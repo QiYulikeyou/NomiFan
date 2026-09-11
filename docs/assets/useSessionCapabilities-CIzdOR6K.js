@@ -1,0 +1,5 @@
+import{j as f,i as m,b,r as l,b1 as d,b2 as k}from"./index-BfwY-Z1G.js";import{_ as S}from"./Brain-C-vrh8g5.js";const g=b(S),M=({size:e,className:t,spinning:s=!1})=>f.jsx(g,{theme:"outline",size:e,fill:"currentColor",className:m("block",s&&"autowork-spin",t)});/**
+ * @license
+ * Copyright 2025-2026 NomiFun (nomifun.com)
+ * SPDX-License-Identifier: Apache-2.0
+ */const r=(e,t)=>`${e}:${t}`,n=new Map,o=new Map,i=new Set;let p=!1;const c=()=>i.forEach(e=>e()),u=()=>({autowork:new Map(n),idmm:new Map(o)}),y=e=>{const t=r(e.kind,e.target_id);e.enabled?n.set(t,e.run_state):n.delete(t),c()},h=e=>{const t=r(e.kind,e.target_id);e.enabled?o.set(t,e.run_state):o.delete(t),c()},w=()=>{p||(p=!0,d.tagBindings.invoke().then(e=>{let t=!1;for(const s of e??[])for(const a of s.bindings)n.set(r(a.kind,a.target_id),a.run_state),t=!0;t&&c()}).catch(()=>{}),d.onAutoWork.on(e=>{y(e)}),k.onStatus.on(e=>{h(e)}))};function x(){const[e,t]=l.useState(u);return l.useEffect(()=>{w();const s=()=>t(u());return i.add(s),s(),()=>{i.delete(s)}},[]),e}export{h as a,r as c,M as r,x as u};

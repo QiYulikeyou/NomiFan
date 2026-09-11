@@ -1,0 +1,5 @@
+import{u as f,al as g,r as v,a6 as r,am as p,aj as y,an as k,ao as u,ap as _}from"./index-BfwY-Z1G.js";import{g as h}from"./conversationCreateError-LyyWqI8j.js";import{u as C}from"./useGuidModelSelection-CQ0FpxrZ.js";import{u as S}from"./uuidv7-CffZc0Oa.js";/**
+ * @license
+ * Copyright 2025-2026 NomiFun (nomifun.com)
+ * SPDX-License-Identifier: Apache-2.0
+ */const T=()=>{const{t:a}=f(),o=g(),{current_model:t}=C("nomi");return{start:v.useCallback(async({name:l,prompt:s,send:i=!0,model:m,extra:d})=>{const n=m??t;if(!n)return r.warning(a("conversation.noModelConfigured")),!1;try{const e=await p.create.invoke({type:"nomi",name:l,model:n,extra:{workspace:"",custom_workspace:!1,default_files:[],...d}});if(!e||!e.id)return r.error(a("conversation.createFailed")),!1;y.emit("chat.history.refresh");const c=k(e.id);return sessionStorage.setItem(i?u("initial-message-nomi",c):u("draft",c),JSON.stringify(i?{conversation_id:e.id,initial_admission_epoch:0,input:s,idempotency_key:S()}:{input:s})),_(e),await o(`/conversation/${e.id}`),!0}catch(e){return console.error("Nomi quick start failed:",e),r.error(h(e,a)),!1}},[t,o,a]),canStart:!!t}};export{T as u};

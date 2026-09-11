@@ -1,0 +1,6 @@
+import{r as u,s as o,g as c}from"./conversationExport-CYMni0OQ.js";/**
+ * @license
+ * Copyright 2025-2026 NomiFun (nomifun.com)
+ * SPDX-License-Identifier: Apache-2.0
+ */const m=15e3,l=e=>e.replace(/\\/g,"/").replace(/^\/+/,""),d=e=>`${o(e.name||e.id)}__${e.id}`,f=(e,t,s)=>{if(!(t!=null&&t.children)||t.children.length===0)return;const n=a=>{var i;if(a.isFile){const r=l(a.relativePath||a.name);r&&e.push({name:`${s}/workspace/${r}`,sourcePath:a.fullPath});return}(i=a.children)==null||i.forEach(r=>n(r))};t.children.forEach(a=>n(a))},g=e=>e.type,w=async(e,t,s)=>{let n=null;try{const a=new Promise((i,r)=>{n=setTimeout(()=>{r(new Error(`${s} timeout`))},t)});return await Promise.race([e,a])}finally{n&&clearTimeout(n)}},p=e=>{switch(c(e)){case"user":return"User";case"assistant":return"Assistant";case"system":return"System"}},y=(e,t)=>{const s=[];return s.push(`# ${e.name||"Conversation"}`),s.push(""),s.push(`- Conversation ID: ${e.id}`),s.push(`- Exported At: ${new Date().toISOString()}`),s.push(`- Type: ${e.type}`),s.push(""),s.push("## Messages"),s.push(""),t.forEach((n,a)=>{s.push(`### ${a+1}. ${p(n)} (${n.type})`),s.push(""),s.push("```text"),s.push(u(n)),s.push("```"),s.push("")}),s.join(`
+`)},$=(e,t)=>JSON.stringify({version:1,exportedAt:new Date().toISOString(),conversation:e,messages:t},null,2);export{m as E,y as a,$ as b,f as c,d,g,w};

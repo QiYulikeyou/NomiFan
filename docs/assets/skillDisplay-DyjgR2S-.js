@@ -1,0 +1,1 @@
+const s=(e,t)=>{var o,r;const i=(o=e==null?void 0:e[t])==null?void 0:o.trim();if(i)return i;const c=t.toLowerCase().split("-")[0],n=Object.keys(e??{}).find(d=>d.toLowerCase().split("-")[0]===c);return(n?(r=e==null?void 0:e[n])==null?void 0:r.trim():void 0)||void 0},u=(e,t)=>({name:s(e.name_i18n,t)||e.name,description:s(e.description_i18n,t)||e.description||""});export{u as r};

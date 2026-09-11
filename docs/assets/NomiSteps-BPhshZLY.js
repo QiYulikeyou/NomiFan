@@ -1,0 +1,1 @@
+import{j as o,i as p}from"./index-BfwY-Z1G.js";import{S as s}from"./index-7FP92hbw.js";const t=({className:e,...m})=>o.jsx(s,{...m,className:p("nomifun-steps",e)});t.displayName="NomiSteps";t.Step=s.Step;export{t as N};

@@ -1,0 +1,1 @@
+import{R as p,j as l,a as r,i as d}from"./index-BfwY-Z1G.js";const u=p.forwardRef(({className:a,contentFit:s=!1,contentMinWidth:i=0,contentMaxWidth:m=320,autoWidth:e,style:o,...t},n)=>l.jsx(r,{ref:n,className:d("nomi-input",s&&"shrink-0",a),autoWidth:s?{minWidth:i,maxWidth:m}:e,style:{...s?{flex:"none"}:void 0,...o},...t}));u.displayName="NomiInput";export{u as N};

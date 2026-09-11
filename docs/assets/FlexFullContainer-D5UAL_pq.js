@@ -1,0 +1,1 @@
+import{j as s,i as a}from"./index-BfwY-Z1G.js";const i=e=>s.jsx("div",{className:a("flex-1 relative min-h-0",e.className),children:s.jsx("div",{className:a("absolute size-full",e.containerClassName),children:e.children})});export{i as F};

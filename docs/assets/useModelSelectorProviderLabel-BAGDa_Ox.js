@@ -1,0 +1,1 @@
+import{N as a}from"./useModelsForTask-d38A4PPI.js";import{u as s,r as l}from"./index-BfwY-Z1G.js";const m=(e,r)=>{var t,o;return e.platform===a?r.free:((t=e.name)==null?void 0:t.trim())||((o=e.platform)==null?void 0:o.trim())||""},u=()=>{const{t:e}=s(),r=e("settings.modelHub.free.title");return l.useCallback(t=>m(t,{free:r}),[r])};export{u};

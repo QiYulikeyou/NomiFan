@@ -1,0 +1,5 @@
+import{I as d,R as t,l as s,D as k,n as h}from"./index-BfwY-Z1G.js";import{P as L,f as g}from"./presetCatalog-C5SSTuGO.js";const u=d("pause-one",!1,function(e){return t.createElement("svg",{width:e.size,height:e.size,viewBox:"0 0 48 48",fill:"none"},t.createElement("path",{d:"M24 44C35.0457 44 44 35.0457 44 24C44 12.9543 35.0457 4 24 4C12.9543 4 4 12.9543 4 24C4 35.0457 12.9543 44 24 44Z",fill:e.colors[1],stroke:e.colors[0],strokeWidth:e.strokeWidth,strokeLinejoin:e.strokeLinejoin}),t.createElement("path",{d:"M19 18V30",stroke:e.colors[2],strokeWidth:e.strokeWidth,strokeLinecap:e.strokeLinecap,strokeLinejoin:e.strokeLinejoin}),t.createElement("path",{d:"M29 18V30",stroke:e.colors[2],strokeWidth:e.strokeWidth,strokeLinecap:e.strokeLinecap,strokeLinejoin:e.strokeLinejoin}))});/**
+ * @license
+ * Copyright 2025-2026 NomiFun (nomifun.com)
+ * SPDX-License-Identifier: Apache-2.0
+ */const W=()=>{const{data:e,isLoading:n,mutate:a}=s(k,h),{data:i,isLoading:o,mutate:r}=s(L,g),c=(i??[]).filter(l=>l.enabled!==!1);return{cliAgents:e||[],presets:c||[],isLoading:n||o,refresh:async()=>{await Promise.all([a(),r()])}}};export{u as _,W as u};

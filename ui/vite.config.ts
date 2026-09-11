@@ -84,6 +84,7 @@ export default defineConfig(({ mode }) => {
 
   return {
     root: __dirname,
+    base: process.env.NOMIFUN_PAGES_BASE ?? '/',
     // Pin the dev server so it always matches the Tauri `devUrl` (5173).
     server: {
       port: 5173,

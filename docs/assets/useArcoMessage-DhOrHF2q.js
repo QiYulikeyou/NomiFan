@@ -1,0 +1,1 @@
+import{a6 as l,r as s}from"./index-BfwY-Z1G.js";function i(n){const[u,c]=l.useMessage(n),r=s.useRef(u),e=s.useRef(null);return e.current===null&&(e.current=new Proxy({},{get(f,o,a){const t=Reflect.get(r.current,o,a);return typeof t=="function"?t.bind(r.current):t}})),[e.current,c]}export{i as u};
