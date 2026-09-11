@@ -1,0 +1,1654 @@
+//! `/api/knowledge/*` route handlers.
+
+use axum::Router;
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{Extension, Json, Path, Query, State};
+use axum::routing::{get, post};
+
+use nomifun_api_types::{
+    ApiResponse, CreateKnowledgeTagRequest, KnowledgeRetrievalConfig, KnowledgeSource,
+    KnowledgeSourceEntry, KnowledgeTag, KnowledgeTreeAccess, RelocateKnowledgeEntryRequest,
+    RelocateKnowledgeEntryResponse, UndoKnowledgeEntryRelocationRequest,
+    UpdateKnowledgeTagRequest,
+};
+use nomifun_auth::CurrentUser;
+use nomifun_common::{AppError, KnowledgeBaseId, KnowledgeEntryId};
+use serde::{Deserialize, Serialize};
+
+use crate::export::{self, ExportSummary};
+use crate::service::{
+    AppendUrlSourceSummary, AutogenOutcome, ConsumerInfo, FolderImportSummary, KbFileContent,
+    KbFileEntry, KbFileUpdateResult, KbTreeEntry, KnowledgeBaseInfo, KnowledgeBinding,
+    KnowledgeEntrySourceActionResult, KnowledgeSearchHit, RefreshSourceSummary,
+};
+use crate::state::KnowledgeRouterState;
+
+pub fn knowledge_routes(state: KnowledgeRouterState) -> Router {
+    Router::new()
+        .route("/api/knowledge/bases", get(list_bases).post(create_base))
+        .route("/api/knowledge/bases/import", post(import_base))
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}",
+            get(get_base).put(update_base).delete(delete_base),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/export",
+            post(export_base),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/autogen",
+            post(autogen_base),
+        )
+        .route("/api/knowledge/description/generate", post(generate_description))
+        .route("/api/knowledge/description/polish", post(polish_description))
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/refresh-source",
+            post(refresh_source),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/source",
+            axum::routing::put(set_source),
+        )
+        .route(
+            "/api/knowledge/tags",
+            get(list_tags).post(create_tag),
+        )
+        .route(
+            "/api/knowledge/tags/{key}",
+            axum::routing::put(update_tag).delete(delete_tag),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/files",
+            get(list_files),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/content",
+            post(add_content),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/tree",
+            get(list_tree),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/folder",
+            post(create_folder).delete(delete_folder),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/tree/rename",
+            post(rename_tree_entry),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/tree/relocate",
+            post(relocate_tree_entry),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/tree/relocate/undo",
+            post(undo_tree_relocation),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/entries/{entry_id}/refresh-source",
+            post(refresh_entry_source),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/entries/{entry_id}/copy-as-editable",
+            post(copy_entry_as_editable),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/entries/{entry_id}/detach-source",
+            post(detach_entry_source),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/entries/{entry_id}/remove-source",
+            post(remove_entry_source),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/consumers",
+            get(list_consumers),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/file",
+            get(read_file).put(write_file).delete(delete_file),
+        )
+        .route(
+            // `target_id` is ONE path segment. Workpath targets (normalized
+            // absolute paths) therefore arrive percent-encoded — the
+            // frontend calls `encodeURIComponent(workpathKey)` so `/`
+            // travels as `%2F`. axum matches routes on the still-encoded
+            // path and the `Path` extractor decodes afterwards, so an
+            // encoded path never splits into extra segments (pinned by
+            // `binding_route_extracts_percent_encoded_workpath` below).
+            "/api/knowledge/binding/{kind}/{target_id}",
+            get(get_binding).post(set_binding),
+        )
+        .route(
+            "/api/knowledge/retrieval",
+            get(get_retrieval_config).put(update_retrieval_config),
+        )
+        .route("/api/knowledge/search", post(search_bases))
+        .with_state(state)
+}
+
+async fn get_retrieval_config(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<KnowledgeRetrievalConfig>>, AppError> {
+    Ok(Json(ApiResponse::ok(
+        state.service.retrieval_config().await?,
+    )))
+}
+
+async fn update_retrieval_config(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    body: Result<Json<KnowledgeRetrievalConfig>, JsonRejection>,
+) -> Result<Json<ApiResponse<KnowledgeRetrievalConfig>>, AppError> {
+    let Json(config) = body.map_err(|error| AppError::BadRequest(error.to_string()))?;
+    Ok(Json(ApiResponse::ok(
+        state.service.update_retrieval_config(config).await?,
+    )))
+}
+
+async fn list_bases(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<Vec<KnowledgeBaseInfo>>>, AppError> {
+    Ok(Json(ApiResponse::ok(state.service.list_bases().await?)))
+}
+
+#[derive(Deserialize)]
+struct CreateBaseRequest {
+    name: String,
+    #[serde(default)]
+    description: String,
+    /// Absolute path of an existing external directory; omit to provision a
+    /// managed directory under the backend data dir.
+    root_path: Option<String>,
+    /// External directories default to read-only; editable requires an explicit
+    /// user decision in the create flow.
+    #[serde(default)]
+    tree_access: Option<KnowledgeTreeAccess>,
+    /// Optional URL source, stored in `extra.source`. `mode=live` stores it
+    /// without fetching; `mode=snapshot` fetches every entry into
+    /// managed Markdown entries before the response returns (using
+    /// `snapshots/` only as the initial default, and chaining a best-effort
+    /// AI overview run) — the per-entry fetch outcome is reported in the
+    /// response's `source_fetch` field.
+    #[serde(default)]
+    source: Option<KnowledgeSource>,
+    /// Optional tag keys to assign at creation time (same semantics as
+    /// `UpdateBaseRequest.tags`).
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+}
+
+async fn create_base(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    body: Result<Json<CreateBaseRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<KnowledgeBaseInfo>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let mut info = state
+        .service
+        .create_base_with_access(
+            &req.name,
+            &req.description,
+            req.root_path.as_deref(),
+            req.source,
+            req.tree_access,
+        )
+        .await?;
+    // Persist tags (if provided) as a post-creation step — avoids changing the
+    // 4-param `create_base` signature used by 50+ callers.
+    if let Some(ref tag_keys) = req.tags {
+        if !tag_keys.is_empty() {
+            info = state
+                .service
+                .update_base(
+                    info.knowledge_base_id.as_str(),
+                    None,
+                    None,
+                    Some(tag_keys.clone()),
+                )
+                .await?;
+        }
+    }
+    Ok(Json(ApiResponse::ok(info)))
+}
+
+async fn get_base(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
+) -> Result<Json<ApiResponse<KnowledgeBaseInfo>>, AppError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .get_base_info(knowledge_base_id.as_str())
+            .await?,
+    )))
+}
+
+#[derive(Deserialize)]
+struct UpdateBaseRequest {
+    name: Option<String>,
+    description: Option<String>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    #[serde(default)]
+    tree_access: Option<KnowledgeTreeAccess>,
+}
+
+async fn update_base(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
+    body: Result<Json<UpdateBaseRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<KnowledgeBaseInfo>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .update_base_with_access(
+                knowledge_base_id.as_str(),
+                req.name.as_deref(),
+                req.description.as_deref(),
+                req.tags,
+                req.tree_access,
+            )
+            .await?,
+    )))
+}
+
+#[derive(Deserialize)]
+struct DeleteBaseQuery {
+    #[serde(default)]
+    purge: bool,
+}
+
+async fn delete_base(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
+    Query(query): Query<DeleteBaseQuery>,
+) -> Result<Json<ApiResponse<()>>, AppError> {
+    state
+        .service
+        .delete_base(knowledge_base_id.as_str(), query.purge)
+        .await?;
+    Ok(Json(ApiResponse::ok(())))
+}
+
+async fn list_files(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
+) -> Result<Json<ApiResponse<Vec<KbFileEntry>>>, AppError> {
+    Ok(Json(ApiResponse::ok(
+        state.service.list_files(knowledge_base_id.as_str()).await?,
+    )))
+}
+
+/// One append-only contract for every user-facing "add knowledge" method.
+/// Editor saves intentionally stay on PUT /file because they overwrite an
+/// existing document; this endpoint's document variant is no-clobber.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum AddContentRequest {
+    Document { path: String, content: String },
+    LocalFolder {
+        source_path: String,
+        #[serde(default)]
+        destination_parent_path: String,
+    },
+    Web {
+        entries: Vec<KnowledgeSourceEntry>,
+        #[serde(default)]
+        destination_parent_path: String,
+        #[serde(default)]
+        destination_parent_id: Option<KnowledgeEntryId>,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AddContentResponse {
+    Document {
+        path: String,
+    },
+    LocalFolder {
+        target_directory: String,
+        imported: usize,
+        skipped: usize,
+        total_size: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        first_file: Option<String>,
+    },
+    Web {
+        added: usize,
+        duplicates: usize,
+        fetched: usize,
+        failed: usize,
+        errors: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_fetched_at: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        first_file: Option<String>,
+    },
+}
+
+async fn add_content(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
+    body: Result<Json<AddContentRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<AddContentResponse>>, AppError> {
+    let Json(req) = body.map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let result = match req {
+        AddContentRequest::Document { path, content } => {
+            let path = state
+                .service
+                .create_document(knowledge_base_id.as_str(), &path, &content)
+                .await?;
+            AddContentResponse::Document { path }
+        }
+        AddContentRequest::LocalFolder {
+            source_path,
+            destination_parent_path,
+        } => {
+            let FolderImportSummary {
+                target_directory,
+                imported,
+                skipped,
+                total_size,
+                first_file,
+            } = state
+                .service
+                .import_markdown_folder_into(
+                    knowledge_base_id.as_str(),
+                    &source_path,
+                    &destination_parent_path,
+                )
+                .await?;
+            AddContentResponse::LocalFolder {
+                target_directory,
+                imported,
+                skipped,
+                total_size,
+                first_file,
+            }
+        }
+        AddContentRequest::Web {
+            entries,
+            destination_parent_path,
+            destination_parent_id,
+        } => {
+            let AppendUrlSourceSummary {
+                added,
+                duplicates,
+                fetched,
+                failed,
+                errors,
+                last_fetched_at,
+                first_file,
+            } = state
+                .service
+                .append_url_entries_into(
+                    knowledge_base_id.as_str(),
+                    entries,
+                    &destination_parent_path,
+                    destination_parent_id,
+                )
+                .await?;
+            AddContentResponse::Web {
+                added,
+                duplicates,
+                fetched,
+                failed,
+                errors,
+                last_fetched_at,
+                first_file,
+            }
+        }
+    };
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+#[derive(Deserialize, Default)]
+struct TreeQuery {
+    #[serde(default)]
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct DeleteTreeQuery {
+    path: String,
+    #[serde(default)]
+    entry_id: Option<KnowledgeEntryId>,
+    #[serde(default)]
+    expected_revision: Option<i64>,
+}
+
+async fn list_tree(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
+    Query(query): Query<TreeQuery>,
+) -> Result<Json<ApiResponse<Vec<KbTreeEntry>>>, AppError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .list_tree(knowledge_base_id.as_str(), &query.path)
+            .await?,
+    )))
+}
+
+#[derive(Deserialize)]
+struct CreateFolderRequest {
+    path: String,
+}
+
+async fn create_folder(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
+    body: Result<Json<CreateFolderRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<KbTreeEntry>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .create_folder(knowledge_base_id.as_str(), &req.path)
+            .await?,
+    )))
+}
+
+async fn delete_folder(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
+    Query(query): Query<DeleteTreeQuery>,
+) -> Result<Json<ApiResponse<()>>, AppError> {
+    state
+        .service
+        .delete_folder_entry(
+            knowledge_base_id.as_str(),
+            &query.path,
+            query.entry_id.as_ref(),
+            query.expected_revision,
+        )
+        .await?;
+    Ok(Json(ApiResponse::ok(())))
+}
+
+#[derive(Deserialize)]
+struct RenameTreeEntryRequest {
+    path: String,
+    new_name: String,
+}
+
+async fn rename_tree_entry(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
+    body: Result<Json<RenameTreeEntryRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<KbTreeEntry>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .rename_tree_entry(knowledge_base_id.as_str(), &req.path, &req.new_name)
+            .await?,
+    )))
+}
+
+async fn relocate_tree_entry(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
+    body: Result<Json<RelocateKnowledgeEntryRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<RelocateKnowledgeEntryResponse>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .relocate_tree_entry(knowledge_base_id.as_str(), req)
+            .await?,
+    )))
+}
+
+async fn undo_tree_relocation(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
+    body: Result<Json<UndoKnowledgeEntryRelocationRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<RelocateKnowledgeEntryResponse>>, AppError> {
+    let Json(req) = body.map_err(|error| AppError::BadRequest(error.to_string()))?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .undo_tree_relocation(knowledge_base_id.as_str(), req)
+            .await?,
+    )))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EntrySourceActionRequest {
+    expected_revision: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CopyEntryAsEditableRequest {
+    expected_revision: Option<i64>,
+    #[serde(default)]
+    destination_parent_path: String,
+    #[serde(default)]
+    destination_parent_id: Option<KnowledgeEntryId>,
+    #[serde(default)]
+    new_name: Option<String>,
+}
+
+fn required_entry_revision(expected_revision: Option<i64>) -> Result<i64, AppError> {
+    expected_revision.ok_or_else(|| {
+        AppError::BadRequest(
+            "expected_revision is required for a source-managed entry action".into(),
+        )
+    })
+}
+
+async fn refresh_entry_source(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path((knowledge_base_id, entry_id)): Path<(KnowledgeBaseId, KnowledgeEntryId)>,
+    body: Result<Json<EntrySourceActionRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<KnowledgeEntrySourceActionResult>>, AppError> {
+    let Json(req) = body.map_err(|error| AppError::BadRequest(error.to_string()))?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .refresh_entry_source(
+                knowledge_base_id.as_str(),
+                &entry_id,
+                required_entry_revision(req.expected_revision)?,
+            )
+            .await?,
+    )))
+}
+
+async fn copy_entry_as_editable(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path((knowledge_base_id, entry_id)): Path<(KnowledgeBaseId, KnowledgeEntryId)>,
+    body: Result<Json<CopyEntryAsEditableRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<KnowledgeEntrySourceActionResult>>, AppError> {
+    let Json(req) = body.map_err(|error| AppError::BadRequest(error.to_string()))?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .copy_entry_as_editable(
+                knowledge_base_id.as_str(),
+                &entry_id,
+                required_entry_revision(req.expected_revision)?,
+                &req.destination_parent_path,
+                req.destination_parent_id,
+                req.new_name.as_deref(),
+            )
+            .await?,
+    )))
+}
+
+async fn detach_entry_source(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path((knowledge_base_id, entry_id)): Path<(KnowledgeBaseId, KnowledgeEntryId)>,
+    body: Result<Json<EntrySourceActionRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<KnowledgeEntrySourceActionResult>>, AppError> {
+    let Json(req) = body.map_err(|error| AppError::BadRequest(error.to_string()))?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .detach_entry_source(
+                knowledge_base_id.as_str(),
+                &entry_id,
+                required_entry_revision(req.expected_revision)?,
+            )
+            .await?,
+    )))
+}
+
+async fn remove_entry_source(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path((knowledge_base_id, entry_id)): Path<(KnowledgeBaseId, KnowledgeEntryId)>,
+    body: Result<Json<EntrySourceActionRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<KnowledgeEntrySourceActionResult>>, AppError> {
+    let Json(req) = body.map_err(|error| AppError::BadRequest(error.to_string()))?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .remove_entry_source(
+                knowledge_base_id.as_str(),
+                &entry_id,
+                required_entry_revision(req.expected_revision)?,
+            )
+            .await?,
+    )))
+}
+
+#[derive(Deserialize)]
+struct ExportBaseRequest {
+    /// Absolute destination path of the zip package.
+    dest_path: String,
+}
+
+async fn export_base(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
+    body: Result<Json<ExportBaseRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ExportSummary>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    Ok(Json(ApiResponse::ok(
+        export::export_base(
+            &state.service,
+            knowledge_base_id.as_str(),
+            std::path::Path::new(&req.dest_path),
+        )
+        .await?,
+    )))
+}
+
+#[derive(Deserialize)]
+struct ImportBaseRequest {
+    /// Absolute path of a zip package created by the export endpoint.
+    src_path: String,
+}
+
+/// On success the service's managed-create path has already emitted
+/// `knowledge.base-created` (followed by `knowledge.base-updated` with the
+/// final file stats), so connected frontends refresh automatically. A
+/// best-effort AI overview run is then spawned in the background: it never
+/// overwrites a README carried by the package and only backfills the
+/// description when the package had none.
+async fn import_base(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    body: Result<Json<ImportBaseRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<KnowledgeBaseInfo>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let summary = export::import_base(&state.service, std::path::Path::new(&req.src_path)).await?;
+    // The public create/import contract returns the same complete base shape.
+    // Returning the internal ImportSummary here made the TypeScript mapper throw
+    // after the filesystem and registry commit, encouraging a destructive retry
+    // that created "(2)" duplicate bases.
+    let imported = state.service.get_base_info(summary.kb_id.as_str()).await?;
+
+    let service = state.service.clone();
+    let kb_id = summary.kb_id.clone();
+    tokio::spawn(async move {
+        // Best-effort: a missing completer (409) or an empty base (400) is
+        // expected and must not surface anywhere. `None`: post-import
+        // backfill is a background curation task → always the default model.
+        if let Err(e) = service.generate_overview_opts(kb_id.as_str(), false, true, None).await {
+            tracing::debug!(kb_id = %kb_id, error = %e, "post-import knowledge autogen skipped");
+        }
+    });
+
+    Ok(Json(ApiResponse::ok(imported)))
+}
+
+#[derive(Deserialize, Default)]
+struct AutogenRequest {
+    /// Replace an existing `README.md`; default keeps it (the description is
+    /// refreshed either way).
+    #[serde(default)]
+    overwrite_readme: bool,
+    /// Explicit provider for the LLM call (the model picker). Must be sent
+    /// together with `model` or not at all.
+    #[serde(default)]
+    provider_id: Option<String>,
+    /// Explicit model for the LLM call. Must be sent together with
+    /// `provider_id` or not at all.
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// Validate and assemble an optional explicit `(provider_id, model)` pick
+/// from a request: both fields must be present (non-blank) or both absent —
+/// a half-specified pick is a 400. Returns `Ok(None)` when neither is given
+/// (use the completer's default model).
+fn model_override(
+    provider_id: Option<String>,
+    model: Option<String>,
+) -> Result<Option<(String, String)>, AppError> {
+    match (provider_id, model) {
+        (Some(provider_id), Some(model)) => {
+            let provider_id = nomifun_common::ProviderId::parse(provider_id).map_err(|error| {
+                AppError::BadRequest(format!("invalid provider_id: {error}"))
+            })?;
+            if model.is_empty() || model.trim() != model {
+                return Err(AppError::BadRequest(
+                    "model must be a non-empty trimmed natural key".into(),
+                ));
+            }
+            Ok(Some((provider_id.into_string(), model)))
+        }
+        (None, None) => Ok(None),
+        _ => Err(AppError::BadRequest(
+            "provider_id and model must be supplied together (or both omitted)".into(),
+        )),
+    }
+}
+
+/// AI overview generation. Without a wired completer this returns 409 with
+/// an actionable message. Completion is broadcast as `knowledge.base-updated`.
+async fn autogen_base(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
+    body: Option<Json<AutogenRequest>>,
+) -> Result<Json<ApiResponse<AutogenOutcome>>, AppError> {
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+    let override_model = model_override(req.provider_id, req.model)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .generate_overview(
+                knowledge_base_id.as_str(),
+                req.overwrite_readme,
+                override_model,
+            )
+            .await?,
+    )))
+}
+
+#[derive(Deserialize)]
+struct GenerateDescriptionRequest {
+    /// Tentative base name from the create form; may be omitted/blank.
+    #[serde(default)]
+    name: String,
+    /// Absolute path of an existing directory to sample.
+    root_path: String,
+    /// Explicit provider for the LLM call; pair with `model` or omit both.
+    #[serde(default)]
+    provider_id: Option<String>,
+    /// Explicit model for the LLM call; pair with `provider_id` or omit both.
+    #[serde(default)]
+    model: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PolishDescriptionRequest {
+    /// Tentative base name from the create form; may be omitted/blank.
+    #[serde(default)]
+    name: String,
+    /// User-written draft description to rewrite.
+    draft: String,
+    /// Explicit provider for the LLM call; pair with `model` or omit both.
+    #[serde(default)]
+    provider_id: Option<String>,
+    /// Explicit model for the LLM call; pair with `provider_id` or omit both.
+    #[serde(default)]
+    model: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DescriptionResponse {
+    description: String,
+}
+
+/// Stateless AI description generation for the create-base form: samples the
+/// given directory and returns a description only — no base row required,
+/// nothing persisted. 409 without a wired completer, 400 on an invalid path.
+async fn generate_description(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    body: Result<Json<GenerateDescriptionRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<DescriptionResponse>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let override_model = model_override(req.provider_id, req.model)?;
+    let description = state
+        .service
+        .generate_description_for_path(&req.name, &req.root_path, override_model)
+        .await?;
+    Ok(Json(ApiResponse::ok(DescriptionResponse { description })))
+}
+
+/// Stateless AI polish of a user-written draft description. 409 without a
+/// wired completer, 400 on an empty draft. Nothing persisted.
+async fn polish_description(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    body: Result<Json<PolishDescriptionRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<DescriptionResponse>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let override_model = model_override(req.provider_id, req.model)?;
+    let description = state.service.polish_description(&req.name, &req.draft, override_model).await?;
+    Ok(Json(ApiResponse::ok(DescriptionResponse { description })))
+}
+
+/// Re-fetch every URL-source entry (overwriting old snapshots) and stamp
+/// `extra.source.last_fetched_at`.
+async fn refresh_source(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
+) -> Result<Json<ApiResponse<RefreshSourceSummary>>, AppError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .refresh_source(knowledge_base_id.as_str())
+            .await?,
+    )))
+}
+
+#[derive(Deserialize)]
+struct SetSourceRequest {
+    /// New source config, or `null` to detach the base's source.
+    #[serde(default)]
+    source: Option<KnowledgeSource>,
+}
+
+/// Attach / replace / clear a base's source config (`extra.source`).
+/// Does not fetch — the caller triggers refresh-source afterward.
+async fn set_source(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
+    body: Result<Json<SetSourceRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<KnowledgeBaseInfo>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .set_source(knowledge_base_id.as_str(), req.source)
+            .await?,
+    )))
+}
+
+// ── Tag CRUD routes ──────────────────────────────────────────────────────
+
+async fn list_tags(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<Vec<KnowledgeTag>>>, AppError> {
+    Ok(Json(ApiResponse::ok(state.service.list_tags().await?)))
+}
+
+async fn create_tag(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    body: Result<Json<CreateKnowledgeTagRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<KnowledgeTag>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    Ok(Json(ApiResponse::ok(
+        state.service.create_tag(&req.label, req.color).await?,
+    )))
+}
+
+async fn update_tag(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(key): Path<String>,
+    body: Result<Json<UpdateKnowledgeTagRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<KnowledgeTag>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    Ok(Json(ApiResponse::ok(
+        state.service.update_tag(&key, req).await?,
+    )))
+}
+
+async fn delete_tag(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(key): Path<String>,
+) -> Result<Json<ApiResponse<()>>, AppError> {
+    state.service.delete_tag(&key).await?;
+    Ok(Json(ApiResponse::ok(())))
+}
+
+// ── P4 consumers ──────────────────────────────────────────────────────
+
+async fn list_consumers(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
+) -> Result<Json<ApiResponse<Vec<ConsumerInfo>>>, AppError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .list_consumers(knowledge_base_id.as_str())
+            .await?,
+    )))
+}
+
+#[derive(Deserialize)]
+struct FilePathQuery {
+    path: String,
+    #[serde(default)]
+    entry_id: Option<KnowledgeEntryId>,
+    #[serde(default)]
+    expected_revision: Option<i64>,
+}
+
+async fn read_file(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
+    Query(query): Query<FilePathQuery>,
+) -> Result<Json<ApiResponse<KbFileContent>>, AppError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .read_file(knowledge_base_id.as_str(), &query.path)
+            .await?,
+    )))
+}
+
+#[derive(Deserialize)]
+struct WriteFileRequest {
+    path: String,
+    content: String,
+    /// When present this is an editor update, not a create/overwrite command.
+    /// The service compares the exact last-read content and refuses stale or
+    /// moved paths instead of recreating a duplicate at the old location.
+    #[serde(default)]
+    expected_content: Option<String>,
+    /// Stable editor identity/version. These fields are accepted only as a
+    /// pair and only with `expected_content`.
+    #[serde(default)]
+    entry_id: Option<KnowledgeEntryId>,
+    #[serde(default)]
+    expected_revision: Option<i64>,
+}
+
+async fn write_file(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
+    body: Result<Json<WriteFileRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<KbFileUpdateResult>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let result = if let Some(expected_content) = req.expected_content {
+        state
+            .service
+            .update_file_by_identity_if_unchanged(
+                knowledge_base_id.as_str(),
+                &req.path,
+                req.entry_id.as_ref(),
+                req.expected_revision,
+                &expected_content,
+                &req.content,
+            )
+            .await?
+    } else {
+        if req.entry_id.is_some() || req.expected_revision.is_some() {
+            return Err(AppError::BadRequest(
+                "entry_id/expected_revision require expected_content".into(),
+            ));
+        }
+        state
+            .service
+            .write_file(knowledge_base_id.as_str(), &req.path, &req.content)
+            .await?;
+        KbFileUpdateResult {
+            rel_path: req.path.replace('\\', "/"),
+            entry_id: None,
+        }
+    };
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+async fn delete_file(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
+    Query(query): Query<FilePathQuery>,
+) -> Result<Json<ApiResponse<()>>, AppError> {
+    state
+        .service
+        .delete_file_entry(
+            knowledge_base_id.as_str(),
+            &query.path,
+            query.entry_id.as_ref(),
+            query.expected_revision,
+        )
+        .await?;
+    Ok(Json(ApiResponse::ok(())))
+}
+
+async fn get_binding(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path((kind, target_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<KnowledgeBinding>>, AppError> {
+    Ok(Json(ApiResponse::ok(state.service.get_binding(&kind, &target_id).await?)))
+}
+
+async fn set_binding(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path((kind, target_id)): Path<(String, String)>,
+    body: Result<Json<KnowledgeBinding>, JsonRejection>,
+) -> Result<Json<ApiResponse<KnowledgeBinding>>, AppError> {
+    let Json(binding) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    Ok(Json(ApiResponse::ok(
+        state.service.set_binding(&kind, &target_id, binding).await?,
+    )))
+}
+
+// ─── Manual search (read-only, scoped) ───────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchBasesRequest {
+    kb_ids: Vec<KnowledgeBaseId>,
+    query: String,
+    limit: Option<usize>,
+}
+
+async fn search_bases(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    body: Result<Json<SearchBasesRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<Vec<KnowledgeSearchHit>>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    // Scope: only search the caller-supplied kb_ids. Empty list → empty result
+    // (search_bases already handles this, but we make it explicit).
+    if req.kb_ids.is_empty() {
+        return Ok(Json(ApiResponse::ok(Vec::new())));
+    }
+    let limit = req.limit.unwrap_or(20);
+    let hits = state.service.search_bases(&req.kb_ids, &req.query, limit).await?;
+    Ok(Json(ApiResponse::ok(hits)))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::testutil::make_service;
+
+    const TEST_PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+
+    fn test_app(data_dir: &std::path::Path) -> Router {
+        let service = Arc::new(make_service(data_dir));
+        // The auth middleware normally injects `CurrentUser`; tests attach
+        // it directly as a request extension.
+        knowledge_routes(KnowledgeRouterState::new(service)).layer(Extension(CurrentUser {
+            id: nomifun_common::UserId::new(),
+            username: "u1".into(),
+        }))
+    }
+
+    async fn json_body(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn retrieval_get_defaults_local_and_first_complete_put_persists() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let app = test_app(dir.path());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/api/knowledge/retrieval")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(
+            body["data"],
+            serde_json::json!({
+                "embedding": {"mode": "local"},
+                "rerank": {"mode": "local"}
+            })
+        );
+
+        let complete = serde_json::json!({
+            "embedding": {"mode": "local"},
+            "rerank": {"mode": "local"}
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::put("/api/knowledge/retrieval")
+                    .header("content-type", "application/json")
+                    .body(Body::from(complete.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::get("/api/knowledge/retrieval")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(json_body(response).await["data"], complete);
+    }
+
+    #[tokio::test]
+    async fn retrieval_put_rejects_partial_or_unknown_stage_configuration() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let app = test_app(dir.path());
+        for body in [
+            serde_json::json!({"embedding": {"mode": "local"}}),
+            serde_json::json!({
+                "embedding": {"mode": "local", "provider_id": TEST_PROVIDER_ID},
+                "rerank": {"mode": "local"}
+            }),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::put("/api/knowledge/retrieval")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn retrieval_put_never_persists_unvalidated_remote_stage() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let app = test_app(dir.path());
+        let body = serde_json::json!({
+            "embedding": {
+                "mode": "remote",
+                "provider_id": TEST_PROVIDER_ID,
+                "model": "embedding-model"
+            },
+            "rerank": {"mode": "local"}
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::put("/api/knowledge/retrieval")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let response = app
+            .oneshot(
+                Request::get("/api/knowledge/retrieval")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let saved = json_body(response).await;
+        assert_eq!(
+            saved["data"],
+            serde_json::json!({
+                "embedding": {"mode": "local"},
+                "rerank": {"mode": "local"}
+            })
+        );
+    }
+
+    /// Wire-contract pin for workpath bindings (frontend Task 11): the
+    /// target_id is sent as ONE percent-encoded segment
+    /// (`encodeURIComponent(workpathKey)`, `/` → `%2F`). axum must match
+    /// the single-segment route on the encoded path and hand the DECODED
+    /// path to the handler; the service then canonicalizes spellings
+    /// (trailing slash et al) onto one row.
+    #[tokio::test]
+    async fn binding_route_extracts_percent_encoded_workpath() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let app = test_app(dir.path());
+
+        let create = Request::post("/api/knowledge/bases")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"route fixture","description":""}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let created = json_body(resp).await;
+        let kb_id = created["data"]["knowledge_base_id"].as_str().unwrap();
+
+        // Write under a trailing-slash spelling…
+        let set = Request::post("/api/knowledge/binding/workpath/%2FUsers%2Fme%2Fproj%2F")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "enabled": true,
+                    "writeback": false,
+                    "kb_ids": [kb_id],
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(set).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // …and read it back under the canonical spelling: same row.
+        let get = Request::get("/api/knowledge/binding/workpath/%2FUsers%2Fme%2Fproj")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(get).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        assert_eq!(v["success"], true, "{v}");
+        assert_eq!(v["data"]["enabled"], true, "{v}");
+        assert_eq!(v["data"]["kb_ids"][0], kb_id, "{v}");
+
+        // A never-bound workpath reads as the default (disabled) binding.
+        let get = Request::get("/api/knowledge/binding/workpath/%2Felsewhere")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(get).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        assert_eq!(v["data"]["enabled"], false, "{v}");
+
+        // The default-workpath sentinel needs no encoding at all.
+        let get = Request::get("/api/knowledge/binding/workpath/__default__")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(get).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn external_base_is_read_only_until_the_api_receives_explicit_consent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let external = dir.path().join("external-vault");
+        std::fs::create_dir_all(&external).unwrap();
+        let app = test_app(dir.path());
+
+        let create = serde_json::json!({
+            "name": "external",
+            "description": "",
+            "root_path": external.to_string_lossy(),
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/knowledge/bases")
+                    .header("content-type", "application/json")
+                    .body(Body::from(create.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created = json_body(response).await;
+        let kb_id = created["data"]["knowledge_base_id"].as_str().unwrap();
+        assert_eq!(created["data"]["tree_access"], "read_only");
+
+        let blocked = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/knowledge/bases/{kb_id}/folder"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"path":"blocked"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+        assert!(!external.join("blocked").exists());
+
+        let allow = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/knowledge/bases/{kb_id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"tree_access":"editable"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allow.status(), StatusCode::OK);
+        let allowed = json_body(allow).await;
+        assert_eq!(allowed["data"]["tree_access"], "editable");
+
+        let created_folder = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/knowledge/bases/{kb_id}/folder"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"path":"allowed"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created_folder.status(), StatusCode::OK);
+        assert!(external.join("allowed").is_dir());
+
+        let write = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/knowledge/bases/{kb_id}/file"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "path": "allowed/note.md",
+                            "content": "# Local folder CRUD\n"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(write.status(), StatusCode::OK);
+        assert_eq!(
+            std::fs::read_to_string(external.join("allowed/note.md")).unwrap(),
+            "# Local folder CRUD\n"
+        );
+
+        let rename = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/knowledge/bases/{kb_id}/tree/rename"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"path":"allowed/note.md","new_name":"renamed.md"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rename.status(), StatusCode::OK);
+        assert!(!external.join("allowed/note.md").exists());
+        assert!(external.join("allowed/renamed.md").is_file());
+
+        let delete_file = app
+            .clone()
+            .oneshot(
+                Request::delete(format!(
+                    "/api/knowledge/bases/{kb_id}/file?path=allowed%2Frenamed.md"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_file.status(), StatusCode::OK);
+        assert!(!external.join("allowed/renamed.md").exists());
+
+        let delete_folder = app
+            .oneshot(
+                Request::delete(format!(
+                    "/api/knowledge/bases/{kb_id}/folder?path=allowed"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_folder.status(), StatusCode::OK);
+        assert!(!external.join("allowed").exists());
+    }
+
+    /// An unknown binding kind stays a 400 — `workpath` is now accepted,
+    /// arbitrary kinds are not.
+    #[tokio::test]
+    async fn binding_route_rejects_unknown_kind() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let app = test_app(dir.path());
+        let get = Request::get("/api/knowledge/binding/nonsense/x")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(get).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A half-specified model pick (only `provider_id`, or only `model`) is a
+    /// 400 BadRequest — the validation runs before any completer/path work,
+    /// so it fires even with no completer wired and an arbitrary root_path.
+    #[tokio::test]
+    async fn description_generate_rejects_half_specified_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let app = test_app(dir.path());
+
+        for body in [
+            serde_json::json!({
+                "name": "x",
+                "root_path": "/tmp/x",
+                "provider_id": TEST_PROVIDER_ID,
+            })
+            .to_string(),
+            serde_json::json!({"name": "x", "root_path": "/tmp/x", "model": "m1"})
+                .to_string(),
+        ] {
+            let req = Request::post("/api/knowledge/description/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(body.clone()))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "body={body}");
+            let v = json_body(resp).await;
+            assert!(
+                v["error"].as_str().unwrap_or_default().contains("supplied together"),
+                "{v}"
+            );
+        }
+    }
+
+    /// The matching `model_override` unit contract: both or neither.
+    #[test]
+    fn model_override_requires_both_or_neither() {
+        assert_eq!(model_override(None, None).unwrap(), None);
+        assert_eq!(
+            model_override(Some(TEST_PROVIDER_ID.into()), Some("m".into())).unwrap(),
+            Some((TEST_PROVIDER_ID.into(), "m".into()))
+        );
+        // Present-but-blank IDs are invalid boundary values, never aliases for absence.
+        assert!(model_override(Some("  ".into()), Some("  ".into())).is_err());
+        assert!(model_override(Some("p".into()), None).is_err());
+        assert!(model_override(None, Some("m".into())).is_err());
+        assert!(model_override(Some("p".into()), Some("  ".into())).is_err());
+    }
+
+    #[tokio::test]
+    async fn manual_search_returns_scoped_hits() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let app = test_app(dir.path());
+
+        // 1. Create a knowledge base.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/knowledge/bases")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"规范","description":""}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        let kb_id = v["data"]["knowledge_base_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // 2. Write a file with a keyword.
+        let write_body = serde_json::json!({
+            "path": "a.md",
+            "content": "# 评审\n选中态用 primary-1"
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/knowledge/bases/{kb_id}/file"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(write_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "write_file failed");
+
+        // 3. Search via the new route.
+        let search_body = serde_json::json!({
+            "kbIds": [kb_id],
+            "query": "评审",
+            "limit": 10
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/knowledge/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(search_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        let hits = v["data"].as_array().expect("data should be an array");
+        assert!(
+            hits.iter().any(|h| h["kb_id"].as_str() == Some(&kb_id)),
+            "expected hit for kb_id={kb_id}, got {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_search_empty_kb_ids_returns_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let app = test_app(dir.path());
+
+        let search_body = serde_json::json!({
+            "kbIds": [],
+            "query": "anything"
+        });
+        let resp = app
+            .oneshot(
+                Request::post("/api/knowledge/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(search_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        let hits = v["data"].as_array().expect("data should be an array");
+        assert!(hits.is_empty(), "empty kb_ids should return empty hits");
+    }
+
+    #[tokio::test]
+    async fn relocate_route_moves_a_directory_and_returns_an_idempotent_receipt() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let app = test_app(dir.path());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/knowledge/bases")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"relocate","description":""}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created = json_body(response).await;
+        let kb_id = created["data"]["knowledge_base_id"].as_str().unwrap();
+        let root = std::path::PathBuf::from(created["data"]["root_path"].as_str().unwrap());
+        std::fs::create_dir_all(root.join("source/nested")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("source/nested/note.md"), "# Note").unwrap();
+
+        let relocate = serde_json::json!({
+            "source_path": "source",
+            "destination_parent_path": "target",
+            "new_name": "renamed",
+            "request_id": "route-relocate-once",
+            "conflict_policy": "reject"
+        });
+        let unsupported = serde_json::json!({
+            "source_path": "source",
+            "destination_parent_path": "target",
+            "request_id": "route-relocate-unsupported-field",
+            "conflict_policy": "reject",
+            "update_links": true
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/knowledge/bases/{kb_id}/tree/relocate"
+                ))
+                .header("content-type", "application/json")
+                .body(Body::from(unsupported.to_string()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/knowledge/bases/{kb_id}/tree/relocate"
+                ))
+                .header("content-type", "application/json")
+                .body(Body::from(relocate.to_string()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let first = json_body(response).await;
+        assert_eq!(first["data"]["old_path"], "source");
+        assert_eq!(first["data"]["new_path"], "target/renamed");
+        assert_eq!(first["data"]["kind"], "directory");
+        assert_eq!(first["data"]["moved_descendant_count"], 2);
+        assert!(first["data"]["tree_revision"].as_u64().is_some());
+        assert!(first["data"].get("undo_token").is_none());
+        assert!(root.join("target/renamed/nested/note.md").is_file());
+        assert!(!root.join("source").exists());
+
+        let response = app
+            .oneshot(
+                Request::post(format!(
+                    "/api/knowledge/bases/{kb_id}/tree/relocate"
+                ))
+                .header("content-type", "application/json")
+                .body(Body::from(relocate.to_string()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let replay = json_body(response).await;
+        assert_eq!(
+            replay["data"]["operation_id"],
+            first["data"]["operation_id"]
+        );
+        assert_eq!(
+            replay["data"]["tree_revision"],
+            first["data"]["tree_revision"]
+        );
+    }
+}

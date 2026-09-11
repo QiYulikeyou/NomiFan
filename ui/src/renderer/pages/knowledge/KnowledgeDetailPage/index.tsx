@@ -1,0 +1,2583 @@
+/**
+ * @license
+ * Copyright 2025-2026 NomiFun (nomifun.com)
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/**
+ * KnowledgeDetailPage — Tab-shell redesign (Phase D).
+ *
+ * Structure:
+ *   Header: back + kind icon + name + kind badge + tags + actions + meta row
+ *   Tabs:   docs | use | set
+ *
+ * Each tab body is a placeholder for D2-D5 tasks.
+ * Existing document logic is preserved inline under the "docs" tab.
+ */
+
+import classNames from 'classnames';
+import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { parseKnowledgeBaseId } from '@/common/types/ids';
+import { uuidv7 } from '@/common/utils/uuidv7';
+import { useTranslation } from 'react-i18next';
+import {
+  Button,
+  Checkbox,
+  Dropdown,
+  Empty,
+  Input,
+  Menu,
+  Message,
+  Modal,
+  Notification,
+  Result,
+  Spin,
+  Switch,
+  Tabs,
+  Tooltip,
+  Tree,
+} from '@arco-design/web-react';
+import {
+  ExpandDown,
+  ExpandUp,
+  FileFocus,
+  Copy,
+  Delete,
+  EditTwo,
+  FolderOpen,
+  FolderPlus,
+  Left,
+  LinkCloud,
+  LinkOne,
+  MagicHat,
+  More,
+  Plus,
+  Refresh,
+  Right,
+  Search,
+  SettingTwo,
+  Unlock,
+  Unlink,
+} from '@icon-park/react';
+import type {
+  IKnowledgeAddContentResult,
+  IKnowledgeBase,
+  IKnowledgeEntrySource,
+  IKnowledgeEntrySourceActionResult,
+  IKnowledgeFileContent,
+  IKnowledgeRelocateResult,
+  IKnowledgeTag,
+  IKnowledgeTreeEntry,
+} from '@/common/adapter/ipcBridge';
+import Markdown from '@renderer/components/Markdown';
+import NomiInput from '@/renderer/components/base/NomiInput';
+import { NomiSettingList, NomiSettingRow, NomiSettingSection } from '@/renderer/components/base/NomiSettingLayout';
+import { useLayoutContext } from '@renderer/hooks/context/LayoutContext';
+import { openExternalUrl } from '@renderer/utils/platform';
+import { ipcBridge } from '@/common';
+import {
+  formatSize,
+  getBaseSource,
+  isAutogenNoProviderError,
+  knowledgeErrorText,
+  notifySourceFetchResult,
+  useKnowledgeBase,
+} from '../useKnowledge';
+import { useKnowledgeTags } from '../useKnowledgeTags';
+import KnowledgeModelSelector, { useKnowledgeAutogenModel } from '../KnowledgeModelSelector';
+import KnowledgeConsumersSection from '../KnowledgeConsumersSection';
+import TagPicker from '../CreateStudio/TagPicker';
+import { getKindConfig, KindIcon, type KindConfig } from '../knowledgeKind';
+import KnowledgeAddContentControl, {
+  type KnowledgeAddContentControlHandle,
+} from './KnowledgeAddContentControl';
+import {
+  KnowledgeTreeDnd,
+  KnowledgeTreeDndHandle,
+  KnowledgeTreeDndRow,
+} from './KnowledgeTreeDnd';
+import {
+  hasKnowledgeEntryCapability,
+  isManagedKnowledgeEntry,
+  knowledgeEntryRestrictionReason,
+  knowledgeTreeEntryFromFile,
+} from './entryCapabilities';
+import {
+  buildKnowledgeSearchTree,
+  collectKnowledgeDirectoryPaths,
+  initialKnowledgeTreeViewState,
+  isKnowledgePathWithin,
+  isNewerKnowledgeTreeRevision,
+  knowledgeDirectoryOnlyTree,
+  knowledgeFolderPathChain,
+  knowledgeRelocationIssue,
+  knowledgeTreeViewReducer,
+  mergeKnowledgeTreeChildren,
+  parentDirOfKnowledgePath,
+  replaceKnowledgePathPrefix,
+} from './treeModel';
+
+// ─── Tab keys (maps to ?tab= query values) ─────────────────────────────────────
+
+type TabKey = 'docs' | 'use' | 'set';
+const ALL_TABS: TabKey[] = ['docs', 'use', 'set'];
+
+// ─── Kind config (shared with KnowledgeCard via ../knowledgeKind) ──────────────
+
+/** Kind icon in a rounded square (52px for detail header, bigger than card). */
+function DetailKindIcon({ kind, config }: { kind: IKnowledgeBase['kind']; config: KindConfig }) {
+  return <KindIcon kind={kind} config={config} size={22} containerClass='w-52px h-52px rounded-14px' />;
+}
+
+function findKnowledgeTreeEntry(
+  nodes: IKnowledgeTreeEntry[],
+  relPath: string
+): IKnowledgeTreeEntry | undefined {
+  for (const node of nodes) {
+    if (node.rel_path === relPath) return node;
+    if (node.children?.length) {
+      const child = findKnowledgeTreeEntry(node.children, relPath);
+      if (child) return child;
+    }
+  }
+  return undefined;
+}
+
+const knowledgeDetailSoftActiveClass =
+  'knowledge-detail-soft-active border border-solid border-[rgba(var(--primary-6),0.26)] bg-[rgba(var(--primary-6),0.12)] text-[var(--color-text-1)] shadow-[inset_0_0_0_1px_rgba(var(--primary-6),0.06)]';
+const knowledgeDetailSegmentIdleClass =
+  'border border-solid border-transparent text-[var(--color-text-2)] hover:bg-[var(--color-fill-2)] hover:text-[var(--color-text-1)]';
+const knowledgeDetailSettingsLabelClass = 'block text-13px font-600 text-[var(--color-text-1)]';
+const knowledgeDetailSettingsInputClass = 'knowledge-detail-settings-input';
+
+type KnowledgeIconButtonProps = {
+  label: string;
+  icon: React.ReactNode;
+  onClick: () => void;
+  loading?: boolean;
+  tooltipPosition?: 'top' | 'bottom';
+};
+
+/** Compact icon action shared by the document rail header and its fixed footer. */
+const KnowledgeIconButton: React.FC<KnowledgeIconButtonProps> = ({
+  label,
+  icon,
+  onClick,
+  loading = false,
+  tooltipPosition = 'bottom',
+}) => (
+  <Tooltip content={label} position={tooltipPosition} mini>
+    <Button
+      type='text'
+      size='mini'
+      shape='circle'
+      className='knowledge-doc-icon-button'
+      icon={icon}
+      loading={loading}
+      aria-label={label}
+      onClick={onClick}
+    />
+  </Tooltip>
+);
+
+// ─── Settings Tab (D5) ────────────────────────────────────────────────────────
+
+interface SettingsTabProps {
+  base: IKnowledgeBase;
+  allTags: IKnowledgeTag[];
+  createTag: (label: string) => Promise<IKnowledgeTag>;
+  onRefresh: () => void;
+  onSourceRefreshed: () => Promise<void>;
+}
+
+const SettingsTab: React.FC<SettingsTabProps> = ({
+  base,
+  allTags,
+  createTag,
+  onRefresh,
+  onSourceRefreshed,
+}) => {
+  const { t } = useTranslation();
+  const navigate = useNavigate();
+  const hasRefreshableSource = Boolean(
+    base.source?.entries.some((entry) => entry.syncStatus !== 'paused')
+  );
+
+  // ─── Editable fields (local state, save on button click) ──────────────────
+  const [editName, setEditName] = useState(base.name);
+  const [editDesc, setEditDesc] = useState(base.description);
+  const [editTags, setEditTags] = useState<string[]>(base.tags);
+  const [editTreeAccess, setEditTreeAccess] = useState(base.tree_access);
+  const [saving, setSaving] = useState(false);
+
+  // Sync local state when base changes from parent refresh
+  useEffect(() => {
+    setEditName(base.name);
+    setEditDesc(base.description);
+    setEditTags(base.tags);
+    setEditTreeAccess(base.tree_access);
+  }, [base.name, base.description, base.tags, base.tree_access]);
+
+  const isDirty =
+    editName !== base.name ||
+    editDesc !== base.description ||
+    editTreeAccess !== base.tree_access ||
+    JSON.stringify(editTags) !== JSON.stringify(base.tags);
+
+  const handleSaveInfo = async () => {
+    if (!isDirty) return;
+    setSaving(true);
+    try {
+      await ipcBridge.knowledge.updateBase.invoke({
+        knowledge_base_id: base.knowledge_base_id,
+        name: editName.trim() || base.name,
+        description: editDesc,
+        tags: editTags,
+        tree_access: editTreeAccess,
+      });
+      Message.success(t('knowledge.detail.settings.saveOk', { defaultValue: '保存成功' }));
+      onRefresh();
+    } catch (e) {
+      Message.error(String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // ─── Source actions (per kind) ────────────────────────────────────────────
+  const [sourceLoading, setSourceLoading] = useState(false);
+
+  const handleRefreshSource = async () => {
+    if (sourceLoading) return;
+    setSourceLoading(true);
+    try {
+      const summary = await ipcBridge.knowledge.refreshSource.invoke({ knowledge_base_id: base.knowledge_base_id });
+      notifySourceFetchResult(t, summary, t('knowledge.source.refreshOk', { defaultValue: '刷新完成，获取 {{fetched}} 条', fetched: summary.fetched }));
+      await onSourceRefreshed();
+    } catch (e) {
+      Message.error(knowledgeErrorText(e));
+    } finally {
+      setSourceLoading(false);
+    }
+  };
+
+  // ─── Danger zone: export ──────────────────────────────────────────────────
+  const [exporting, setExporting] = useState(false);
+
+  const handleExport = async () => {
+    if (exporting) return;
+    const dirs = await ipcBridge.dialog.showOpen.invoke({ properties: ['openDirectory'] });
+    if (!dirs || dirs.length === 0) return;
+    const destDir = dirs[0];
+    setExporting(true);
+    try {
+      const { dest_path } = await ipcBridge.knowledge.exportBase.invoke({
+        knowledge_base_id: base.knowledge_base_id,
+        dest_path: destDir,
+      });
+      Message.success(t('knowledge.detail.settings.exportOk', { defaultValue: '已导出至 {{path}}', path: dest_path }));
+    } catch (e) {
+      Message.error(String(e));
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  // ─── Danger zone: delete ──────────────────────────────────────────────────
+  const [deleteModalVisible, setDeleteModalVisible] = useState(false);
+  const [purge, setPurge] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+
+  const handleDelete = async () => {
+    setDeleting(true);
+    try {
+      await ipcBridge.knowledge.deleteBase.invoke({ knowledge_base_id: base.knowledge_base_id, purge });
+      Message.success(t('knowledge.detail.settings.deleteOk', { defaultValue: '已删除' }));
+      navigate('/knowledge');
+    } catch (e) {
+      Message.error(String(e));
+    } finally {
+      setDeleting(false);
+      setDeleteModalVisible(false);
+    }
+  };
+
+  return (
+    <div className='knowledge-settings-layout flex max-w-900px flex-col gap-18px'>
+      {/* ─── Basic info: name / description / tags ─── */}
+      <NomiSettingList>
+        <NomiSettingRow
+          title={t('knowledge.detail.settings.labelName', { defaultValue: '名称' })}
+          description={t('knowledge.detail.settings.nameHint', {
+            defaultValue: '知识库的名称，会显示在列表与挂载选择中。',
+          })}
+          controls={
+            <NomiInput
+              contentFit
+              contentMaxWidth={320}
+              value={editName}
+              onChange={setEditName}
+              placeholder={t('knowledge.detail.settings.namePlaceholder', { defaultValue: '知识库名称' })}
+            />
+          }
+        />
+        {base.kind === 'local' && (
+          <NomiSettingRow
+            title={t('knowledge.detail.settings.folderEditAccess', {
+              defaultValue: '允许修改本地文件夹',
+            })}
+            description={t('knowledge.detail.settings.folderEditAccessHint', {
+              defaultValue: '开启后可在知识库中创建、编辑、移动和删除文件；关闭时保持严格只读。',
+            })}
+            controls={
+              <Switch
+                size='small'
+                checked={editTreeAccess === 'editable'}
+                onChange={(checked) => setEditTreeAccess(checked ? 'editable' : 'read_only')}
+              />
+            }
+          />
+        )}
+      </NomiSettingList>
+
+      <NomiSettingSection
+        title={t('knowledge.detail.settings.labelDesc', { defaultValue: '描述' })}
+        description={t('knowledge.detail.settings.descHint', {
+          defaultValue: '向模型说明此知识库的内容与适用场景，帮助判断何时检索此库。',
+        })}
+      >
+        <Input.TextArea
+          value={editDesc}
+          onChange={setEditDesc}
+          autoSize={{ minRows: 3, maxRows: 10 }}
+          className={`${knowledgeDetailSettingsInputClass} knowledge-settings-description-input`}
+          placeholder={t('knowledge.detail.settings.descPlaceholder', { defaultValue: '简要描述知识库内容和用途' })}
+        />
+      </NomiSettingSection>
+
+      <section className='knowledge-settings-tags-section flex flex-col gap-8px'>
+        <label className={knowledgeDetailSettingsLabelClass}>
+          {t('knowledge.detail.settings.labelTags', { defaultValue: '标签' })}
+        </label>
+        <div className='knowledge-settings-tag-picker'>
+          <TagPicker value={editTags} onChange={setEditTags} tags={allTags} createTag={createTag} />
+        </div>
+        <div className='mt-8px'>
+          <Button
+            className='knowledge-settings-save-button'
+            type='primary'
+            loading={saving}
+            disabled={!isDirty}
+            onClick={() => void handleSaveInfo()}
+          >
+            {t('knowledge.detail.settings.save', { defaultValue: '保存修改' })}
+          </Button>
+        </div>
+      </section>
+
+      {/* ─── Source section (varies by kind) ─── */}
+      <NomiSettingList>
+        <NomiSettingRow
+          className='knowledge-settings-source-row'
+          title={
+            <>
+              {t('knowledge.detail.settings.labelSource', { defaultValue: '来源' })}
+              {' · '}
+              {base.kind === 'local' && t('knowledge.card.kindLocal', { defaultValue: '本地文件夹' })}
+              {base.kind === 'web' && t('knowledge.card.kindWeb', { defaultValue: '网页' })}
+              {base.kind === 'blank' && t('knowledge.card.kindBlank', { defaultValue: '空白' })}
+            </>
+          }
+          description={
+            base.kind === 'web'
+              ? t('knowledge.detail.settings.webHint', { defaultValue: '网页来源 — 点击“刷新”重新抓取所有 URL。' })
+              : undefined
+          }
+          controls={
+            base.kind === 'local' ? (
+              <>
+                <NomiInput contentFit contentMinWidth={220} contentMaxWidth={520} value={base.root_path} readOnly />
+                <Button
+                  icon={<FolderOpen theme='outline' size='14' />}
+                  onClick={() => {
+                    void ipcBridge.shell.openFolderWith
+                      .invoke({ folder_path: base.root_path, tool: 'explorer' })
+                      .catch((e: unknown) => Message.error(String(e)));
+                  }}
+                >
+                  {t('knowledge.detail.settings.openFolder', { defaultValue: '打开' })}
+                </Button>
+              </>
+            ) : base.kind === 'web' && hasRefreshableSource ? (
+              <Button
+                icon={<Refresh theme='outline' size='14' />}
+                loading={sourceLoading}
+                onClick={() => void handleRefreshSource()}
+              >
+                {t('knowledge.detail.settings.refreshSource', { defaultValue: '刷新' })}
+              </Button>
+            ) : undefined
+          }
+        />
+      </NomiSettingList>
+
+      {/* ─── Danger zone ─── */}
+      <NomiSettingSection
+        className='knowledge-settings-danger-section'
+        title={t('knowledge.detail.settings.dangerTitle', { defaultValue: '危险操作' })}
+      >
+        <NomiSettingList>
+          <NomiSettingRow
+            title={t('knowledge.detail.settings.exportDesc', { defaultValue: '导出为 .zip 备份包' })}
+            controls={
+              <Button size='mini' loading={exporting} onClick={() => void handleExport()}>
+                {t('knowledge.detail.settings.exportBtn', { defaultValue: '导出' })}
+              </Button>
+            }
+          />
+          <NomiSettingRow
+            title={t('knowledge.detail.settings.deleteDesc', { defaultValue: '删除此知识库' })}
+            description={
+              !base.managed
+                ? t('knowledge.detail.settings.deleteLocalHint', { defaultValue: '（本地引用目录不会被删除）' })
+                : undefined
+            }
+            controls={
+              <Button size='mini' status='danger' onClick={() => setDeleteModalVisible(true)}>
+                {t('knowledge.detail.settings.deleteBtn', { defaultValue: '删除知识库' })}
+              </Button>
+            }
+          />
+        </NomiSettingList>
+      </NomiSettingSection>
+
+      {/* Delete confirmation modal */}
+      <Modal
+        title={t('knowledge.detail.settings.deleteModalTitle', { defaultValue: '确认删除知识库' })}
+        visible={deleteModalVisible}
+        onCancel={() => setDeleteModalVisible(false)}
+        onOk={() => void handleDelete()}
+        confirmLoading={deleting}
+        okButtonProps={{ status: 'danger' }}
+        okText={t('knowledge.detail.settings.deleteConfirm', { defaultValue: '确认删除' })}
+      >
+        <p className='text-13px text-[var(--color-text-2)] mb-12px'>
+          {t('knowledge.detail.settings.deleteWarning', {
+            defaultValue: '删除后无法恢复。知识库的所有文档、挂载关系将被清除。',
+          })}
+        </p>
+        {base.managed && (
+          <Checkbox checked={purge} onChange={setPurge}>
+            <span className='text-12px text-[var(--color-text-3)]'>
+              {t('knowledge.detail.settings.purgeOption', { defaultValue: '同时删除磁盘上的数据目录' })}
+            </span>
+          </Checkbox>
+        )}
+        {!base.managed && (
+          <p className='text-12px text-[var(--color-text-3)] m-0 mt-8px'>
+            {t('knowledge.detail.settings.deleteLocalNote', {
+              defaultValue: '本知识库引用的外部目录（{{path}}）不会被删除，仅取消关联。',
+              path: base.root_path,
+            })}
+          </p>
+        )}
+      </Modal>
+    </div>
+  );
+};
+
+// ─── Main Component ─────────────────────────────────────────────────────────────
+
+const KnowledgeDetailPage: React.FC = () => {
+  const { t } = useTranslation();
+  const sourceStatusLabel = useCallback(
+    (source: IKnowledgeEntrySource | undefined): string => {
+      switch (source?.sync_status) {
+        case 'syncing':
+          return t('knowledge.detail.docs.managedSyncing', {
+            defaultValue: '网页快照 · 正在同步',
+          });
+        case 'conflicted':
+          return t('knowledge.detail.docs.managedSyncConflict', {
+            defaultValue: '网页快照 · 同步冲突',
+          });
+        case 'failed':
+          return t('knowledge.detail.docs.managedSyncFailed', {
+            defaultValue: '网页快照 · 同步失败',
+          });
+        case 'missing':
+          return t('knowledge.detail.docs.managedSyncMissing', {
+            defaultValue: '网页快照 · 文件缺失',
+          });
+        default:
+          return t('knowledge.detail.docs.managedSnapshot', {
+            defaultValue: '网页快照 · 正文只读',
+          });
+      }
+    },
+    [t]
+  );
+  const navigate = useNavigate();
+  const { id: rawId } = useParams<{ id: string }>();
+  const id = rawId == null ? undefined : parseKnowledgeBaseId(rawId);
+  const activeKnowledgeBaseIdRef = useRef(id);
+  activeKnowledgeBaseIdRef.current = id;
+  const [searchParams, setSearchParams] = useSearchParams();
+  const layout = useLayoutContext();
+  const isMobile = layout?.isMobile ?? false;
+
+  // ─── Data hooks ─────────────────────────────────────────────────────────────
+  const { base, files: remoteFiles, tree, loading, error, refresh } = useKnowledgeBase(id);
+  const { choice: modelChoice, setChoice: setModelChoice } = useKnowledgeAutogenModel();
+  const { tags: allTags, createTag } = useKnowledgeTags();
+
+  // ─── Tab routing via ?tab= ──────────────────────────────────────────────────
+  const rawTabParam = searchParams.get('tab');
+  const activeTab: TabKey = rawTabParam && ALL_TABS.includes(rawTabParam as TabKey) ? (rawTabParam as TabKey) : 'docs';
+
+  const setTab = useCallback(
+    (key: string) => {
+      setSearchParams(
+        (prev) => {
+          prev.set('tab', key);
+          return prev;
+        },
+        { replace: true }
+      );
+    },
+    [setSearchParams]
+  );
+
+  // ─── Tag resolution ─────────────────────────────────────────────────────────
+  const tagMap = useMemo(() => {
+    const m: Record<string, IKnowledgeTag> = {};
+    for (const tag of allTags) m[tag.key] = tag;
+    return m;
+  }, [allTags]);
+
+  // ─── Document state (preserved from original — D2 will own this) ────────────
+  const [treeState, dispatchTree] = useReducer(knowledgeTreeViewReducer, initialKnowledgeTreeViewState);
+  const {
+    files,
+    treeData,
+    expandedTreeKeys,
+    selectedFolderPath,
+    selectedPath,
+    selectedTreeKey,
+  } = treeState;
+  const [content, setContent] = useState<string>('');
+  const [loadedDocument, setLoadedDocument] = useState<IKnowledgeFileContent | null>(null);
+  const [documentReloadToken, setDocumentReloadToken] = useState(0);
+  const [fileLoading, setFileLoading] = useState(false);
+  const [editMode, setEditMode] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [newFolderVisible, setNewFolderVisible] = useState(false);
+  const [newFolderPath, setNewFolderPath] = useState('');
+  const [renameVisible, setRenameVisible] = useState(false);
+  const [renameTarget, setRenameTarget] = useState<IKnowledgeTreeEntry | null>(null);
+  const [renameName, setRenameName] = useState('');
+  const [autogenLoading, setAutogenLoading] = useState(false);
+  const [refreshingSource, setRefreshingSource] = useState(false);
+  const [enablingLocalFolderEdits, setEnablingLocalFolderEdits] = useState(false);
+  const [fileSearch, setFileSearch] = useState('');
+  const [treeAction, setTreeAction] = useState<'reveal' | 'expand' | null>(null);
+  const [movingPath, setMovingPath] = useState<string | null>(null);
+  const [moveTarget, setMoveTarget] = useState<IKnowledgeTreeEntry | null>(null);
+  const [moveDestinationPath, setMoveDestinationPath] = useState('');
+  const [moveDirectoryTree, setMoveDirectoryTree] = useState<IKnowledgeTreeEntry[]>([]);
+  const [moveDirectoryLoading, setMoveDirectoryLoading] = useState(false);
+  const [sourceActionEntryId, setSourceActionEntryId] = useState<string | null>(null);
+  const treeScrollRef = React.useRef<HTMLDivElement>(null);
+  const addContentControlRef = React.useRef<KnowledgeAddContentControlHandle>(null);
+  const loadedDocumentPathRef = useRef<string | null>(null);
+  const loadedDocumentVersionRef = useRef<{
+    entryId: NonNullable<IKnowledgeTreeEntry['entry_id']>;
+    revision: number;
+  } | null>(null);
+  const relocationInFlightRef = useRef(false);
+  const saveInFlightRef = useRef(false);
+  const moveDirectoryRequestRef = useRef(0);
+  const lastTreeRevisionRef = useRef<number | null>(null);
+  const isTreeSearch = fileSearch.trim().length > 0;
+
+  const source = getBaseSource(base);
+  const canMutateTree = base?.tree_access === 'editable';
+  const defaultContentFolderPath =
+    selectedFolderPath || parentDirOfKnowledgePath(selectedPath);
+  const defaultContentFolderEntryId = defaultContentFolderPath
+    ? findKnowledgeTreeEntry(treeData, defaultContentFolderPath)?.entry_id
+    : undefined;
+  const canEditSelectedDocument =
+    canMutateTree &&
+    loadedDocument?.rel_path === selectedPath &&
+    hasKnowledgeEntryCapability(loadedDocument, 'edit_content');
+  const selectedDocumentReadOnlyReason =
+    base?.kind === 'local' && !canMutateTree
+      ? t('knowledge.detail.docs.localFolderReadOnlyReason', {
+          defaultValue: '当前本地文件夹仅作只读索引；启用文件操作后可编辑。',
+        })
+      : knowledgeEntryRestrictionReason(
+          loadedDocument,
+          isManagedKnowledgeEntry(loadedDocument)
+            ? t('knowledge.detail.docs.managedReadOnlyReason', {
+                defaultValue: '正文由来源管理；仍可移动、重命名或复制为可编辑笔记。',
+              })
+            : t('knowledge.detail.docs.entryReadOnlyReason', {
+                defaultValue: '当前文档不可编辑。',
+              })
+        );
+  const selectedDocumentEntry = loadedDocument
+    ? knowledgeTreeEntryFromFile(loadedDocument)
+    : null;
+
+  useEffect(() => {
+    dispatchTree({ type: 'sync', files: remoteFiles, tree });
+  }, [remoteFiles, tree]);
+
+  // Reset per-base view state when switching knowledge bases — the route param
+  // changes but React reuses this component instance, so the previous base's
+  // document search query / edit mode would otherwise leak into the next base
+  // (looking like "documents missing"). selectedPath is reconciled above.
+  useEffect(() => {
+    setFileSearch('');
+    setEditMode(false);
+    setNewFolderVisible(false);
+    setNewFolderPath('');
+    setRenameVisible(false);
+    setRenameTarget(null);
+    setRenameName('');
+    moveDirectoryRequestRef.current += 1;
+    setMoveTarget(null);
+    setMoveDestinationPath('');
+    setMoveDirectoryTree([]);
+    setMoveDirectoryLoading(false);
+    setLoadedDocument(null);
+    setSourceActionEntryId(null);
+    loadedDocumentPathRef.current = null;
+    loadedDocumentVersionRef.current = null;
+    lastTreeRevisionRef.current = null;
+    dispatchTree({ type: 'reset-base' });
+  }, [id]);
+
+  // Load file content
+  useEffect(() => {
+    if (!id || !selectedPath) {
+      setContent('');
+      setLoadedDocument(null);
+      loadedDocumentPathRef.current = null;
+      loadedDocumentVersionRef.current = null;
+      return;
+    }
+    // A relocate changes the document's locator, not the editor session. The
+    // move handler advances this ref before dispatching the path transition so
+    // an unsaved draft is never replaced by a redundant disk read.
+    if (loadedDocumentPathRef.current === selectedPath) return;
+    loadedDocumentVersionRef.current = null;
+    setLoadedDocument(null);
+    let cancelled = false;
+    setFileLoading(true);
+    setEditMode(false);
+    ipcBridge.knowledge.readFile
+      .invoke({ knowledge_base_id: id, path: selectedPath })
+      .then((res) => {
+        if (!cancelled) {
+          setContent(res.content);
+          setLoadedDocument(res);
+          loadedDocumentPathRef.current = selectedPath;
+          loadedDocumentVersionRef.current =
+            res.entry_id != null && res.revision != null
+              ? { entryId: res.entry_id, revision: res.revision }
+              : null;
+        }
+      })
+      .catch((e) => {
+        if (!cancelled) Message.error(String(e));
+      })
+      .finally(() => {
+        if (!cancelled) setFileLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [documentReloadToken, id, selectedPath]);
+
+  const forceReloadSelectedDocument = useCallback(() => {
+    loadedDocumentPathRef.current = null;
+    loadedDocumentVersionRef.current = null;
+    setLoadedDocument(null);
+    setDocumentReloadToken((token) => token + 1);
+  }, []);
+
+  useEffect(() => {
+    if (!id) return;
+    return ipcBridge.knowledge.onEntryContentUpdated.on((event) => {
+      if (event.knowledge_base_id !== id) return;
+      if (loadedDocument?.entry_id === event.entry_id || selectedPath === event.rel_path) {
+        forceReloadSelectedDocument();
+      }
+    });
+  }, [forceReloadSelectedDocument, id, loadedDocument?.entry_id, selectedPath]);
+
+  useEffect(() => {
+    if (editMode && !canEditSelectedDocument) setEditMode(false);
+  }, [canEditSelectedDocument, editMode]);
+
+  const startEdit = () => {
+    if (!canEditSelectedDocument) return;
+    setDraft(content);
+    setEditMode(true);
+  };
+
+  const handleSave = async () => {
+    if (
+      !id ||
+      !selectedPath ||
+      !canEditSelectedDocument ||
+      saveInFlightRef.current ||
+      relocationInFlightRef.current
+    ) return;
+    const saveBaseId = id;
+    const savePath = selectedPath;
+    const draftToSave = draft;
+    const selectedEntry = findKnowledgeTreeEntry(treeData, savePath);
+    const loadedVersion =
+      loadedDocumentPathRef.current === savePath
+        ? loadedDocumentVersionRef.current
+        : null;
+    const stableEntryId = loadedVersion?.entryId ?? selectedEntry?.entry_id;
+    const stableRevision = loadedVersion?.revision ?? selectedEntry?.revision;
+    const hasStableVersion = stableEntryId != null && stableRevision != null;
+    saveInFlightRef.current = true;
+    setSaving(true);
+    try {
+      const result = await ipcBridge.knowledge.writeFile.invoke({
+        knowledge_base_id: saveBaseId,
+        path: savePath,
+        content: draftToSave,
+        expected_content: content,
+        entry_id: hasStableVersion ? stableEntryId : undefined,
+        expected_revision: hasStableVersion ? stableRevision : undefined,
+      });
+      if (activeKnowledgeBaseIdRef.current !== saveBaseId) return;
+      if (result.rel_path !== savePath) {
+        preserveLoadedDocumentRelocation(savePath, result.rel_path);
+        dispatchTree({ type: 'relocated', oldPath: savePath, newPath: result.rel_path });
+      }
+      if (hasStableVersion && loadedDocumentVersionRef.current?.entryId === stableEntryId) {
+        // Atomic replacement changes the projected filesystem identity; the
+        // next reconciliation deterministically advances this entry once.
+        loadedDocumentVersionRef.current = {
+          entryId: stableEntryId,
+          revision: stableRevision + 1,
+        };
+      }
+      setLoadedDocument((previous) =>
+        previous
+          ? {
+              ...previous,
+              rel_path: result.rel_path,
+              content: draftToSave,
+              revision:
+                previous.revision == null ? previous.revision : previous.revision + 1,
+            }
+          : previous
+      );
+      setContent(draftToSave);
+      setEditMode(false);
+      Message.success(t('knowledge.actions.saveOk'));
+      await Promise.all([
+        refresh(),
+        reloadTreeBranches([
+          parentDirOfKnowledgePath(savePath),
+          parentDirOfKnowledgePath(result.rel_path),
+        ]),
+      ]);
+    } catch (e) {
+      Message.error(String(e));
+    } finally {
+      saveInFlightRef.current = false;
+      setSaving(false);
+    }
+  };
+
+  const handleLoadTreeChildren = useCallback(
+    async (node: IKnowledgeTreeEntry) => {
+      if (!id || node.is_file || isTreeSearch) return;
+      const children = await ipcBridge.knowledge.listTree.invoke({ knowledge_base_id: id, path: node.rel_path });
+      dispatchTree({ type: 'merge-children', parentPath: node.rel_path, children });
+    },
+    [id, isTreeSearch]
+  );
+
+  const reloadTreeBranches = useCallback(
+    async (folderPaths: string[]) => {
+      if (!id) return;
+      const rootChildren = await ipcBridge.knowledge.listTree.invoke({ knowledge_base_id: id });
+      dispatchTree({ type: 'set-root', tree: rootChildren });
+
+      const branchesToReload = [
+        ...new Set(folderPaths.flatMap((folderPath) => knowledgeFolderPathChain(folderPath))),
+      ];
+      for (const branchPath of branchesToReload) {
+        const children = await ipcBridge.knowledge.listTree.invoke({ knowledge_base_id: id, path: branchPath });
+        dispatchTree({ type: 'merge-children', parentPath: branchPath, children });
+      }
+      if (branchesToReload.length > 0) {
+        dispatchTree({ type: 'expand', paths: branchesToReload });
+      }
+    },
+    [id]
+  );
+
+  const reloadTreePath = useCallback(
+    (folderPath: string) => reloadTreeBranches([folderPath]),
+    [reloadTreeBranches]
+  );
+
+  const scrollCurrentTreeNodeIntoView = useCallback(() => {
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        const container = treeScrollRef.current;
+        const selectedNode = container?.querySelector<HTMLElement>('.arco-tree-node-selected');
+        if (!container || !selectedNode) return;
+
+        const containerRect = container.getBoundingClientRect();
+        const nodeRect = selectedNode.getBoundingClientRect();
+        const centeredTop =
+          container.scrollTop + nodeRect.top - containerRect.top - (container.clientHeight - nodeRect.height) / 2;
+        container.scrollTo({ top: Math.max(0, centeredTop), behavior: 'smooth' });
+      });
+    });
+  }, []);
+
+  const handleRevealCurrentFile = useCallback(async () => {
+    if (!selectedPath) {
+      Message.info(t('knowledge.selectFile'));
+      return;
+    }
+
+    setTreeAction('reveal');
+    try {
+      const parentPath = parentDirOfKnowledgePath(selectedPath);
+      const ancestorKeys = knowledgeFolderPathChain(parentPath);
+      setFileSearch('');
+      await reloadTreePath(parentPath);
+      dispatchTree({ type: 'expand', paths: ancestorKeys });
+      dispatchTree({ type: 'select-tree-key', path: selectedPath });
+      scrollCurrentTreeNodeIntoView();
+    } catch (e) {
+      Message.error(String(e));
+    } finally {
+      setTreeAction(null);
+    }
+  }, [reloadTreePath, scrollCurrentTreeNodeIntoView, selectedPath, t]);
+
+  const loadEntireKnowledgeTree = useCallback(async (): Promise<IKnowledgeTreeEntry[]> => {
+    if (!id) return [];
+    const loadAllChildren = async (nodes: IKnowledgeTreeEntry[]): Promise<IKnowledgeTreeEntry[]> =>
+      Promise.all(
+        nodes.map(async (node) => {
+          if (!node.is_dir) return node;
+          const children = await ipcBridge.knowledge.listTree.invoke({
+            knowledge_base_id: id,
+            path: node.rel_path,
+          });
+          return { ...node, children: await loadAllChildren(children) };
+        })
+      );
+
+    const rootNodes = await ipcBridge.knowledge.listTree.invoke({ knowledge_base_id: id });
+    return loadAllChildren(rootNodes);
+  }, [id]);
+
+  const handleExpandAllTreeNodes = useCallback(async () => {
+    if (!id) return;
+
+    setTreeAction('expand');
+    try {
+      const fullTree = await loadEntireKnowledgeTree();
+      setFileSearch('');
+      dispatchTree({ type: 'set-root', tree: fullTree });
+      dispatchTree({ type: 'replace-expanded', paths: collectKnowledgeDirectoryPaths(fullTree) });
+    } catch (e) {
+      Message.error(String(e));
+    } finally {
+      setTreeAction(null);
+    }
+  }, [id, loadEntireKnowledgeTree]);
+
+  const openNewFolderModal = (folderOverride?: string) => {
+    if (!canMutateTree) return;
+    const folder = folderOverride ?? (selectedFolderPath || parentDirOfKnowledgePath(selectedPath));
+    setNewFolderPath(folder ? `${folder}/` : '');
+    setNewFolderVisible(true);
+  };
+
+  const handleContentAdded = async (result: IKnowledgeAddContentResult) => {
+    setFileSearch('');
+    await refresh();
+    if (result.type === 'document') {
+      const parent = parentDirOfKnowledgePath(result.path);
+      await reloadTreePath(parent);
+      dispatchTree({ type: 'select-file', path: result.path });
+      return;
+    }
+    if (result.type === 'local_folder') {
+      await reloadTreePath(result.target_directory);
+      if (result.first_file) {
+        dispatchTree({ type: 'select-file', path: result.first_file });
+      } else {
+        dispatchTree({ type: 'select-folder', path: result.target_directory });
+      }
+      return;
+    }
+    if (result.first_file) {
+      const parent = parentDirOfKnowledgePath(result.first_file);
+      await reloadTreePath(parent);
+      dispatchTree({ type: 'select-file', path: result.first_file });
+    }
+  };
+
+  const openRenameModal = (item: IKnowledgeTreeEntry) => {
+    if (!hasKnowledgeEntryCapability(item, 'rename')) return;
+    setRenameTarget(item);
+    setRenameName(item.name);
+    setRenameVisible(true);
+  };
+
+  const preserveLoadedDocumentRelocation = useCallback((oldPath: string, newPath: string) => {
+    const previousPath = loadedDocumentPathRef.current;
+    const relocatedPath = replaceKnowledgePathPrefix(
+      previousPath,
+      oldPath,
+      newPath
+    );
+    loadedDocumentPathRef.current = relocatedPath;
+    if (
+      previousPath != null &&
+      relocatedPath !== previousPath &&
+      loadedDocumentVersionRef.current
+    ) {
+      loadedDocumentVersionRef.current = {
+        ...loadedDocumentVersionRef.current,
+        revision: loadedDocumentVersionRef.current.revision + 1,
+      };
+    }
+    setLoadedDocument((previous) => {
+      if (!previous) return previous;
+      const nextPath = replaceKnowledgePathPrefix(previous.rel_path, oldPath, newPath);
+      if (!nextPath || nextPath === previous.rel_path) return previous;
+      return {
+        ...previous,
+        rel_path: nextPath,
+        revision:
+          previous.revision == null ? previous.revision : previous.revision + 1,
+      };
+    });
+  }, []);
+
+  const scrollKnowledgeTreePathIntoView = useCallback((path: string) => {
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        const container = treeScrollRef.current;
+        if (!container) return;
+        const target = Array.from(
+          container.querySelectorAll<HTMLElement>('[data-knowledge-path]')
+        ).find((element) => element.dataset.knowledgePath === path);
+        target?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      });
+    });
+  }, []);
+
+  const describeRelocationIssue = useCallback(
+    (issue: ReturnType<typeof knowledgeRelocationIssue>): string => {
+      switch (issue) {
+        case 'same-parent':
+          return t('knowledge.detail.docs.moveSameParent', { defaultValue: '项目已经在这个文件夹中' });
+        case 'self':
+          return t('knowledge.detail.docs.moveIntoSelf', { defaultValue: '文件夹不能移动到自身' });
+        case 'descendant':
+          return t('knowledge.detail.docs.moveIntoDescendant', {
+            defaultValue: '文件夹不能移动到自己的子文件夹中',
+          });
+        default:
+          return '';
+      }
+    },
+    [t]
+  );
+
+  const applyRelocationReceipt = useCallback(
+    async (result: IKnowledgeRelocateResult, operationBaseId: NonNullable<typeof id>) => {
+      if (activeKnowledgeBaseIdRef.current !== operationBaseId) return false;
+      preserveLoadedDocumentRelocation(result.old_path, result.new_path);
+      lastTreeRevisionRef.current = Math.max(
+        lastTreeRevisionRef.current ?? 0,
+        result.tree_revision
+      );
+      dispatchTree({ type: 'relocated', oldPath: result.old_path, newPath: result.new_path });
+      setFileSearch('');
+      await refresh();
+      await reloadTreeBranches([
+        parentDirOfKnowledgePath(result.old_path),
+        parentDirOfKnowledgePath(result.new_path),
+      ]);
+      scrollKnowledgeTreePathIntoView(result.new_path);
+      return true;
+    },
+    [preserveLoadedDocumentRelocation, refresh, reloadTreeBranches, scrollKnowledgeTreePathIntoView]
+  );
+
+  const relocateTreeEntry = useCallback(
+    async (
+      sourceEntry: IKnowledgeTreeEntry,
+      destinationParentPath: string,
+      options?: { newName?: string; successKind?: 'move' | 'rename' }
+    ): Promise<IKnowledgeRelocateResult | null> => {
+      const requiredCapability =
+        options?.successKind === 'rename' ? 'rename' : 'relocate';
+      if (
+        !id ||
+        !canMutateTree ||
+        !hasKnowledgeEntryCapability(sourceEntry, requiredCapability) ||
+        relocationInFlightRef.current ||
+        saveInFlightRef.current
+      ) return null;
+      const issue = knowledgeRelocationIssue(
+        sourceEntry.rel_path,
+        sourceEntry.is_dir,
+        destinationParentPath,
+        options?.newName
+      );
+      if (issue) {
+        if (issue !== 'same-parent' || options?.successKind === 'rename') {
+          Message.warning(describeRelocationIssue(issue));
+        }
+        return null;
+      }
+
+      relocationInFlightRef.current = true;
+      setMovingPath(sourceEntry.rel_path);
+      try {
+        const result = await ipcBridge.knowledge.relocateTreeEntry.invoke({
+          knowledge_base_id: id,
+          source_path: sourceEntry.rel_path,
+          destination_parent_path: destinationParentPath,
+          new_name: options?.newName,
+          request_id: uuidv7(),
+          conflict_policy: 'reject',
+          entry_id: sourceEntry.entry_id,
+          destination_parent_id: destinationParentPath
+            ? findKnowledgeTreeEntry(treeData, destinationParentPath)?.entry_id ??
+              findKnowledgeTreeEntry(moveDirectoryTree, destinationParentPath)?.entry_id
+            : undefined,
+          expected_revision: sourceEntry.revision,
+        });
+        // The route can switch knowledge bases while the filesystem mutation is
+        // in flight. The old operation still succeeded, but must never rewrite
+        // the newly mounted base's local tree/editor state.
+        if (!(await applyRelocationReceipt(result, id))) return result;
+        const successMessage = options?.successKind === 'rename'
+            ? t('knowledge.actions.renameOk', { defaultValue: '已重命名' })
+            : t('knowledge.actions.moveOk', {
+                defaultValue: '已移动到“{{folder}}”',
+                folder:
+                  parentDirOfKnowledgePath(result.new_path) ||
+                  t('knowledge.detail.docs.rootFolder', { defaultValue: '知识库根目录' }),
+              });
+        if (result.undo_token) {
+          const notificationId = `knowledge-relocation-${result.operation_id}`;
+          Notification.success({
+            id: notificationId,
+            title: successMessage,
+            content: t('knowledge.actions.undoMoveHint', {
+              defaultValue: '如需恢复原位置，可在通知关闭前撤销。',
+            }),
+            btn: (
+              <Button
+                size='mini'
+                onClick={() => {
+                  if (relocationInFlightRef.current || saveInFlightRef.current) return;
+                  Notification.remove(notificationId);
+                  relocationInFlightRef.current = true;
+                  setMovingPath(result.new_path);
+                  void ipcBridge.knowledge.undoRelocateTreeEntry
+                    .invoke({
+                      knowledge_base_id: id,
+                      request_id: uuidv7(),
+                      undo_token: result.undo_token!,
+                    })
+                    .then(async (undone) => {
+                      if (await applyRelocationReceipt(undone, id)) {
+                        Message.success(
+                          t('knowledge.actions.moveUndone', { defaultValue: '已撤销移动' })
+                        );
+                      }
+                    })
+                    .catch((error: unknown) => Message.error(String(error)))
+                    .finally(() => {
+                      relocationInFlightRef.current = false;
+                      setMovingPath(null);
+                    });
+                }}
+              >
+                {t('knowledge.actions.undoMove', { defaultValue: '撤销' })}
+              </Button>
+            ),
+            duration: 8000,
+          });
+        } else {
+          Message.success(successMessage);
+        }
+        return result;
+      } catch (e) {
+        Message.error(String(e));
+        return null;
+      } finally {
+        relocationInFlightRef.current = false;
+        setMovingPath(null);
+      }
+    },
+    [
+      applyRelocationReceipt,
+      canMutateTree,
+      describeRelocationIssue,
+      id,
+      moveDirectoryTree,
+      t,
+      treeData,
+    ]
+  );
+
+  const handleCreateFolder = async () => {
+    if (!id || !canMutateTree) return;
+    const path = newFolderPath.trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    if (!path) return;
+    const parent = parentDirOfKnowledgePath(path);
+    try {
+      await ipcBridge.knowledge.createFolder.invoke({ knowledge_base_id: id, path });
+      setNewFolderVisible(false);
+      setNewFolderPath('');
+      setFileSearch('');
+      await reloadTreePath(parent);
+      dispatchTree({ type: 'select-folder', path });
+      Message.success(t('knowledge.actions.createFolderOk', { defaultValue: '文件夹已创建' }));
+    } catch (e) {
+      Message.error(String(e));
+    }
+  };
+
+  const handleRenameTreeEntry = async () => {
+    if (
+      !id ||
+      !renameTarget ||
+      !canMutateTree ||
+      !hasKnowledgeEntryCapability(renameTarget, 'rename')
+    ) return;
+    let newName = renameName.trim();
+    if (!newName) return;
+    if (renameTarget.is_file && !newName.toLowerCase().endsWith('.md')) newName = `${newName}.md`;
+    const result = await relocateTreeEntry(renameTarget, parentDirOfKnowledgePath(renameTarget.rel_path), {
+      newName,
+      successKind: 'rename',
+    });
+    if (result) {
+      setRenameVisible(false);
+      setRenameTarget(null);
+      setRenameName('');
+    }
+  };
+
+  const handleDeleteFile = async (item: IKnowledgeTreeEntry) => {
+    if (!id || !canMutateTree || !item.entry_id || item.revision == null) return;
+    const path = item.rel_path;
+    const parent = parentDirOfKnowledgePath(path);
+    try {
+      await ipcBridge.knowledge.deleteFile.invoke({
+        knowledge_base_id: id,
+        path,
+        entry_id: item.entry_id,
+        expected_revision: item.revision,
+      });
+      Message.success(t('knowledge.actions.deleteOk'));
+      if (selectedPath === path) {
+        loadedDocumentPathRef.current = null;
+        loadedDocumentVersionRef.current = null;
+        dispatchTree({ type: 'remove-path', path, parentPath: parent });
+      }
+      await refresh();
+      await reloadTreePath(parent);
+    } catch (e) {
+      Message.error(String(e));
+    }
+  };
+
+  const handleDeleteFolder = async (item: IKnowledgeTreeEntry) => {
+    if (!id || !canMutateTree || !item.entry_id || item.revision == null) return;
+    const path = item.rel_path;
+    const parent = parentDirOfKnowledgePath(path);
+    try {
+      await ipcBridge.knowledge.deleteFolder.invoke({
+        knowledge_base_id: id,
+        path,
+        entry_id: item.entry_id,
+        expected_revision: item.revision,
+      });
+      Message.success(t('knowledge.actions.deleteFolderOk', { defaultValue: '目录已删除' }));
+      setFileSearch('');
+      if (isKnowledgePathWithin(selectedPath, path)) {
+        loadedDocumentPathRef.current = null;
+        loadedDocumentVersionRef.current = null;
+        setContent('');
+        setDraft('');
+        setEditMode(false);
+      }
+      dispatchTree({ type: 'remove-path', path, parentPath: parent });
+      await refresh();
+      await reloadTreePath(parent);
+    } catch (e) {
+      Message.error(String(e));
+    }
+  };
+
+  const confirmDeleteTreeEntry = (item: IKnowledgeTreeEntry) => {
+    if (item.is_dir) {
+      Modal.confirm({
+        title: t('knowledge.tree.deleteFolderTitle', { defaultValue: '确认删除目录？' }),
+        content: (
+          <div className='text-13px leading-20px text-[var(--color-text-2)]'>
+            <div>
+              {t('knowledge.tree.deleteFolderWarning', {
+                defaultValue:
+                  '删除目录“{{name}}”会永久删除其下所有文件和子目录，包括知识库树中未显示的非 Markdown 文件，无法撤销。',
+                name: item.name,
+              })}
+            </div>
+            <div className='mt-6px break-all text-[var(--color-text-3)]'>{item.rel_path}</div>
+          </div>
+        ),
+        okButtonProps: { status: 'danger' },
+        okText: t('knowledge.actions.delete', { defaultValue: '删除' }),
+        onOk: () => handleDeleteFolder(item),
+      });
+      return;
+    }
+
+    Modal.confirm({
+      title: t('knowledge.actions.deleteFileConfirm', { defaultValue: '确认删除该文档？' }),
+      content: <div className='break-all text-[var(--color-text-3)]'>{item.rel_path}</div>,
+      okButtonProps: { status: 'danger' },
+      okText: t('knowledge.actions.delete', { defaultValue: '删除' }),
+      onOk: () => handleDeleteFile(item),
+    });
+  };
+
+  const openMoveModal = useCallback(
+    async (item: IKnowledgeTreeEntry) => {
+      if (!hasKnowledgeEntryCapability(item, 'relocate')) return;
+      const requestNumber = moveDirectoryRequestRef.current + 1;
+      moveDirectoryRequestRef.current = requestNumber;
+      setMoveTarget(item);
+      setMoveDestinationPath(parentDirOfKnowledgePath(item.rel_path));
+      setMoveDirectoryTree(knowledgeDirectoryOnlyTree(treeData, item));
+      setMoveDirectoryLoading(true);
+      try {
+        if (!id) return;
+        const rootTree = await ipcBridge.knowledge.listTree.invoke({ knowledge_base_id: id });
+        if (moveDirectoryRequestRef.current === requestNumber) {
+          setMoveDirectoryTree(knowledgeDirectoryOnlyTree(rootTree, item));
+        }
+      } catch (error) {
+        Message.error(String(error));
+      } finally {
+        if (moveDirectoryRequestRef.current === requestNumber) {
+          setMoveDirectoryLoading(false);
+        }
+      }
+    },
+    [id, treeData]
+  );
+
+  const confirmMoveTreeEntry = useCallback(async () => {
+    if (!moveTarget) return;
+    const result = await relocateTreeEntry(moveTarget, moveDestinationPath, { successKind: 'move' });
+    if (result) {
+      moveDirectoryRequestRef.current += 1;
+      setMoveTarget(null);
+      setMoveDestinationPath('');
+      setMoveDirectoryTree([]);
+    }
+  }, [moveDestinationPath, moveTarget, relocateTreeEntry]);
+
+  useEffect(() => {
+    if (!id) return;
+    return ipcBridge.knowledge.onTreeChanged.on((event) => {
+      if (
+        event.knowledge_base_id !== id ||
+        !event.old_prefix ||
+        !event.new_prefix ||
+        !isNewerKnowledgeTreeRevision(lastTreeRevisionRef.current, event.tree_revision)
+      ) {
+        return;
+      }
+      lastTreeRevisionRef.current = event.tree_revision;
+      preserveLoadedDocumentRelocation(event.old_prefix, event.new_prefix);
+      dispatchTree({ type: 'relocated', oldPath: event.old_prefix, newPath: event.new_prefix });
+      setFileSearch('');
+      void Promise.all([
+        refresh(),
+        reloadTreeBranches([
+          parentDirOfKnowledgePath(event.old_prefix),
+          parentDirOfKnowledgePath(event.new_prefix),
+        ]),
+      ]).catch((error: unknown) => Message.error(String(error)));
+    });
+  }, [id, preserveLoadedDocumentRelocation, refresh, reloadTreeBranches]);
+
+  const runEntrySourceAction = async (
+    action: 'refresh' | 'copy' | 'detach' | 'remove',
+    item: IKnowledgeTreeEntry
+  ) => {
+    if (!id || !item.entry_id || item.revision == null || sourceActionEntryId) return;
+    const operationBaseId = id;
+    const parentPath = parentDirOfKnowledgePath(item.rel_path);
+    const destinationParentId = parentPath
+      ? findKnowledgeTreeEntry(treeData, parentPath)?.entry_id
+      : undefined;
+    setSourceActionEntryId(item.entry_id);
+    try {
+      const common = {
+        knowledge_base_id: operationBaseId,
+        entry_id: item.entry_id,
+        expected_revision: item.revision,
+      };
+      let result: IKnowledgeEntrySourceActionResult;
+      switch (action) {
+        case 'refresh':
+          result = await ipcBridge.knowledge.refreshEntrySource.invoke(common);
+          break;
+        case 'copy':
+          result = await ipcBridge.knowledge.copyEntryAsEditable.invoke({
+            ...common,
+            destination_parent_path: parentPath || undefined,
+            destination_parent_id: destinationParentId,
+          });
+          break;
+        case 'detach':
+          result = await ipcBridge.knowledge.detachEntrySource.invoke(common);
+          break;
+        case 'remove':
+          result = await ipcBridge.knowledge.removeEntrySource.invoke(common);
+          break;
+      }
+
+      if (activeKnowledgeBaseIdRef.current !== operationBaseId) return;
+      setFileSearch('');
+      if (action === 'remove') {
+        if (selectedPath === item.rel_path) {
+          loadedDocumentPathRef.current = null;
+          loadedDocumentVersionRef.current = null;
+          setLoadedDocument(null);
+          setContent('');
+          setDraft('');
+          setEditMode(false);
+        }
+        dispatchTree({ type: 'remove-path', path: item.rel_path, parentPath });
+        await Promise.all([refresh(), reloadTreePath(parentPath)]);
+        Message.success(
+          t('knowledge.detail.docs.removeSourceOk', { defaultValue: '已移除网页来源' })
+        );
+        return;
+      }
+
+      await Promise.all([refresh(), reloadTreePath(parentPath)]);
+      if (action === 'copy') {
+        const copied = result.entry;
+        if (copied?.is_file) {
+          await reloadTreePath(parentDirOfKnowledgePath(copied.rel_path));
+          dispatchTree({ type: 'select-file', path: copied.rel_path });
+        }
+        Message.success(
+          t('knowledge.detail.docs.copyAsEditableOk', {
+            defaultValue: '已创建可编辑副本',
+          })
+        );
+        return;
+      }
+
+      const affectsSelectedDocument =
+        loadedDocument?.entry_id === item.entry_id || selectedPath === item.rel_path;
+      if (affectsSelectedDocument) forceReloadSelectedDocument();
+      if (action === 'refresh') {
+        if (result.source_fetch) {
+          notifySourceFetchResult(
+            t,
+            result.source_fetch,
+            t('knowledge.detail.docs.refreshEntryOk', {
+              defaultValue: '网页快照已刷新',
+            })
+          );
+        } else {
+          Message.success(
+            t('knowledge.detail.docs.refreshEntryOk', {
+              defaultValue: '网页快照已刷新',
+            })
+          );
+        }
+      } else {
+        Message.success(
+          t('knowledge.detail.docs.detachSourceOk', {
+            defaultValue: '已脱离同步，现在可以编辑正文',
+          })
+        );
+      }
+    } catch (error) {
+      Message.error(knowledgeErrorText(error));
+    } finally {
+      setSourceActionEntryId(null);
+    }
+  };
+
+  const confirmDetachEntrySource = (item: IKnowledgeTreeEntry) => {
+    Modal.confirm({
+      title: t('knowledge.detail.docs.detachSourceTitle', {
+        defaultValue: '脱离网页同步？',
+      }),
+      content: t('knowledge.detail.docs.detachSourceConfirm', {
+        defaultValue: '将保留当前正文并转换为普通笔记，之后不再随原网页刷新。',
+      }),
+      okText: t('knowledge.detail.docs.detachSource', { defaultValue: '脱离同步' }),
+      onOk: () => runEntrySourceAction('detach', item),
+    });
+  };
+
+  const confirmRemoveEntrySource = (item: IKnowledgeTreeEntry) => {
+    Modal.confirm({
+      title: t('knowledge.detail.docs.removeSourceTitle', {
+        defaultValue: '移除网页来源？',
+      }),
+      content: t('knowledge.detail.docs.removeSourceConfirm', {
+        defaultValue: '将同时移除来源关系和这份受管快照。此操作无法撤销。',
+      }),
+      okButtonProps: { status: 'danger' },
+      okText: t('knowledge.detail.docs.removeSource', { defaultValue: '移除来源' }),
+      onOk: () => runEntrySourceAction('remove', item),
+    });
+  };
+
+  const handleTreeNodeMenuClick = (key: string, item: IKnowledgeTreeEntry) => {
+    if (key === 'new-file' && item.is_dir) {
+      addContentControlRef.current?.openDocument(item.rel_path);
+      return;
+    }
+    if (key === 'new-folder' && item.is_dir) {
+      openNewFolderModal(item.rel_path);
+      return;
+    }
+    if (key === 'rename') {
+      openRenameModal(item);
+      return;
+    }
+    if (key === 'move') {
+      void openMoveModal(item);
+      return;
+    }
+    if (key === 'delete') {
+      confirmDeleteTreeEntry(item);
+      return;
+    }
+    if (key === 'open-source' && item.source?.source_url) {
+      void openExternalUrl(item.source.source_url).catch((error: unknown) =>
+        Message.error(knowledgeErrorText(error))
+      );
+      return;
+    }
+    if (key === 'refresh-source') {
+      void runEntrySourceAction('refresh', item);
+      return;
+    }
+    if (key === 'copy-as-editable') {
+      void runEntrySourceAction('copy', item);
+      return;
+    }
+    if (key === 'detach-source') {
+      confirmDetachEntrySource(item);
+      return;
+    }
+    if (key === 'remove-source') {
+      confirmRemoveEntrySource(item);
+    }
+  };
+
+  const hasTreeNodeActions = (item: IKnowledgeTreeEntry): boolean =>
+    Boolean(item.source?.source_url) ||
+    hasKnowledgeEntryCapability(item, 'refresh_source') ||
+    hasKnowledgeEntryCapability(item, 'copy_as_editable') ||
+    hasKnowledgeEntryCapability(item, 'detach_source') ||
+    hasKnowledgeEntryCapability(item, 'remove_source') ||
+    hasKnowledgeEntryCapability(item, 'accept_children') ||
+    hasKnowledgeEntryCapability(item, 'rename') ||
+    hasKnowledgeEntryCapability(item, 'relocate') ||
+    hasKnowledgeEntryCapability(item, 'delete_entry');
+
+  const renderTreeNodeMenu = (item: IKnowledgeTreeEntry) => (
+    <Menu
+      className='knowledge-tree-node-menu'
+      onClickMenuItem={(key) => handleTreeNodeMenuClick(String(key), item)}
+    >
+      {item.source?.source_url && (
+        <Menu.Item key='open-source'>
+          <span className='inline-flex items-center gap-4px'>
+            <LinkOne theme='outline' size='11' />
+            {t('knowledge.detail.docs.openSource', { defaultValue: '打开原网页' })}
+          </span>
+        </Menu.Item>
+      )}
+      {hasKnowledgeEntryCapability(item, 'refresh_source') && (
+        <Menu.Item key='refresh-source'>
+          <span className='inline-flex items-center gap-4px'>
+            <Refresh theme='outline' size='11' />
+            {t('knowledge.detail.docs.refreshEntry', { defaultValue: '刷新此网页' })}
+          </span>
+        </Menu.Item>
+      )}
+      {hasKnowledgeEntryCapability(item, 'copy_as_editable') && (
+        <Menu.Item key='copy-as-editable'>
+          <span className='inline-flex items-center gap-4px'>
+            <Copy theme='outline' size='11' />
+            {t('knowledge.detail.docs.copyAsEditable', {
+              defaultValue: '复制为可编辑笔记',
+            })}
+          </span>
+        </Menu.Item>
+      )}
+      {hasKnowledgeEntryCapability(item, 'detach_source') && (
+        <Menu.Item key='detach-source'>
+          <span className='inline-flex items-center gap-4px'>
+            <Unlink theme='outline' size='11' />
+            {t('knowledge.detail.docs.detachSource', { defaultValue: '脱离同步' })}
+          </span>
+        </Menu.Item>
+      )}
+      {item.is_dir && hasKnowledgeEntryCapability(item, 'accept_children') && (
+        <>
+          <Menu.Item key='new-file'>
+            <span className='inline-flex items-center gap-4px'>
+              <Plus theme='outline' size='11' />
+              {t('knowledge.detail.docs.newFile', { defaultValue: '新建文档' })}
+            </span>
+          </Menu.Item>
+          <Menu.Item key='new-folder'>
+            <span className='inline-flex items-center gap-4px'>
+              <FolderPlus theme='outline' size='11' />
+              {t('knowledge.detail.docs.newFolder', { defaultValue: '新建文件夹' })}
+            </span>
+          </Menu.Item>
+        </>
+      )}
+      {hasKnowledgeEntryCapability(item, 'rename') && (
+        <Menu.Item key='rename'>
+          <span className='inline-flex items-center gap-4px'>
+            <EditTwo theme='outline' size='11' />
+            {t('knowledge.actions.rename', { defaultValue: '重命名' })}
+          </span>
+        </Menu.Item>
+      )}
+      {hasKnowledgeEntryCapability(item, 'relocate') && (
+        <Menu.Item key='move'>
+          <span className='inline-flex items-center gap-4px'>
+            <FolderOpen theme='outline' size='11' />
+            {t('knowledge.actions.move', { defaultValue: '移动到…' })}
+          </span>
+        </Menu.Item>
+      )}
+      {hasKnowledgeEntryCapability(item, 'delete_entry') && (
+        <Menu.Item key='delete' className='!text-danger-6'>
+          <span className='inline-flex items-center gap-4px'>
+            <Delete theme='outline' size='11' />
+            {t('knowledge.actions.delete', { defaultValue: '删除' })}
+          </span>
+        </Menu.Item>
+      )}
+      {hasKnowledgeEntryCapability(item, 'remove_source') && (
+        <Menu.Item key='remove-source' className='!text-danger-6'>
+          <span className='inline-flex items-center gap-4px'>
+            <Delete theme='outline' size='11' />
+            {t('knowledge.detail.docs.removeSource', { defaultValue: '移除网页来源' })}
+          </span>
+        </Menu.Item>
+      )}
+    </Menu>
+  );
+
+  const handleOpenFolder = async () => {
+    if (!base) return;
+    try {
+      await ipcBridge.shell.openFolderWith.invoke({ folder_path: base.root_path, tool: 'explorer' });
+    } catch (e) {
+      Message.error(String(e));
+    }
+  };
+
+  const handleEnableLocalFolderEdits = async () => {
+    if (
+      !id ||
+      base?.kind !== 'local' ||
+      canMutateTree ||
+      enablingLocalFolderEdits
+    ) return;
+    setEnablingLocalFolderEdits(true);
+    try {
+      await ipcBridge.knowledge.updateBase.invoke({
+        knowledge_base_id: id,
+        tree_access: 'editable',
+      });
+      await refresh();
+      Message.success(
+        t('knowledge.detail.docs.enableFileOperationsOk', {
+          defaultValue: '已恢复新建、编辑、移动、重命名和删除操作',
+        })
+      );
+    } catch (error) {
+      Message.error(knowledgeErrorText(error));
+    } finally {
+      setEnablingLocalFolderEdits(false);
+    }
+  };
+
+  const handleAutogen = async () => {
+    if (!id || autogenLoading) return;
+    setAutogenLoading(true);
+    try {
+      const res = await ipcBridge.knowledge.autogenBase.invoke({ knowledge_base_id: id, ...(modelChoice ?? {}) });
+      Message.success(
+        t(res.readme_written ? 'knowledge.actions.autogenOkReadme' : 'knowledge.actions.autogenOkNoReadme')
+      );
+      void refresh();
+    } catch (e) {
+      Message.error(isAutogenNoProviderError(e) ? t('knowledge.actions.autogenNoProvider') : knowledgeErrorText(e));
+    } finally {
+      setAutogenLoading(false);
+    }
+  };
+
+  const refreshAfterSourceMutation = async () => {
+    await refresh();
+    if (
+      isManagedKnowledgeEntry(loadedDocument) ||
+      hasKnowledgeEntryCapability(loadedDocument, 'refresh_source')
+    ) {
+      forceReloadSelectedDocument();
+    }
+  };
+
+  const handleRefreshSource = async () => {
+    if (!id || refreshingSource) return;
+    setRefreshingSource(true);
+    try {
+      const summary = await ipcBridge.knowledge.refreshSource.invoke({ knowledge_base_id: id });
+      notifySourceFetchResult(t, summary, t('knowledge.source.refreshOk', { fetched: summary.fetched }));
+      await refreshAfterSourceMutation();
+    } catch (e) {
+      Message.error(knowledgeErrorText(e));
+    } finally {
+      setRefreshingSource(false);
+    }
+  };
+
+  // ─── Computed ───────────────────────────────────────────────────────────────
+  const kindConfig = base ? getKindConfig(base.kind, t, 'neutral') : null;
+
+  const displayedTreeData = useMemo(
+    () => (isTreeSearch ? buildKnowledgeSearchTree(files, fileSearch, treeData) : treeData),
+    [files, fileSearch, isTreeSearch, treeData]
+  );
+  const visibleTreeExpandedKeys = useMemo(
+    () => (isTreeSearch ? collectKnowledgeDirectoryPaths(displayedTreeData) : expandedTreeKeys),
+    [displayedTreeData, expandedTreeKeys, isTreeSearch]
+  );
+  const loadedTreeDirectoryKeys = useMemo(
+    () => collectKnowledgeDirectoryPaths(treeData),
+    [treeData]
+  );
+  const isEntireTreeExpanded = useMemo(
+    () =>
+      loadedTreeDirectoryKeys.length > 0 &&
+      loadedTreeDirectoryKeys.every((key) => expandedTreeKeys.includes(key)),
+    [expandedTreeKeys, loadedTreeDirectoryKeys]
+  );
+
+  const handleToggleEntireTree = useCallback(() => {
+    if (isEntireTreeExpanded && !isTreeSearch) {
+      dispatchTree({ type: 'replace-expanded', paths: [] });
+      return;
+    }
+    void handleExpandAllTreeNodes();
+  }, [handleExpandAllTreeNodes, isEntireTreeExpanded, isTreeSearch]);
+
+  const moveModalIssue = moveTarget
+    ? knowledgeRelocationIssue(
+        moveTarget.rel_path,
+        moveTarget.is_dir,
+        moveDestinationPath
+      )
+    : null;
+
+  // Build breadcrumb segments from selected path
+  const breadcrumbSegments = useMemo(() => {
+    if (!selectedPath) return [];
+    return selectedPath.split('/');
+  }, [selectedPath]);
+
+  const relativeTime = useMemo(() => {
+    if (!base?.updated_at) return '';
+    // updated_at is already epoch-MILLIS (TimestampMs / now_ms() on the backend);
+    // KnowledgeCard's formatRelativeTime treats it as ms directly. The stray
+    // `* 1000` here pushed it ~1.7e15, making diffMin always < 1 → forever "刚刚".
+    const diffMs = Date.now() - base.updated_at;
+    const diffMin = Math.floor(diffMs / 60000);
+    if (diffMin < 1) return t('knowledge.detail.justNow', { defaultValue: '刚刚' });
+    if (diffMin < 60) return t('knowledge.detail.minutesAgo', { defaultValue: '{{n}} 分钟前', n: diffMin });
+    const diffH = Math.floor(diffMin / 60);
+    if (diffH < 24) return t('knowledge.detail.hoursAgo', { defaultValue: '{{n}} 小时前', n: diffH });
+    const diffD = Math.floor(diffH / 24);
+    return t('knowledge.detail.daysAgo', { defaultValue: '{{n}} 天前', n: diffD });
+  }, [base?.updated_at, t]);
+
+  // ─── Error state ────────────────────────────────────────────────────────────
+  if (error) {
+    return (
+      <div className='size-full flex items-center justify-center'>
+        <Result
+          status='error'
+          title={t('knowledge.loadError')}
+          subTitle={error}
+          extra={<Button onClick={() => navigate('/knowledge')}>{t('knowledge.backToList')}</Button>}
+        />
+      </div>
+    );
+  }
+
+  // ─── Render ─────────────────────────────────────────────────────────────────
+  return (
+    <div
+      className={classNames(
+        'size-full box-border overflow-y-auto',
+        isMobile ? 'px-16px py-14px' : 'px-12px py-24px md:px-40px md:py-32px'
+      )}
+    >
+      <div className='mx-auto flex w-full max-w-1180px box-border flex-col gap-16px'>
+        {/* ─── Back link ─────────────────────────────────────────────────────── */}
+        <button
+          type='button'
+          className='knowledge-detail-back-link inline-flex h-24px items-center gap-6px border-0 bg-transparent p-0 font-[inherit] text-12px leading-none text-[var(--color-text-3)] appearance-none cursor-pointer transition-colors hover:text-primary-6 focus-visible:outline-none focus-visible:text-primary-6'
+          onClick={() => navigate('/knowledge')}
+        >
+          <span className='knowledge-detail-back-icon inline-flex h-14px w-14px items-center justify-center leading-none [&_svg]:block'>
+            <Left theme='outline' size='14' />
+          </span>
+          <span className='leading-none'>{t('knowledge.detail.back', { defaultValue: '返回知识库' })}</span>
+        </button>
+
+        {/* ─── Header ────────────────────────────────────────────────────────── */}
+        <div className='flex flex-wrap items-start justify-between gap-18px'>
+          {/* Left: icon + title + badges + tags */}
+          <div className='flex gap-14px items-center'>
+            {base && kindConfig && <DetailKindIcon kind={base.kind} config={kindConfig} />}
+            <div className='flex flex-col gap-6px'>
+              <h1 className='m-0 text-21px font-700 text-[var(--color-text-1)] flex items-center gap-9px'>
+                {base?.name ?? '...'}
+                {/* Pen icon — edit entry point (actual editing in D5/Settings tab) */}
+                <span
+                  className='text-12px text-[var(--color-text-3)] cursor-pointer hover:text-primary-6'
+                  onClick={() => setTab('set')}
+                  title={t('knowledge.detail.editName', { defaultValue: '编辑名称' })}
+                >
+                  <EditTwo theme='outline' size='12' />
+                </span>
+              </h1>
+              <div className='flex flex-wrap items-center gap-6px'>
+                {/* Kind badge */}
+                {kindConfig && (
+                  <span
+                    className={`knowledge-detail-kind-badge inline-flex items-center rounded-6px px-8px py-2px text-10px font-600 border border-solid ${kindConfig.bgClass} ${kindConfig.textClass} ${kindConfig.borderClass}`}
+                  >
+                    {kindConfig.label}
+                  </span>
+                )}
+                {/* User tags */}
+                {base?.tags.map((tagKey) => {
+                  const tag = tagMap[tagKey];
+                  return (
+                    <span
+                      key={tagKey}
+                      className='knowledge-detail-user-tag inline-flex items-center gap-5px text-11px font-500 text-[var(--color-text-1)] bg-[var(--color-fill-2)] border border-solid border-[var(--color-border-3)] rounded-6px px-8px py-2px'
+                    >
+                      {tag?.color && (
+                        <i className='w-6px h-6px rounded-full inline-block' style={{ background: tag.color }} />
+                      )}
+                      {tag?.label ?? tagKey}
+                    </span>
+                  );
+                })}
+                {/* Add tag placeholder (leads to settings tab) */}
+                <span
+                  className='knowledge-detail-add-tag text-11px font-500 text-[var(--color-text-2)] bg-[var(--color-fill-1)] cursor-pointer border border-dashed border-[var(--color-border-3)] rounded-6px px-8px py-2px transition-colors hover:bg-[rgba(var(--primary-6),0.1)] hover:text-[var(--color-text-1)] hover:border-[rgba(var(--primary-6),0.36)]'
+                  onClick={() => setTab('set')}
+                >
+                  + {t('knowledge.detail.addTag', { defaultValue: '标签' })}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* Right: action buttons */}
+          <div className='flex items-center gap-8px flex-wrap'>
+            <Button
+              shape='round'
+              icon={<Search theme='outline' size='14' />}
+              onClick={() => Message.info(t('knowledge.detail.searchPlaceholder', { defaultValue: '检索功能开发中' }))}
+            >
+              {t('knowledge.detail.search', { defaultValue: '检索' })}
+            </Button>
+            <Button
+              type='primary'
+              shape='round'
+              icon={<LinkOne theme='outline' size='14' />}
+              onClick={() => setTab('use')}
+            >
+              {t('knowledge.detail.mountToSession', { defaultValue: '挂载到会话' })}
+            </Button>
+            <Dropdown
+              droplist={
+                <Menu>
+                  <Menu.Item key='export' onClick={() => setTab('set')}>
+                    {t('knowledge.detail.export', { defaultValue: '导出' })}
+                  </Menu.Item>
+                  <Menu.Item key='openFolder' onClick={() => void handleOpenFolder()}>
+                    {t('knowledge.actions.openFolder', { defaultValue: '打开文件夹' })}
+                  </Menu.Item>
+                  <Menu.Item key='delete' className='!text-danger-6' onClick={() => setTab('set')}>
+                    {t('knowledge.detail.delete', { defaultValue: '删除知识库' })}
+                  </Menu.Item>
+                </Menu>
+              }
+              position='br'
+            >
+              <Button shape='round' icon={<More theme='outline' size='14' />} />
+            </Dropdown>
+          </div>
+        </div>
+
+        {/* ─── Meta info row ─────────────────────────────────────────────────── */}
+        {base && (
+          <div className='flex flex-wrap gap-14px text-12px text-[var(--color-text-3)]'>
+            <span>{t('knowledge.detail.fileCount', { defaultValue: '{{n}} 篇文档', n: base.file_count })}</span>
+            <span>{formatSize(base.total_size)}</span>
+            {/* mount count placeholder — D3 consumers section will provide real data */}
+            <span>{t('knowledge.detail.rootPath', { defaultValue: '{{path}}', path: base.root_path })}</span>
+            {relativeTime && (
+              <span>{t('knowledge.detail.updatedAt', { defaultValue: '更新于 {{time}}', time: relativeTime })}</span>
+            )}
+          </div>
+        )}
+
+        {/* ─── Tabs ──────────────────────────────────────────────────────────── */}
+        <Tabs className='knowledge-detail-tabs' activeTab={activeTab} onChange={(k) => setTab(k)} type='line'>
+          {/* Tab: Documents */}
+          <Tabs.TabPane key='docs' title={t('knowledge.detail.tabDocs', { defaultValue: '文档' })}>
+            {/* ── Document tree + viewer (D2 redesign) ── */}
+            <div
+              className={classNames(
+                'knowledge-doc-workspace flex w-full gap-14px',
+                isMobile ? 'flex-col' : 'flex-row',
+                isMobile ? 'min-h-720px' : 'h-[clamp(500px,calc(100vh-300px),760px)] min-h-500px'
+              )}
+            >
+              {/* ─── Left: File tree panel ─── */}
+              <div
+                className={classNames(
+                  'knowledge-doc-panel-frame knowledge-doc-sidebar box-border shrink-0 flex flex-col overflow-hidden rd-12px bg-transparent',
+                  isMobile ? 'h-420px w-full' : 'h-full w-276px'
+                )}
+              >
+                {/* Compact document toolbar: icon-first, labels are shown in small hover bubbles. */}
+                <div className='knowledge-doc-divider-bottom knowledge-doc-toolbar flex h-42px shrink-0 items-center gap-2px bg-transparent px-9px'>
+                  {base?.kind === 'local' && !canMutateTree && (
+                    <Button
+                      type='text'
+                      size='mini'
+                      className='knowledge-local-folder-enable-editing'
+                      icon={<Unlock theme='outline' size='14' />}
+                      loading={enablingLocalFolderEdits}
+                      onClick={() => void handleEnableLocalFolderEdits()}
+                    >
+                      {t('knowledge.detail.docs.enableFileOperations', {
+                        defaultValue: '启用文件操作',
+                      })}
+                    </Button>
+                  )}
+                  {id && base && canMutateTree && (
+                    <KnowledgeAddContentControl
+                      key={id}
+                      ref={addContentControlRef}
+                      knowledgeBaseId={id}
+                      baseRootPath={base.root_path}
+                      defaultFolderPath={defaultContentFolderPath}
+                      defaultFolderEntryId={defaultContentFolderEntryId}
+                      existingUrlCount={
+                        source?.entries.filter((entry) => entry.syncStatus !== 'paused').length ?? 0
+                      }
+                      onAdded={handleContentAdded}
+                    />
+                  )}
+                  {canMutateTree && (
+                    <KnowledgeIconButton
+                      label={t('knowledge.detail.docs.newFolder', { defaultValue: '新建文件夹' })}
+                      icon={<FolderPlus theme='outline' size='15' />}
+                      onClick={() => openNewFolderModal()}
+                    />
+                  )}
+                  <div className='ml-auto flex items-center gap-2px'>
+                    <KnowledgeIconButton
+                      label={t('knowledge.detail.docs.revealCurrentFile', { defaultValue: '自动显示当前文件' })}
+                      icon={<FileFocus theme='outline' size='15' />}
+                      loading={treeAction === 'reveal'}
+                      onClick={() => void handleRevealCurrentFile()}
+                    />
+                    <KnowledgeIconButton
+                      label={
+                        isEntireTreeExpanded && !isTreeSearch
+                          ? t('knowledge.detail.docs.collapseAll', { defaultValue: '全部折叠' })
+                          : t('knowledge.detail.docs.expandAll', { defaultValue: '全部展开' })
+                      }
+                      icon={
+                        isEntireTreeExpanded && !isTreeSearch ? (
+                          <ExpandUp theme='outline' size='15' />
+                        ) : (
+                          <ExpandDown theme='outline' size='15' />
+                        )
+                      }
+                      loading={treeAction === 'expand'}
+                      onClick={handleToggleEntireTree}
+                    />
+                  </div>
+                </div>
+
+                {/* Search box */}
+                <div className='knowledge-doc-search mx-9px mt-9px flex shrink-0 items-center gap-7px rounded-7px bg-[var(--color-fill-2)] border border-solid border-[var(--color-border-3)] px-9px py-4px'>
+                  <Search theme='outline' size='13' className='text-[var(--color-text-3)] shrink-0' />
+                  <input
+                    className='min-w-0 border-none bg-transparent outline-none text-[var(--color-text-1)] text-11px w-full placeholder:text-[var(--color-text-3)]'
+                    placeholder={t('knowledge.detail.docs.searchPlaceholder', { defaultValue: '搜索文档…' })}
+                    value={fileSearch}
+                    onChange={(e) => setFileSearch(e.target.value)}
+                  />
+                </div>
+
+                {/* File tree */}
+                <div
+                  ref={treeScrollRef}
+                  className='knowledge-doc-tree-scroll min-h-0 flex-1 overflow-y-auto px-7px py-8px'
+                >
+                  <KnowledgeTreeDnd
+                    disabled={!canMutateTree || isTreeSearch || Boolean(movingPath) || saving}
+                    expandedDirectoryPaths={expandedTreeKeys}
+                    labels={{
+                      dropHint: t('knowledge.detail.docs.moveDropHint', {
+                        defaultValue: '拖到文件夹以移动',
+                      }),
+                      invalidTarget: t('knowledge.detail.docs.moveFileInvalidTarget', {
+                        defaultValue: '文件不能作为目标位置',
+                      }),
+                      rootFolder: t('knowledge.detail.docs.rootFolder', {
+                        defaultValue: '知识库根目录',
+                      }),
+                      describeIssue: describeRelocationIssue,
+                      moveTo: (folder) =>
+                        t('knowledge.detail.docs.moveToTarget', {
+                          defaultValue: '移动到“{{folder}}”',
+                          folder,
+                        }),
+                    }}
+                    onExpandDirectory={(path) =>
+                      dispatchTree({ type: 'expand', paths: [path] })
+                    }
+                    onInvalidDrop={(issue) => Message.warning(describeRelocationIssue(issue))}
+                    onLoadDirectory={handleLoadTreeChildren}
+                    onLoadError={(error) => Message.error(String(error))}
+                    onRelocate={(entry, destinationParentPath) => {
+                      void relocateTreeEntry(entry, destinationParentPath, {
+                        successKind: 'move',
+                      });
+                    }}
+                  >
+                    <Spin loading={loading} className='w-full'>
+                    {displayedTreeData.length === 0 ? (
+                      <Empty
+                        description={
+                          fileSearch.trim()
+                            ? t('knowledge.detail.docs.noSearchResults', { defaultValue: '无匹配文件' })
+                            : t('knowledge.noFiles')
+                        }
+                        className='mt-32px'
+                      />
+                    ) : (
+                      <Tree
+                        className='knowledge-doc-tree text-13px [&_.arco-tree-node]:w-full [&_.arco-tree-node-title-wrapper]:flex [&_.arco-tree-node-title-wrapper]:w-full [&_.arco-tree-node-title-wrapper]:min-w-0 [&_.arco-tree-node-title-wrapper]:items-center [&_.arco-tree-node-title]:min-w-0 [&_.arco-tree-node-title]:flex-1 [&_.arco-tree-node-title]:!pr-0'
+                        size='mini'
+                        blockNode
+                        showLine
+                        icons={(nodeProps) => ({
+                          switcherIcon: nodeProps.isLeaf ? null : (
+                            <Right
+                              theme='outline'
+                              size='11'
+                              className={classNames(
+                                'knowledge-tree-switcher-chevron transition-transform duration-150',
+                                nodeProps.expanded && 'rotate-90'
+                              )}
+                            />
+                          ),
+                        })}
+                        actionOnClick={['select', 'expand']}
+                        selectedKeys={selectedTreeKey ? [selectedTreeKey] : []}
+                        expandedKeys={visibleTreeExpandedKeys}
+                        treeData={displayedTreeData}
+                        fieldNames={{
+                          children: 'children',
+                          title: 'name',
+                          key: 'rel_path',
+                          isLeaf: 'is_file',
+                        }}
+                        onSelect={(_keys, extra) => {
+                          const dataRef = (extra?.node as { props?: { dataRef?: IKnowledgeTreeEntry } } | undefined)
+                            ?.props?.dataRef;
+                          if (!dataRef) return;
+                          if (dataRef.is_file) {
+                            dispatchTree({ type: 'select-file', path: dataRef.rel_path });
+                          } else {
+                            dispatchTree({ type: 'select-folder', path: dataRef.rel_path });
+                          }
+                        }}
+                        onExpand={(keys) => {
+                          if (!isTreeSearch) dispatchTree({ type: 'replace-expanded', paths: keys.map(String) });
+                        }}
+                        loadMore={(treeNode) => {
+                          const dataRef = (treeNode.props as { dataRef?: IKnowledgeTreeEntry }).dataRef;
+                          if (!dataRef || dataRef.is_file || isTreeSearch) return Promise.resolve();
+                          return handleLoadTreeChildren(dataRef).catch((e: unknown) => {
+                            Message.error(String(e));
+                          });
+                        }}
+                        renderTitle={(node) => {
+                          const item = node.dataRef as IKnowledgeTreeEntry;
+                          const row = (
+                            <KnowledgeTreeDndRow item={item}>
+                            <div className='knowledge-tree-node-row group flex w-full min-w-0 items-center gap-3px pr-1px'>
+                              <KnowledgeTreeDndHandle
+                                aria-label={`${t('knowledge.actions.move', { defaultValue: '移动' })} ${item.name}`}
+                                className='knowledge-tree-node-main flex min-w-0 flex-1 items-center'
+                              >
+                                <span className='knowledge-tree-node-name block min-w-0 truncate leading-17px' title={item.rel_path}>
+                                  {node.title}
+                                </span>
+                              </KnowledgeTreeDndHandle>
+                              {isManagedKnowledgeEntry(item) && (
+                                <Tooltip
+                                  content={item.source?.last_error || sourceStatusLabel(item.source)}
+                                  mini
+                                >
+                                  <span
+                                    className={classNames(
+                                      'inline-flex shrink-0',
+                                      ['conflicted', 'failed', 'missing'].includes(
+                                        item.source?.sync_status ?? ''
+                                      )
+                                        ? 'text-[var(--color-warning-6)]'
+                                        : 'text-[var(--color-text-3)]'
+                                    )}
+                                  >
+                                    <LinkCloud theme='outline' size='11' />
+                                  </span>
+                                </Tooltip>
+                              )}
+                              {hasTreeNodeActions(item) && (
+                                <span className='knowledge-tree-node-action ml-auto w-21px grid shrink-0 place-items-center opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-within:opacity-100'>
+                                <Dropdown
+                                  trigger='click'
+                                  droplist={renderTreeNodeMenu(item)}
+                                >
+                                  <button
+                                    type='button'
+                                    className='knowledge-tree-node-more grid h-20px w-20px shrink-0 place-items-center rounded-5px border-0 bg-transparent p-0 text-[var(--color-text-3)] cursor-pointer hover:bg-[var(--color-fill-2)] hover:text-[var(--color-text-1)] focus-visible:outline-none focus-visible:bg-[var(--color-fill-2)]'
+                                    onPointerDown={(e) => e.stopPropagation()}
+                                    onMouseDown={(e) => e.stopPropagation()}
+                                    onClick={(e) => e.stopPropagation()}
+                                    disabled={sourceActionEntryId === item.entry_id}
+                                    title={t('common.more', { defaultValue: '更多' })}
+                                    aria-label={t('common.more', { defaultValue: '更多' })}
+                                  >
+                                    <More theme='outline' size='13' />
+                                  </button>
+                                </Dropdown>
+                                </span>
+                              )}
+                            </div>
+                            </KnowledgeTreeDndRow>
+                          );
+                          return hasTreeNodeActions(item) ? (
+                            <Dropdown
+                              trigger='contextMenu'
+                              position='bl'
+                              triggerProps={{ alignPoint: true }}
+                              droplist={renderTreeNodeMenu(item)}
+                            >
+                              <div className='w-full'>{row}</div>
+                            </Dropdown>
+                          ) : row;
+                        }}
+                      />
+                    )}
+                    </Spin>
+                  </KnowledgeTreeDnd>
+                </div>
+
+                {/* This footer remains pinned while only the directory tree scrolls. */}
+                <div className='knowledge-doc-divider-top knowledge-doc-footer flex h-44px shrink-0 items-center gap-2px bg-transparent px-8px'>
+                  {canMutateTree && (
+                    <>
+                      <KnowledgeIconButton
+                        label={t('knowledge.actions.aiGenerateOverview')}
+                        icon={<MagicHat theme='outline' size='13' />}
+                        loading={autogenLoading}
+                        tooltipPosition='top'
+                        onClick={() => void handleAutogen()}
+                      />
+                      <div className='min-w-0 flex-1'>
+                        <KnowledgeModelSelector
+                          size='small'
+                          choice={modelChoice}
+                          onChange={(c) => void setModelChoice(c)}
+                          triggerClassName='knowledge-doc-model-trigger'
+                        />
+                      </div>
+                    </>
+                  )}
+                  {source?.entries.some((entry) => entry.syncStatus !== 'paused') && (
+                    <KnowledgeIconButton
+                      label={t('knowledge.source.refresh')}
+                      icon={<Refresh theme='outline' size='13' />}
+                      loading={refreshingSource}
+                      tooltipPosition='top'
+                      onClick={() => void handleRefreshSource()}
+                    />
+                  )}
+                </div>
+              </div>
+
+              {/* ─── Right: Viewer / editor panel ─── */}
+              <div className='knowledge-doc-panel-frame box-border min-h-0 min-w-0 flex-1 flex flex-col overflow-hidden rd-12px bg-transparent'>
+                {selectedPath == null ? (
+                  <div className='flex-1 grid place-items-center'>
+                    <Empty description={t('knowledge.selectFile')} />
+                  </div>
+                ) : (
+                  <>
+                    {/* Toolbar: breadcrumb + toggle + save */}
+                    <div className='knowledge-doc-divider-bottom knowledge-doc-editor-toolbar flex items-center justify-between gap-8px bg-transparent px-16px py-11px'>
+                      {/* Breadcrumb */}
+                      <div className='flex min-w-0 items-center gap-8px text-12px text-[var(--color-text-3)]'>
+                        <div className='min-w-0 truncate'>
+                          {breadcrumbSegments.map((seg, idx) => (
+                            <React.Fragment key={idx}>
+                              {idx > 0 && <span className='mx-4px'>/</span>}
+                              {idx === breadcrumbSegments.length - 1 ? (
+                                <span className='font-500 text-[var(--color-text-2)]'>{seg}</span>
+                              ) : (
+                                <span>{seg}</span>
+                              )}
+                            </React.Fragment>
+                          ))}
+                        </div>
+                        {isManagedKnowledgeEntry(loadedDocument) && (
+                          <Tooltip
+                            content={loadedDocument?.source?.last_error || selectedDocumentReadOnlyReason}
+                            mini
+                          >
+                            <span
+                              className={classNames(
+                                'inline-flex shrink-0 items-center gap-4px rounded-6px bg-[var(--color-fill-2)] px-6px py-2px text-10px',
+                                ['conflicted', 'failed', 'missing'].includes(
+                                  loadedDocument?.source?.sync_status ?? ''
+                                )
+                                  ? 'text-[var(--color-warning-6)]'
+                                  : 'text-[var(--color-text-2)]'
+                              )}
+                            >
+                              <LinkCloud theme='outline' size='11' />
+                              {sourceStatusLabel(loadedDocument?.source)}
+                            </span>
+                          </Tooltip>
+                        )}
+                      </div>
+                      {/* Right side controls */}
+                      <div className='flex items-center gap-10px shrink-0'>
+                        {/* Preview / Edit segmented toggle */}
+                        <div className='inline-flex bg-[var(--color-fill-2)] border border-solid border-[var(--color-border-3)] rd-8px p-2px'>
+                          <button
+                            className={classNames(
+                              'bg-transparent text-12px px-12px py-5px rd-6px cursor-pointer font-inherit transition-colors',
+                              !editMode
+                                ? `${knowledgeDetailSoftActiveClass} font-600`
+                                : knowledgeDetailSegmentIdleClass
+                            )}
+                            onClick={() => setEditMode(false)}
+                          >
+                            {t('knowledge.detail.docs.preview', { defaultValue: '预览' })}
+                          </button>
+                          <button
+                            className={classNames(
+                              'bg-transparent text-12px px-12px py-5px rd-6px font-inherit transition-colors',
+                              canEditSelectedDocument
+                                ? 'cursor-pointer'
+                                : 'cursor-not-allowed opacity-45',
+                              editMode
+                                ? `${knowledgeDetailSoftActiveClass} font-600`
+                                : knowledgeDetailSegmentIdleClass
+                            )}
+                            disabled={!canEditSelectedDocument}
+                            title={
+                              canEditSelectedDocument
+                                ? undefined
+                                : selectedDocumentReadOnlyReason
+                            }
+                            onClick={startEdit}
+                          >
+                            {t('knowledge.detail.docs.edit', { defaultValue: '编辑' })}
+                          </button>
+                        </div>
+                        {selectedDocumentEntry &&
+                          hasKnowledgeEntryCapability(
+                            selectedDocumentEntry,
+                            'copy_as_editable'
+                          ) && (
+                            <Button
+                              size='small'
+                              icon={<Copy theme='outline' size='12' />}
+                              loading={sourceActionEntryId === selectedDocumentEntry.entry_id}
+                              onClick={() =>
+                                void runEntrySourceAction('copy', selectedDocumentEntry)
+                              }
+                            >
+                              {t('knowledge.detail.docs.copyAsEditable', {
+                                defaultValue: '复制为可编辑笔记',
+                              })}
+                            </Button>
+                          )}
+                        {/* Save button (visible when editing) */}
+                        {editMode && (
+                          <Button
+                            size='small'
+                            type='primary'
+                            loading={saving}
+                            disabled={Boolean(movingPath)}
+                            onClick={() => void handleSave()}
+                          >
+                            {t('knowledge.actions.save')}
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+                    {/* Content area */}
+                    <div
+                      className={classNames(
+                        'knowledge-doc-content flex-1 overflow-y-auto',
+                        editMode ? 'knowledge-doc-content-edit' : 'p-16px'
+                      )}
+                    >
+                      <Spin loading={fileLoading} className='w-full'>
+                        {editMode ? (
+                          <Input.TextArea
+                            value={draft}
+                            onChange={setDraft}
+                            autoSize={{ minRows: 18, maxRows: 40 }}
+                            className='knowledge-doc-source-editor font-mono text-13px'
+                          />
+                        ) : (
+                          <Markdown compact>{content}</Markdown>
+                        )}
+                      </Spin>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+          </Tabs.TabPane>
+
+          {/* Tab: Mount & Usage */}
+          <Tabs.TabPane key='use' title={t('knowledge.detail.tabUse', { defaultValue: '挂载与使用' })}>
+            <div
+              className={classNames(
+                'knowledge-use-shell grid min-h-470px overflow-hidden rd-12px border border-solid border-[var(--color-border-2)] bg-[var(--color-bg-2)]',
+                isMobile ? 'grid-cols-1' : 'grid-cols-[minmax(0,1fr)_320px]'
+              )}
+            >
+              <div className='flex min-w-0 flex-col gap-14px p-16px'>
+                {base ? <KnowledgeConsumersSection baseId={base.knowledge_base_id} /> : null}
+
+                <section className='box-border rd-9px bg-[var(--color-fill-1)] px-12px py-10px'>
+                  <div className='text-12px font-700 leading-18px text-[var(--color-text-1)]'>
+                    {t('knowledge.detail.use.cliTitle', { defaultValue: '终端 CLI 接入' })}
+                  </div>
+                  <p className='mb-8px mt-3px text-11px leading-17px text-[var(--color-text-3)]'>
+                    {t('knowledge.detail.use.cliDesc', {
+                      defaultValue: '给 claude / codex / gemini 一键注入只读的 knowledge_search 工具，让命令行里的 Agent 也能查这个库。请在终端页面使用「接入知识库」按钮完成注册。',
+                    })}
+                  </p>
+                  <Button
+                    size='mini'
+                    icon={<LinkCloud theme='outline' size='13' />}
+                    onClick={() => navigate('/terminal')}
+                  >
+                    {t('knowledge.detail.use.goTerminal', { defaultValue: '前往终端注册' })}
+                  </Button>
+                </section>
+              </div>
+
+              <aside
+                className={classNames(
+                  'knowledge-use-rules box-border min-w-0 p-16px',
+                  isMobile ? 'knowledge-use-rules-mobile' : 'knowledge-use-rules-desktop'
+                )}
+              >
+                <h3 className='m-0 text-14px font-700 leading-20px text-[var(--color-text-1)]'>
+                  {t('knowledge.detail.use.rulesTitle', { defaultValue: '使用规则' })}
+                </h3>
+
+                <div className='mt-18px flex flex-col gap-18px'>
+                  <div className='knowledge-use-step'>
+                    <div className='knowledge-use-step-number'>1</div>
+                    <div className='min-w-0 pt-2px'>
+                      <b className='block text-12px leading-18px text-[var(--color-text-1)]'>
+                        {t('knowledge.detail.use.step1Title', { defaultValue: '挂载到一个会话' })}
+                      </b>
+                      <p className='mb-0 mt-3px text-11px leading-17px text-[var(--color-text-3)]'>
+                        {t('knowledge.detail.use.step1Desc', {
+                          defaultValue: '把知识库挂到会话 / 终端 / 数字伙伴上，它就成为该处模型的扩展知识。一个库可被多处复用。',
+                        })}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className='knowledge-use-step'>
+                    <div className='knowledge-use-step-number'>2</div>
+                    <div className='min-w-0 pt-2px'>
+                      <b className='block text-12px leading-18px text-[var(--color-text-1)]'>
+                        {t('knowledge.detail.use.step2Title', { defaultValue: '模型自动检索' })}
+                      </b>
+                      <p className='mb-0 mt-3px text-11px leading-17px text-[var(--color-text-3)]'>
+                        {t('knowledge.detail.use.step2Desc', {
+                          defaultValue: '模型会在 .nomi/knowledge/ 下按需检索，命中的内容用于回答——原文不塞进上下文，省 token。',
+                        })}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className='knowledge-use-step'>
+                    <div className='knowledge-use-step-number'>3</div>
+                    <div className='min-w-0 pt-2px'>
+                      <b className='block text-12px leading-18px text-[var(--color-text-1)]'>
+                        {t('knowledge.detail.use.step3Title', { defaultValue: '（可选）回血沉淀' })}
+                      </b>
+                      <p className='mb-0 mt-3px text-11px leading-17px text-[var(--color-text-3)]'>
+                        {t('knowledge.detail.use.step3Desc', {
+                          defaultValue: '开启回血后，会话里新学到的知识会直接写回知识库正文，知识库越用越厚。',
+                        })}
+                      </p>
+                      <div className='mt-9px rd-8px bg-[var(--color-fill-1)] px-9px py-8px text-10px leading-16px text-[var(--color-text-3)]'>
+                        <div className='font-600 text-[var(--color-text-2)]'>
+                          {t('knowledge.detail.use.writebackTitle', { defaultValue: '回血（让会话把新知识写回本库）' })}
+                        </div>
+                        <p className='mb-5px mt-2px'>
+                          {t('knowledge.detail.use.writebackDesc', {
+                            defaultValue: '回血在每个会话的「挂载知识库」控件里按工作区设置——不是全局统一开关。每个挂载可独立选择：',
+                          })}
+                        </p>
+                        <ul className='m-0 pl-14px'>
+                          <li>
+                            <span className='font-500 text-[var(--color-text-2)]'>
+                              {t('knowledge.detail.use.writebackOff', { defaultValue: '关闭' })}
+                            </span>
+                            {' — '}
+                            {t('knowledge.detail.use.writebackOffDesc', { defaultValue: '纯只读，不回写' })}
+                          </li>
+                          <li>
+                            <span className='font-500 text-[var(--color-text-2)]'>
+                              {t('knowledge.detail.use.writebackDirect', { defaultValue: '开启回写' })}
+                            </span>
+                            {' — '}
+                            {t('knowledge.detail.use.writebackDirectDesc', {
+                              defaultValue: '模型把新知识写进库内正文，更新已有文档时追加、不覆盖；由「回写意识」决定它是等你开口还是自己判断',
+                            })}
+                          </li>
+                        </ul>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </aside>
+            </div>
+          </Tabs.TabPane>
+
+          {/* Tab: Settings (D5) */}
+          <Tabs.TabPane
+            key='set'
+            title={
+              <span className='flex items-center gap-6px'>
+                <SettingTwo theme='outline' size='13' />
+                {t('knowledge.detail.tabSettings', { defaultValue: '设置' })}
+              </span>
+            }
+          >
+            <div>
+              {base && (
+                <SettingsTab
+                  base={base}
+                  allTags={allTags}
+                  createTag={createTag}
+                  onRefresh={refresh}
+                  onSourceRefreshed={refreshAfterSourceMutation}
+                />
+              )}
+            </div>
+          </Tabs.TabPane>
+        </Tabs>
+      </div>
+
+      <Modal
+        title={t('knowledge.newFolder', { defaultValue: '新建文件夹' })}
+        visible={newFolderVisible}
+        onOk={() => void handleCreateFolder()}
+        onCancel={() => setNewFolderVisible(false)}
+        autoFocus={false}
+      >
+        <Input
+          placeholder={t('knowledge.newFolderPlaceholder', { defaultValue: '输入文件夹名或相对路径，例如 raw 或 raw/tutorials' })}
+          value={newFolderPath}
+          onChange={setNewFolderPath}
+          onPressEnter={() => void handleCreateFolder()}
+        />
+      </Modal>
+
+      <Modal
+        title={t('knowledge.renameTitle', { defaultValue: '重命名' })}
+        visible={renameVisible}
+        onOk={() => void handleRenameTreeEntry()}
+        onCancel={() => {
+          setRenameVisible(false);
+          setRenameTarget(null);
+          setRenameName('');
+        }}
+        autoFocus={false}
+      >
+        <Input
+          placeholder={t('knowledge.renamePlaceholder', { defaultValue: '输入新的名称' })}
+          value={renameName}
+          onChange={setRenameName}
+          onPressEnter={() => void handleRenameTreeEntry()}
+        />
+      </Modal>
+
+      <Modal
+        title={t('knowledge.detail.docs.moveTitle', {
+          defaultValue: '移动“{{name}}”',
+          name: moveTarget?.name ?? '',
+        })}
+        visible={Boolean(moveTarget)}
+        onOk={() => void confirmMoveTreeEntry()}
+        onCancel={() => {
+          moveDirectoryRequestRef.current += 1;
+          setMoveTarget(null);
+          setMoveDestinationPath('');
+          setMoveDirectoryTree([]);
+        }}
+        okText={t('knowledge.actions.moveConfirm', { defaultValue: '移动' })}
+        okButtonProps={{
+          disabled: Boolean(moveModalIssue) || moveDirectoryLoading || saving,
+          loading: Boolean(movingPath),
+        }}
+        autoFocus={false}
+      >
+        <div className='mb-8px text-12px text-[var(--color-text-3)]'>
+          {t('knowledge.detail.docs.moveChooseDestination', { defaultValue: '选择目标文件夹' })}
+        </div>
+        <button
+          type='button'
+          className={classNames(
+            'mb-6px flex h-30px w-full items-center gap-7px rounded-7px border border-solid px-9px text-left text-12px font-[inherit] cursor-pointer',
+            moveDestinationPath === ''
+              ? 'border-[rgba(var(--primary-6),0.38)] bg-[rgba(var(--primary-6),0.12)] text-[var(--color-text-1)]'
+              : 'border-transparent bg-transparent text-[var(--color-text-2)] hover:bg-[var(--color-fill-2)]'
+          )}
+          onClick={() => setMoveDestinationPath('')}
+        >
+          <FolderOpen theme='outline' size='14' />
+          {t('knowledge.detail.docs.rootFolder', { defaultValue: '知识库根目录' })}
+        </button>
+        <div className='max-h-300px overflow-y-auto rounded-8px border border-solid border-[var(--color-border-2)] p-6px'>
+          <Spin loading={moveDirectoryLoading} className='w-full'>
+            {moveDirectoryTree.length > 0 ? (
+              <Tree
+                size='mini'
+                blockNode
+                showLine
+                treeData={moveDirectoryTree}
+                selectedKeys={moveDestinationPath ? [moveDestinationPath] : []}
+                fieldNames={{ children: 'children', title: 'name', key: 'rel_path', isLeaf: 'is_file' }}
+                actionOnClick={['select']}
+                loadMore={async (treeNode) => {
+                  if (!id || !moveTarget) return;
+                  const directory = (treeNode.props as { dataRef?: IKnowledgeTreeEntry }).dataRef;
+                  if (!directory?.is_dir) return;
+                  try {
+                    const children = await ipcBridge.knowledge.listTree.invoke({
+                      knowledge_base_id: id,
+                      path: directory.rel_path,
+                    });
+                    setMoveDirectoryTree((previous) =>
+                      mergeKnowledgeTreeChildren(
+                        previous,
+                        directory.rel_path,
+                        knowledgeDirectoryOnlyTree(children, moveTarget)
+                      )
+                    );
+                  } catch (error) {
+                    Message.error(String(error));
+                  }
+                }}
+                onSelect={(keys) => {
+                  const path = keys[0];
+                  if (path != null) setMoveDestinationPath(String(path));
+                }}
+              />
+            ) : (
+              <Empty
+                description={t('knowledge.detail.docs.noDestinationFolders', {
+                  defaultValue: '没有其他文件夹，可移动到知识库根目录',
+                })}
+              />
+            )}
+          </Spin>
+        </div>
+        {moveModalIssue && (
+          <div className='mt-8px text-11px text-warning-6'>{describeRelocationIssue(moveModalIssue)}</div>
+        )}
+      </Modal>
+    </div>
+  );
+};
+
+export default KnowledgeDetailPage;

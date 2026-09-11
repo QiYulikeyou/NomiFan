@@ -1,0 +1,22096 @@
+//! `KnowledgeService` — registry CRUD, markdown file access, and mount
+//! planning for the Knowledge Base platform.
+//!
+//! The directory is the source of truth: the user may add/remove `.md` files
+//! out-of-band at any time, so file listings/stats are computed on demand
+//! rather than cached in the database.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock, Weak};
+use std::time::Duration;
+
+use futures_util::{StreamExt, stream};
+use nomifun_api_types::{
+    KnowledgeEmbeddingConfig, KnowledgeEntryCapabilities, KnowledgeEntryKind,
+    KnowledgeEntrySourceInfo, KnowledgeEntrySourceRelationship, KnowledgeMountInfo,
+    KnowledgeRerankConfig, KnowledgeRetrievalConfig, KnowledgeSource,
+    KnowledgeSourceEntry, KnowledgeSourceMode, KnowledgeSourceSyncStatus, KnowledgeTag,
+    KnowledgeTreeAccess, ModelTask,
+    RelocateKnowledgeEntryConflictPolicy as RelocateConflictPolicy,
+    RelocateKnowledgeEntryRequest as RelocateTreeEntryRequest,
+    RelocateKnowledgeEntryResponse as RelocateTreeEntryResult,
+    UndoKnowledgeEntryRelocationRequest, UpdateKnowledgeTagRequest,
+};
+use nomifun_common::{
+    AppError, CompanionId, ConversationId, KnowledgeBaseId, KnowledgeEntryId,
+    KnowledgeSourceId, KnowledgeSourceItemId, KnowledgeTreeOperationId, ProviderWithModel,
+    TerminalId, TimestampMs,
+    UuidV7Error, generate_id, now_ms,
+};
+use nomifun_db::models::{
+    CreateKnowledgeTagParams, KnowledgeBaseRow, KnowledgeBindingRow,
+    KnowledgeEntryProvenanceRelationship, KnowledgeEntryProvenanceRow, KnowledgeEntryRow,
+    KnowledgeSourceItemRow, KnowledgeSourceItemSyncStatus, KnowledgeSourceKind,
+    KnowledgeSourceMode as PersistedKnowledgeSourceMode, KnowledgeSourceRow,
+    KnowledgeSourceState, KnowledgeTreeEventStatus, KnowledgeTreeOperationRow,
+    KnowledgeTreeOperationState,
+};
+use nomifun_db::{
+    BindManagedKnowledgeEntryParams, CommitKnowledgeTreeOperationParams,
+    CreateKnowledgeSourceItemParams, EnsureKnowledgeSourceParams, IClientPreferenceRepository,
+    IKnowledgeEntryRepository, IKnowledgeRepository, IKnowledgeSourceRepository,
+    IKnowledgeTreeOperationRepository, KnowledgeTreeOperationPageCursor,
+    KNOWLEDGE_ENTRY_KIND_DIRECTORY, KNOWLEDGE_ENTRY_KIND_FILE,
+    KNOWLEDGE_ENTRY_ORIGIN_GENERATED, KNOWLEDGE_ENTRY_ORIGIN_URL_SNAPSHOT,
+    KNOWLEDGE_ENTRY_ORIGIN_USER,
+    KNOWLEDGE_RETRIEVAL_KEY,
+    PrepareKnowledgeTreeOperationParams, RecordKnowledgeEntryCopyParams,
+    RecordKnowledgeSourceSyncFailureParams, RecordKnowledgeSourceSyncSuccessParams,
+    RelocateKnowledgeEntryProjectionParams, StageKnowledgeSourcePublicationParams,
+    UpdateKnowledgeSourceParams, UpsertKnowledgeEntryParams,
+};
+use nomifun_model_invoke::{
+    EmbedRequest, ModelInvokeService, ModelRef, RerankRequest, TaskOutcome, TaskRequest,
+    TaskResult,
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::sync::{
+    Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard,
+    OwnedRwLockWriteGuard, RwLock as AsyncRwLock, Semaphore,
+};
+use tokio_util::sync::CancellationToken;
+use unicode_normalization::UnicodeNormalization;
+use url::Url;
+
+use crate::autogen::{self, KnowledgeCompleter};
+use crate::events::{
+    KnowledgeEntryContentUpdatedEvent, KnowledgeEventEmitter, KnowledgeTreeChangedEvent,
+};
+use crate::mount::{self, MountSpec};
+use crate::source_url::{self, HttpFetcher, PageFetcher};
+use crate::workpath::{WORKPATH_BINDING_KIND, workpath_key};
+use crate::{KB_MANAGED_REL_DIR, KB_MOUNT_REL_DIR};
+
+/// Binding target kinds accepted by the API. `workpath` is the primary kind
+/// for conversation/terminal sessions since the session-list unification
+/// (its `target_id` is a normalized [`workpath_key`]); the remaining kinds use
+/// their registered canonical entity IDs.
+pub const BINDING_KINDS: &[&str] = &["workpath", "conversation", "terminal", "companion"];
+
+/// Accepted write-back dispositions ("回写意识"). `manual` (the default) writes
+/// back only what the user explicitly asked for and suppresses the turn-final
+/// extractor entirely; `auto` lets the agent decide against a high bar.
+pub const WRITEBACK_EAGERNESS: &[&str] = &["manual", "auto"];
+
+const TURN_WRITEBACK_LLM_TIMEOUT: Duration = Duration::from_secs(45);
+const KNOWLEDGE_PATH_INSPECTION_TIMEOUT: Duration = Duration::from_secs(6);
+const KNOWLEDGE_FILE_IO_TIMEOUT: Duration = Duration::from_secs(20);
+const KNOWLEDGE_BLOCKING_INSPECTION_CONCURRENCY: usize = 32;
+const TURN_WRITEBACK_MAX_CANDIDATES: usize = 8;
+const TURN_WRITEBACK_MAX_CANDIDATE_CHARS: usize = 32_000;
+const TURN_WRITEBACK_MAX_TOTAL_CHARS: usize = 128_000;
+const REMOTE_RETRIEVAL_MAX_DOCUMENTS: usize = 128;
+const REMOTE_RETRIEVAL_MAX_DOCUMENT_CHARS: usize = 4_000;
+const REMOTE_RETRIEVAL_MAX_TOTAL_CHARS: usize = 256_000;
+const REMOTE_EMBEDDING_BATCH_SIZE: usize = 32;
+const REMOTE_RERANK_MAX_CANDIDATES: usize = 64;
+
+static ROOT_BLOCKING_INSPECTION_LOCKS:
+    OnceLock<StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>> =
+    OnceLock::new();
+static ROOT_BLOCKING_INSPECTION_LIMIT: OnceLock<Arc<Semaphore>> =
+    OnceLock::new();
+
+/// Opaque, copy-pasteable document handle: `kdoc_` + URL-safe base64 (no pad)
+/// of `{kb_id}\x1f{rel_path}`. The model treats it as an opaque token and
+/// never parses or builds paths — `knowledge_search` emits it, `knowledge_read`
+/// and `knowledge_write` consume it, closing a zero-path-arithmetic loop.
+const DOC_HANDLE_PREFIX: &str = "kdoc_";
+const DOC_HANDLE_SEP: char = '\u{1f}';
+
+/// Encode a stable `(kb_id, rel_path)` document handle. See [`DOC_HANDLE_PREFIX`].
+pub fn encode_doc_handle(kb_id: &KnowledgeBaseId, rel_path: &str) -> String {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    let raw = format!("{kb_id}{DOC_HANDLE_SEP}{rel_path}");
+    format!("{DOC_HANDLE_PREFIX}{}", URL_SAFE_NO_PAD.encode(raw.as_bytes()))
+}
+
+/// Decode a document handle back to `(kb_id, rel_path)`. Returns `None` for any
+/// malformed input (wrong prefix, bad base64, non-UTF8, missing separator, or
+/// an empty component).
+pub fn decode_doc_handle(handle: &str) -> Option<(KnowledgeBaseId, String)> {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    let body = handle.strip_prefix(DOC_HANDLE_PREFIX)?;
+    let bytes = URL_SAFE_NO_PAD.decode(body.as_bytes()).ok()?;
+    let raw = String::from_utf8(bytes).ok()?;
+    let (kb_id, rel_path) = raw.split_once(DOC_HANDLE_SEP)?;
+    let kb_id = KnowledgeBaseId::parse(kb_id).ok()?;
+    (!rel_path.is_empty()).then(|| (kb_id, rel_path.to_owned()))
+}
+
+/// Hard cap on `source.entries` per knowledge base — every entry costs a
+/// network fetch at create/refresh time, so an unbounded list would let one
+/// request fan out arbitrarily.
+pub const MAX_SOURCE_ENTRIES: usize = 16;
+const MAX_SOURCE_HISTORY_ENTRIES: usize = 256;
+
+/// How many source entries are fetched concurrently per batch.
+const SOURCE_FETCH_CONCURRENCY: usize = 4;
+
+/// Folder imports are staged in memory before publication so an unreadable or
+/// oversized source never leaves a half-copied tree in a knowledge base.
+const MAX_FOLDER_IMPORT_FILES: usize = 1_000;
+const MAX_FOLDER_IMPORT_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_FOLDER_IMPORT_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// A knowledge base plus directory statistics, as returned by the API.
+#[derive(Debug, Clone, Serialize)]
+pub struct KnowledgeBaseInfo {
+    pub knowledge_base_id: KnowledgeBaseId,
+    pub name: String,
+    pub description: String,
+    pub root_path: String,
+    pub managed: bool,
+    pub tree_access: KnowledgeTreeAccess,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+    pub file_count: u64,
+    pub total_size: u64,
+    /// `false` when the registered root directory no longer exists on disk.
+    pub root_exists: bool,
+    /// URL source configuration (`extra.source`) when the base has one;
+    /// `None` (and off the wire) for plain directory bases. Carried by
+    /// every path that serializes this struct (list/get/create/update
+    /// responses and `knowledge.base-*` events) so the frontend detail
+    /// page can render mode / URL count / lastFetchedAt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<KnowledgeSource>,
+    /// Create-time URL-source fetch summary. Populated only on the response
+    /// of a create that carried a snapshot-mode source; `None` (and off the
+    /// wire) everywhere else (list/get/update, events).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_fetch: Option<RefreshSourceSummary>,
+    /// User-defined tag keys assigned to this base (empty = untagged).
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// UI type discriminator, derived from `managed` + `extra.source`:
+    /// `"blank"` | `"local"` | `"web"`.
+    pub kind: String,
+}
+
+/// One `search_bases` hit. `rel_path` is relative to the base root.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct KnowledgeSearchHit {
+    pub kb_id: KnowledgeBaseId,
+    pub kb_name: String,
+    pub rel_path: String,
+    pub heading: String,
+    pub snippet: String,
+    pub score: u32,
+}
+
+/// One markdown file inside a base, path relative to the base root
+/// (forward slashes on every platform).
+#[derive(Debug, Clone, Serialize)]
+pub struct KbFileEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_id: Option<KnowledgeEntryId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_entry_id: Option<KnowledgeEntryId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    pub rel_path: String,
+    pub size: u64,
+    pub modified_at: Option<TimestampMs>,
+    pub capabilities: KnowledgeEntryCapabilities,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<KnowledgeEntrySourceInfo>,
+}
+
+/// One immediate child in the knowledge-base document tree. Directories are
+/// browse-only; files are markdown documents that can be read/edited.
+#[derive(Debug, Clone, Serialize)]
+pub struct KbTreeEntry {
+    /// Stable identity from the rebuildable entry projection. Omitted only
+    /// when the projection repository is not wired or temporarily unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_id: Option<KnowledgeEntryId>,
+    /// Revision of this exact projected entry (not the whole tree).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<i64>,
+    /// Stable parent identity. Root children intentionally serialize without
+    /// this field, just like path-only compatibility responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_entry_id: Option<KnowledgeEntryId>,
+    /// `user`, `url_snapshot`, or `generated` when projection metadata exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    pub name: String,
+    pub rel_path: String,
+    pub is_dir: bool,
+    pub is_file: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    pub modified_at: Option<TimestampMs>,
+    pub capabilities: KnowledgeEntryCapabilities,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<KnowledgeEntrySourceInfo>,
+}
+
+/// Content payload for a single file read.
+#[derive(Debug, Clone, Serialize)]
+pub struct KbFileContent {
+    pub rel_path: String,
+    pub content: String,
+    pub size: u64,
+    pub modified_at: Option<TimestampMs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_id: Option<KnowledgeEntryId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    pub capabilities: KnowledgeEntryCapabilities,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<KnowledgeEntrySourceInfo>,
+}
+
+/// Result of one editor CAS update. A stable identity may resolve to a newer
+/// locator than the path the editor last rendered; returning it lets the UI
+/// rebind the document session without guessing.
+#[derive(Debug, Clone, Serialize)]
+pub struct KbFileUpdateResult {
+    pub rel_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_id: Option<KnowledgeEntryId>,
+}
+
+/// One consumer (binding) of a knowledge base — a workspace/conversation/etc.
+/// that has this base mounted. Includes disabled bindings (greyed in the UI).
+#[derive(Debug, Clone, Serialize)]
+pub struct ConsumerInfo {
+    pub target_kind: String,
+    pub target_id: Option<String>,
+    pub enabled: bool,
+}
+
+/// Per-target mount configuration (the public shape of a binding row).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeBinding {
+    pub enabled: bool,
+    pub writeback: bool,
+    #[serde(default = "default_writeback_eagerness")]
+    pub writeback_eagerness: String,
+    /// External IM channel write opt-in. Default false — Channel Agent writes
+    /// are disabled unless enabled here.
+    #[serde(default)]
+    pub channel_write_enabled: bool,
+    #[serde(default)]
+    pub kb_ids: Vec<KnowledgeBaseId>,
+}
+
+fn default_writeback_eagerness() -> String {
+    "manual".to_owned()
+}
+
+impl Default for KnowledgeBinding {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            writeback: false,
+            writeback_eagerness: default_writeback_eagerness(),
+            channel_write_enabled: false,
+            kb_ids: Vec::new(),
+        }
+    }
+}
+
+/// Result of a mount sync for one target: what is mounted and whether the
+/// write-back contract applies. Consumed by the conversation service to
+/// inject prompt context.
+#[derive(Debug, Clone, Default)]
+pub struct MountOutcome {
+    pub mounts: Vec<KnowledgeMountInfo>,
+    pub writeback: bool,
+    /// `manual` or `auto` ("回写意识"); meaningful only while `writeback` is
+    /// true.
+    pub writeback_eagerness: String,
+    /// Raw `channel_write_enabled` opt-in from the binding. Carried verbatim
+    /// (independent of `writeback`) so the nomi factory can resolve the
+    /// external-IM-channel write policy with the SAME value the terminal path
+    /// reads at write time — without it the nomi path reconstructs the binding
+    /// with a `false` default and channel write-back is permanently disabled.
+    pub channel_write_enabled: bool,
+}
+
+/// Read-only resolution of one workspace binding.
+///
+/// Preparing a plan performs database and knowledge-root reads but never
+/// touches `.nomi/knowledge`. Callers can therefore compare the runtime
+/// prompt signature and prove teardown of an older runtime before
+/// [`PreparedMountPlan::activate`] acquires physical authority and reconciles
+/// the shared mount directory.
+#[derive(Debug)]
+pub struct PreparedMountPlan {
+    workspace: PathBuf,
+    specs: Vec<MountSpec>,
+    outcome: MountOutcome,
+    binding_signature: String,
+}
+
+impl PreparedMountPlan {
+    /// Runtime-facing metadata resolved for this plan. Mutable TOC/summary
+    /// content is intentionally present here but excluded from
+    /// [`Self::binding_signature`].
+    pub fn outcome(&self) -> &MountOutcome {
+        &self.outcome
+    }
+
+    /// Stable logical/physical binding identity protected by the workspace
+    /// authority lease.
+    pub fn binding_signature(&self) -> &str {
+        &self.binding_signature
+    }
+
+    /// Acquire physical workspace authority and reconcile the mount set.
+    ///
+    /// This strict path is used for long-lived Agent runtimes. It fails
+    /// closed if any desired mount could not be materialized, so a runtime is
+    /// never built with prompt metadata that disagrees with its filesystem.
+    pub async fn activate(
+        self,
+        owner: &str,
+    ) -> Result<(MountOutcome, crate::WorkspaceBindingLease), AppError> {
+        let lease =
+            crate::WorkspaceBindingLease::acquire(&self.workspace, self.binding_signature, owner)?;
+        let expected = self
+            .specs
+            .iter()
+            .map(|spec| spec.link_name.clone())
+            .collect::<Vec<_>>();
+        // `sync_mounts_with_authority` moves this clone into the blocking
+        // sweep/create transaction. Cancelling `activate` may drop the return
+        // lease, but it must not release the cross-process workspace lock
+        // while that uncancellable filesystem work is still running.
+        let present =
+            mount::sync_mounts_with_authority(&self.workspace, self.specs, lease.clone()).await?;
+        if present != expected {
+            return Err(AppError::Conflict(format!(
+                "knowledge mount reconciliation for workspace {} was incomplete (expected {:?}, present {:?})",
+                self.workspace.display(),
+                expected,
+                present
+            )));
+        }
+        Ok((self.outcome, lease))
+    }
+}
+
+/// What the model addressed for a write: an opaque `handle` (preferred — from
+/// `knowledge_search`/`knowledge_read`) or an explicit base + relative path
+/// (browse / create).
+#[derive(Debug, Clone)]
+pub enum WriteTargetSpec {
+    Handle(String),
+    Path { kb_id: KnowledgeBaseId, rel_path: String },
+}
+
+/// Result of resolving a write target to a canonical, base-relative document.
+#[derive(Debug, Clone)]
+pub struct WriteResolution {
+    pub kb_id: KnowledgeBaseId,
+    pub canonical_rel_path: String,
+    pub op: WriteOp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteOp {
+    Update,
+    Create,
+}
+
+/// Where a write originates — selects the write policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteSurface {
+    RegularChat,
+    Companion,
+    /// An in-app terminal CLI session. These sessions get `nomicore
+    /// mcp-knowledge-stdio` injected and reach the write path through
+    /// [`crate::broker`] / [`crate::mcp_server`], so this variant is what every
+    /// terminal `knowledge_write` resolves its policy from.
+    Terminal,
+    ExternalChannel,
+}
+
+/// Code-enforced placement. `Direct` writes the base body; `Disabled` refuses.
+/// Staged placement was removed with the review inbox — there is one landing
+/// spot left, and the safety it used to provide now comes from the append-only
+/// merge plus compare-and-swap on the update path.
+#[derive(Debug, Clone)]
+pub enum WriteMode {
+    Disabled,
+    Direct,
+}
+
+#[derive(Debug, Clone)]
+pub struct WritePolicy {
+    pub mode: WriteMode,
+    pub allow_create: bool,
+    pub surface: WriteSurface,
+}
+
+/// A fully-specified write through the single canonical path.
+#[derive(Debug, Clone)]
+pub struct WriteRequest {
+    pub spec: WriteTargetSpec,
+    pub content: String,
+    pub policy: WritePolicy,
+    pub bound_kb_ids: Vec<KnowledgeBaseId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WriteOutcome {
+    pub kb_id: KnowledgeBaseId,
+    pub final_rel_path: String,
+    pub op: WriteOp,
+}
+
+/// Inputs for the turn-final write-back trigger. Whether the trigger fires at
+/// all is decided by the caller from [`WritebackEagerness`] — a `manual` binding
+/// never reaches here, so no provider call is spent on it. Once here, eagerness
+/// only shapes candidate extraction and [`resolve_write_policy`] decides whether
+/// this surface may write.
+#[derive(Debug, Clone)]
+pub struct TurnWritebackRequest {
+    pub mounts: Vec<KnowledgeMountInfo>,
+    pub binding: KnowledgeBinding,
+    pub surface: WriteSurface,
+    pub user_text: String,
+    pub assistant_text: String,
+    /// Effective model for this write-back. Conversation callers resolve the
+    /// explicit knowledge-model preference first and otherwise capture the
+    /// model that actually answered the turn. `None` is retained for callers
+    /// without a provider-backed conversation model.
+    pub model: Option<ProviderWithModel>,
+    /// On a manual retry of a partial result, logical targets already written
+    /// by the previous attempt are excluded. Failed paths are deliberately not
+    /// a whitelist: a new extraction may correct casing or a wrong-folder
+    /// suggestion and must remain eligible.
+    pub excluded_targets: Option<Vec<(KnowledgeBaseId, String)>>,
+    /// Process-local cancellation for explicit conversation clear/reset/delete.
+    /// It is observed only at cancel-safe boundaries; an atomic filesystem
+    /// publication already in progress is always awaited to completion.
+    pub cancellation: Option<CancellationToken>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnWritebackStatus {
+    Disabled,
+    NoCompleter,
+    NoCandidate,
+    Written,
+    Partial,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnWritebackPhase {
+    Extracting,
+    Writing,
+}
+
+#[derive(Debug, Clone)]
+pub struct TurnWritebackFailure {
+    pub kb_id: Option<KnowledgeBaseId>,
+    pub rel_path: Option<String>,
+    pub error: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TurnWritebackReport {
+    pub status: TurnWritebackStatus,
+    pub candidates: usize,
+    pub written: Vec<WriteOutcome>,
+    pub failures: Vec<TurnWritebackFailure>,
+}
+
+impl TurnWritebackReport {
+    fn status(status: TurnWritebackStatus) -> Self {
+        Self { status, candidates: 0, written: Vec::new(), failures: Vec::new() }
+    }
+
+    pub fn failed(error: impl Into<String>) -> Self {
+        Self {
+            status: TurnWritebackStatus::Failed,
+            candidates: 0,
+            written: Vec::new(),
+            failures: vec![TurnWritebackFailure {
+                kb_id: None,
+                rel_path: None,
+                error: error.into(),
+            }],
+        }
+    }
+}
+
+/// Per-surface write policy. Write-back now has exactly one landing spot, so
+/// this only decides whether a surface may write at all. Companion and regular
+/// chat / terminal write when the binding says so; external IM channels stay
+/// disabled unless the owner flips `channel_write_enabled`, because an
+/// unattended bot writing into a curated base is the owner's call to make.
+pub fn resolve_write_policy(surface: WriteSurface, binding: &KnowledgeBinding) -> WritePolicy {
+    let writeback = binding.enabled && binding.writeback;
+    let mode = if !writeback {
+        WriteMode::Disabled
+    } else {
+        match surface {
+            WriteSurface::Companion
+            | WriteSurface::RegularChat
+            | WriteSurface::Terminal => WriteMode::Direct,
+            WriteSurface::ExternalChannel => {
+                if binding.channel_write_enabled {
+                    WriteMode::Direct
+                } else {
+                    WriteMode::Disabled
+                }
+            }
+        }
+    };
+    WritePolicy { mode, allow_create: true, surface }
+}
+
+/// Result of an AI overview generation (`POST /bases/{id}/autogen`).
+#[derive(Debug, Clone, Serialize)]
+pub struct AutogenOutcome {
+    /// The (possibly clamped) description after the run.
+    pub description: String,
+    /// Whether this run replaced the registry description.
+    pub description_updated: bool,
+    /// Whether this run wrote `{root}/README.md`.
+    pub readme_written: bool,
+    pub base: KnowledgeBaseInfo,
+}
+
+/// Result of a URL-source fetch batch (`POST /bases/{id}/refresh-source`,
+/// also attached to the create response via `source_fetch`).
+#[derive(Debug, Clone, Serialize)]
+pub struct RefreshSourceSummary {
+    /// Entries whose snapshot was (re)written.
+    pub fetched: usize,
+    pub failed: usize,
+    /// One `"{url}: {error}"` line per failed entry.
+    pub errors: Vec<String>,
+    /// `extra.source.last_fetched_at` after this run: re-stamped only when
+    /// at least one entry was fetched; a fully-failed run reports the
+    /// previous value (possibly `None`) unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_fetched_at: Option<TimestampMs>,
+}
+
+/// Result of copying a local Markdown folder into an existing knowledge base.
+/// The source directory is never modified; a collision-free top-level folder
+/// is allocated inside the destination base and the source tree is preserved.
+#[derive(Debug, Clone, Serialize)]
+pub struct FolderImportSummary {
+    pub target_directory: String,
+    pub imported: usize,
+    pub skipped: usize,
+    pub total_size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_file: Option<String>,
+}
+
+/// Result of appending URL entries to an existing base and snapshotting only
+/// the newly accepted entries. Existing entries are never re-fetched by this
+/// operation, and duplicates are reported instead of being stored twice.
+#[derive(Debug, Clone, Serialize)]
+pub struct AppendUrlSourceSummary {
+    pub added: usize,
+    pub duplicates: usize,
+    pub fetched: usize,
+    pub failed: usize,
+    pub errors: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_fetched_at: Option<TimestampMs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_file: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct KnowledgeEntrySourceActionResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry: Option<KbTreeEntry>,
+    pub removed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_fetch: Option<RefreshSourceSummary>,
+}
+
+/// Per-file cached content for `search_bases`, keyed by absolute path + mtime.
+struct CachedDoc {
+    mtime_ms: u64,
+    content: Arc<str>,
+    heading: Arc<str>,
+    bytes: usize,
+}
+
+/// One source document loaded from the filesystem cache. Candidate generation
+/// and result ordering share this value so a configured reranker receives the
+/// exact document that produced the public hit instead of re-reading mutable
+/// files between stages.
+#[derive(Clone, Debug)]
+struct RetrievalDocument {
+    kb_id: KnowledgeBaseId,
+    kb_name: String,
+    rel_path: String,
+    heading: String,
+    content: Arc<str>,
+}
+
+#[derive(Debug)]
+struct RetrievalCandidate {
+    hit: KnowledgeSearchHit,
+    content: Arc<str>,
+}
+
+/// mtime-keyed content cache backing `search_bases`. A pure read-through
+/// optimization: it avoids re-reading + UTF-8-decoding unchanged `.md` files on
+/// every query. Invalidation is per-file via mtime (write_file's atomic rename
+/// and delete_file both bump it), so the cache self-heals with NO watcher and NO
+/// index. Service-owned writes explicitly evict their path because coarse
+/// FAT/SMB/NAS mtimes can retain the same tick after a same-size replacement.
+/// Results remain byte-for-byte identical to the uncached path. Bounded by
+/// [`MAX_SEARCH_CACHE_BYTES`]; oversized files are simply not cached.
+#[derive(Default)]
+struct SearchCacheInner {
+    entries: std::collections::HashMap<PathBuf, CachedDoc>,
+    total_bytes: usize,
+}
+
+const MAX_SEARCH_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SEARCH_CACHE_FILE_BYTES: usize = 1024 * 1024;
+const MAX_RELOCATE_IDEMPOTENCY_ENTRIES: usize = 1_024;
+#[cfg(not(test))]
+const TREE_OPERATION_SWEEP_PAGE_SIZE: u32 =
+    nomifun_db::MAX_KNOWLEDGE_TREE_OPERATION_PAGE_SIZE;
+// Exercise real keyset pagination without creating hundreds of SQLite rows in
+// every unit-test run.
+#[cfg(test)]
+const TREE_OPERATION_SWEEP_PAGE_SIZE: u32 = 2;
+/// Bound one startup/request journal sweep so a continuously growing producer
+/// cannot starve router startup or a user mutation.
+const MAX_TREE_OPERATION_SWEEP_ROWS: usize = 4_096;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct RelocateRequestFingerprint {
+    source_path: String,
+    destination_parent_path: String,
+    new_name: Option<String>,
+    conflict_policy: RelocateConflictPolicy,
+    entry_id: Option<KnowledgeEntryId>,
+    destination_parent_id: Option<KnowledgeEntryId>,
+    expected_revision: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedRelocation {
+    fingerprint: RelocateRequestFingerprint,
+    result: RelocateTreeEntryResult,
+}
+
+#[derive(Default)]
+struct RelocateIdempotencyCache {
+    entries: HashMap<String, CachedRelocation>,
+    insertion_order: VecDeque<String>,
+}
+
+pub struct KnowledgeService {
+    repo: Arc<dyn IKnowledgeRepository>,
+    /// Rebuildable stable-identity projection. It is deliberately late-wired
+    /// so lightweight/path-only test repositories remain valid and the
+    /// filesystem stays usable if projection persistence is degraded.
+    entry_repository: RwLock<Option<Arc<dyn IKnowledgeEntryRepository>>>,
+    /// Authoritative source aggregates and stable source-item ↔ entry
+    /// provenance. It is optional only for lightweight embedders/tests; the
+    /// production app wires the SQLite implementation from the same pool.
+    source_repository: RwLock<Option<Arc<dyn IKnowledgeSourceRepository>>>,
+    /// Durable idempotency journal and transactional outbox for tree
+    /// relocations. Like the entry projection this is late-wired so lightweight
+    /// embedders and path-only unit tests retain their in-memory behaviour.
+    tree_operation_repository:
+        RwLock<Option<Arc<dyn IKnowledgeTreeOperationRepository>>>,
+    /// Prevent concurrent startup/retry drains from broadcasting the same
+    /// pending operation in parallel inside this process. The durable outbox
+    /// remains at-least-once across an emit/ack crash window.
+    tree_operation_drain_lock: Arc<AsyncMutex<()>>,
+    /// Bases successfully reconciled in this process. A listed-level mismatch
+    /// or a failed post-rename CAS forces another full filesystem reconcile.
+    projection_reconciled: Arc<StdMutex<HashSet<String>>>,
+    data_dir: PathBuf,
+    emitter: KnowledgeEventEmitter,
+    /// LLM seam for autogen / snapshot compression. Late-wired (the agent
+    /// stack is built after this service); `None` ⇒ autogen endpoints fail
+    /// with a clear 409 and best-effort call sites skip silently.
+    completer: RwLock<Option<Arc<dyn KnowledgeCompleter>>>,
+    /// Page-fetching backend for URL knowledge sources. A trait object so a
+    /// rendering backend (`BrowserFetcher`, late-wired from `nomifun-ai-agent`)
+    /// can replace the default HTTP fetcher without the knowledge crate
+    /// depending on the browser engine (P3 anti-cycle decision ②).
+    fetcher: Arc<dyn PageFetcher>,
+    /// **P3-K2: optional rendering page-fetcher** (the engine-backed
+    /// `BrowserFetcher`, late-wired from `nomifun-ai-agent` when the `browser-use`
+    /// feature is on). `None` ⇒ no browser backend available; every source uses
+    /// [`Self::fetcher`] (the HTTP default — current behaviour, zero regression).
+    /// K2 only *provides* this backend; **per-source backend selection (the
+    /// `rendered` flag → pick this vs. the HTTP fetcher) is K3's job** and lives at
+    /// the [`Self::prepare_snapshot_body`] dispatch site, which K2 leaves untouched.
+    /// Behind a `RwLock` so it can be late-wired on the shared `Arc<KnowledgeService>`
+    /// after construction (same discipline as [`Self::completer`]).
+    render_fetcher: RwLock<Option<Arc<dyn PageFetcher>>>,
+    /// mtime-keyed content cache for `search_bases` (perf only; see
+    /// [`SearchCacheInner`]). Cloned into the search `spawn_blocking` closure.
+    search_cache: Arc<RwLock<SearchCacheInner>>,
+    /// Bounded process-local replay protection for relocation requests. The
+    /// tree writer lock spans lookup, filesystem commit and insertion, so two
+    /// concurrent retries can never execute the same move twice.
+    relocate_idempotency: Arc<StdMutex<RelocateIdempotencyCache>>,
+    /// Monotonic per-base revisions for fine-grained tree events. The value is
+    /// initialized from the persisted base timestamp and advanced on every
+    /// committed relocation.
+    tree_revisions: Arc<StdMutex<HashMap<String, u64>>>,
+    /// Per-logical-target write-back lock. Direct mode holds it across
+    /// read+merge+replace. Staged mode holds it across duplicate detection,
+    /// collision-suffix allocation, and no-replace publication. The staged key
+    /// is rooted at the outer scope so an explicit tool write and a turn-final
+    /// write for `conversation[/turn]` cannot race each other.
+    turn_writeback_locks: Arc<StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
+    /// Serializes publication with base deletion per canonical root group.
+    /// Duplicate and ancestor/descendant roots are assigned the same lock.
+    base_lifecycle_locks:
+        Arc<StdMutex<HashMap<String, Weak<AsyncRwLock<()>>>>>,
+    /// Coordinates whole-tree mutations with per-document writes for one
+    /// canonical (including overlapping) root group, without letting a slow
+    /// external base block unrelated knowledge bases.
+    document_tree_locks:
+        Arc<StdMutex<HashMap<String, Weak<AsyncRwLock<()>>>>>,
+    /// Canonical root identity is immutable for a registration; caching it
+    /// avoids repeating slow NAS/OneDrive canonicalization at tree, target and
+    /// lifecycle lock boundaries in the same write.
+    root_lock_identity_cache: Arc<StdMutex<HashMap<String, String>>>,
+    /// Additional backend-managed workspace roots (beyond `data_dir`) whose
+    /// paths map to the `__default__` workpath key — late-wired with the
+    /// terminal work dir so this service and the terminal service derive the
+    /// SAME binding key for the same cwd (they historically diverged:
+    /// terminal used its work_dir, live resolvers here used data_dir).
+    extra_managed_roots: RwLock<Vec<PathBuf>>,
+    /// In-process observer invoked after a binding row is persisted (in
+    /// addition to the UI WebSocket event). Late-wired by the app layer to
+    /// re-sync live terminal workspaces (README/mounts) so binding changes
+    /// take effect without a PTY relaunch. `(target_kind, canonical_key)`.
+    binding_changed_hook: RwLock<Option<Arc<dyn Fn(&str, &str) + Send + Sync>>>,
+    /// Single persisted retrieval-policy source (`knowledge.retrieval`) plus
+    /// the shared exact-capability invocation service. Production wires both
+    /// together after construction; tests that exercise only local keyword
+    /// search need neither.
+    retrieval_preferences: RwLock<Option<Arc<dyn IClientPreferenceRepository>>>,
+    model_invoke: RwLock<Option<Arc<ModelInvokeService>>>,
+}
+
+/// One source entry's fetched-and-condensed body, ready to be slugged and
+/// assembled in memory (the serial phase of
+/// [`KnowledgeService::prepare_source_snapshots`]).
+struct PreparedSnapshot {
+    /// Page `<title>` (HTML responses only) — backfills an empty entry title.
+    title: Option<String>,
+    final_url: String,
+    truncated: bool,
+    body: String,
+}
+
+struct PreparedManagedSourceFile {
+    item: KnowledgeSourceItemRow,
+    content: String,
+    final_url: String,
+    title: Option<String>,
+    content_hash: String,
+}
+
+/// A fetched source snapshot that has not yet crossed the filesystem
+/// publication boundary. Network and LLM work produces these in memory; they
+/// are written only after the source configuration is revalidated under the
+/// per-base lifecycle writer.
+struct PreparedSourceFile {
+    rel_path: String,
+    source_label: String,
+    content: String,
+}
+
+struct PreparedFolderImportFile {
+    rel_path: String,
+    content: String,
+}
+
+struct PreparedFolderImport {
+    source_name: String,
+    files: Vec<PreparedFolderImportFile>,
+    skipped: usize,
+    total_size: u64,
+}
+
+struct SourcePublicationOutcome {
+    fetched: usize,
+    errors: Vec<String>,
+    published_paths: Vec<String>,
+    persisted_stamp: Option<TimestampMs>,
+    fatal_error: Option<AppError>,
+}
+
+struct ProjectionState {
+    entries: Vec<KnowledgeEntryRow>,
+    tree_revision: u64,
+}
+
+struct NormalizedSourceAggregate {
+    source: KnowledgeSourceRow,
+    items: Vec<KnowledgeSourceItemRow>,
+}
+
+type SourceMetadataByEntry = HashMap<KnowledgeEntryId, KnowledgeEntrySourceInfo>;
+
+struct ResolvedSourceEntry {
+    entry: KnowledgeEntryRow,
+    provenance: KnowledgeEntryProvenanceRow,
+    item: KnowledgeSourceItemRow,
+    source: KnowledgeSourceRow,
+}
+
+impl KnowledgeService {
+    pub fn new(repo: Arc<dyn IKnowledgeRepository>, data_dir: &Path, emitter: KnowledgeEventEmitter) -> Self {
+        if let Err(error) = std::fs::create_dir_all(data_dir) {
+            tracing::warn!(
+                path = %data_dir.display(),
+                %error,
+                "could not provision the knowledge data directory"
+            );
+        }
+        let data_dir = std::fs::canonicalize(data_dir)
+            .map(|canonical| nomifun_common::paths::simplified(&canonical))
+            .unwrap_or_else(|_| data_dir.to_path_buf());
+        Self {
+            repo,
+            entry_repository: RwLock::new(None),
+            source_repository: RwLock::new(None),
+            tree_operation_repository: RwLock::new(None),
+            tree_operation_drain_lock: Arc::new(AsyncMutex::new(())),
+            projection_reconciled: Arc::new(StdMutex::new(HashSet::new())),
+            data_dir,
+            emitter,
+            completer: RwLock::new(None),
+            fetcher: Arc::new(HttpFetcher::default()),
+            render_fetcher: RwLock::new(None),
+            search_cache: Arc::new(RwLock::new(SearchCacheInner::default())),
+            relocate_idempotency: Arc::new(StdMutex::new(
+                RelocateIdempotencyCache::default(),
+            )),
+            tree_revisions: Arc::new(StdMutex::new(HashMap::new())),
+            turn_writeback_locks: Arc::new(StdMutex::new(HashMap::new())),
+            base_lifecycle_locks: Arc::new(StdMutex::new(HashMap::new())),
+            document_tree_locks: Arc::new(StdMutex::new(HashMap::new())),
+            root_lock_identity_cache: Arc::new(StdMutex::new(HashMap::new())),
+            extra_managed_roots: RwLock::new(Vec::new()),
+            binding_changed_hook: RwLock::new(None),
+            retrieval_preferences: RwLock::new(None),
+            model_invoke: RwLock::new(None),
+        }
+    }
+
+    /// Late-wire the stable entry identity projection. Production passes the
+    /// same concrete SQLite repository used for base registration, while
+    /// path-only embedders and existing unit tests may leave it absent.
+    pub fn set_entry_repository(
+        &self,
+        repository: Arc<dyn IKnowledgeEntryRepository>,
+    ) {
+        *self
+            .entry_repository
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(repository);
+        self.projection_reconciled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    fn entry_repository(&self) -> Option<Arc<dyn IKnowledgeEntryRepository>> {
+        self.entry_repository
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn set_source_repository(
+        &self,
+        repository: Arc<dyn IKnowledgeSourceRepository>,
+    ) {
+        *self
+            .source_repository
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(repository);
+        self.projection_reconciled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    fn source_repository(&self) -> Option<Arc<dyn IKnowledgeSourceRepository>> {
+        self.source_repository
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Late-wire the durable relocation journal/outbox. Production supplies
+    /// the SQLite implementation backed by the same pool as the base and
+    /// stable-entry repositories.
+    pub fn set_tree_operation_repository(
+        &self,
+        repository: Arc<dyn IKnowledgeTreeOperationRepository>,
+    ) {
+        *self
+            .tree_operation_repository
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(repository);
+    }
+
+    fn tree_operation_repository(
+        &self,
+    ) -> Option<Arc<dyn IKnowledgeTreeOperationRepository>> {
+        self.tree_operation_repository
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn durable_relocation_receipt(
+        operation: &KnowledgeTreeOperationRow,
+    ) -> Result<RelocateTreeEntryResult, AppError> {
+        let receipt = operation.receipt_json.as_deref().ok_or_else(|| {
+            AppError::Internal(format!(
+                "committed knowledge-tree operation {} has no receipt",
+                operation.operation_id
+            ))
+        })?;
+        serde_json::from_str(receipt).map_err(|error| {
+            AppError::Internal(format!(
+                "committed knowledge-tree operation {} has an invalid receipt: {error}",
+                operation.operation_id
+            ))
+        })
+    }
+
+    /// Attempt one pending outbox publication. A serialization or repository
+    /// acknowledgement failure deliberately leaves the event pending; callers
+    /// have already committed the filesystem mutation and still return its
+    /// durable receipt.
+    async fn publish_pending_tree_event(
+        &self,
+        repository: &Arc<dyn IKnowledgeTreeOperationRepository>,
+        operation: &KnowledgeTreeOperationRow,
+    ) -> bool {
+        if operation.event_status != KnowledgeTreeEventStatus::Pending {
+            return operation.event_status == KnowledgeTreeEventStatus::Published;
+        }
+        let Some(payload) = operation.event_payload_json.as_deref() else {
+            tracing::error!(
+                operation_id = %operation.operation_id,
+                "committed knowledge-tree outbox row has no event payload"
+            );
+            return false;
+        };
+        let event = match serde_json::from_str::<KnowledgeTreeChangedEvent>(payload) {
+            Ok(event) => event,
+            Err(error) => {
+                tracing::error!(
+                    operation_id = %operation.operation_id,
+                    %error,
+                    "knowledge-tree outbox payload is invalid"
+                );
+                return false;
+            }
+        };
+
+        // A no-op still needs a terminal journal receipt. Its outbox payload is
+        // persisted to satisfy the single-row transactional contract, but it
+        // is acknowledged without broadcasting a meaningless old==new mapping.
+        if event.old_prefix != event.new_prefix {
+            if let Err(error) = self.emitter.try_emit_tree_changed(&event) {
+                tracing::warn!(
+                    operation_id = %operation.operation_id,
+                    %error,
+                    "knowledge-tree outbox publication failed; leaving it pending"
+                );
+                return false;
+            }
+        }
+        match repository
+            .mark_event_published(&operation.operation_id, now_ms())
+            .await
+        {
+            Ok(_) => true,
+            Err(error) => {
+                tracing::warn!(
+                    operation_id = %operation.operation_id,
+                    %error,
+                    "knowledge-tree outbox acknowledgement failed; leaving it pending"
+                );
+                false
+            }
+        }
+    }
+
+    async fn publish_pending_tree_event_serialized(
+        &self,
+        repository: &Arc<dyn IKnowledgeTreeOperationRepository>,
+        operation: &KnowledgeTreeOperationRow,
+    ) -> bool {
+        let _drain_guard = self.tree_operation_drain_lock.lock().await;
+        let latest = match repository
+            .load_by_operation(&operation.operation_id)
+            .await
+        {
+            Ok(Some(latest)) => latest,
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(
+                    operation_id = %operation.operation_id,
+                    %error,
+                    "knowledge-tree outbox refresh failed; leaving it pending"
+                );
+                return false;
+            }
+        };
+        self.publish_pending_tree_event(repository, &latest).await
+    }
+
+    /// Retry committed tree events in bounded keyset pages. Delivery is
+    /// at-least-once across an emit/ack crash window; clients deduplicate by
+    /// `operation_id` and reconcile by `tree_revision`.
+    pub async fn drain_pending_tree_events(&self) -> Result<usize, AppError> {
+        let Some(repository) = self.tree_operation_repository() else {
+            return Ok(0);
+        };
+        let _drain_guard = self.tree_operation_drain_lock.lock().await;
+        let mut published = 0usize;
+        let mut scanned = 0usize;
+        let mut cursor: Option<KnowledgeTreeOperationPageCursor> = None;
+        let mut seen_operation_ids = HashSet::new();
+        while scanned < MAX_TREE_OPERATION_SWEEP_ROWS {
+            let page_limit = (MAX_TREE_OPERATION_SWEEP_ROWS - scanned)
+                .min(TREE_OPERATION_SWEEP_PAGE_SIZE as usize)
+                as u32;
+            let pending = repository
+                .list_pending_events_after(page_limit, cursor.as_ref())
+                .await?;
+            if pending.is_empty() {
+                break;
+            }
+            let page_len = pending.len();
+            let last = pending.last().expect("non-empty outbox page");
+            let committed_at = last.committed_at.ok_or_else(|| {
+                AppError::Internal(format!(
+                    "committed knowledge-tree operation {} has no committed_at cursor",
+                    last.operation_id
+                ))
+            })?;
+            let next_cursor = KnowledgeTreeOperationPageCursor {
+                timestamp: committed_at,
+                operation_id: last.operation_id.clone(),
+            };
+            for operation in pending {
+                if !seen_operation_ids.insert(operation.operation_id.clone()) {
+                    continue;
+                }
+                published += usize::from(
+                    self.publish_pending_tree_event(&repository, &operation)
+                        .await,
+                );
+            }
+            scanned += page_len;
+            cursor = Some(next_cursor);
+            if page_len < page_limit as usize {
+                break;
+            }
+        }
+        if scanned == MAX_TREE_OPERATION_SWEEP_ROWS {
+            tracing::warn!(
+                scanned,
+                "knowledge-tree outbox sweep reached its fairness limit; remaining rows stay pending"
+            );
+        }
+        Ok(published)
+    }
+
+    async fn mark_tree_operation_ambiguous(
+        &self,
+        repository: &Arc<dyn IKnowledgeTreeOperationRepository>,
+        operation: &KnowledgeTreeOperationRow,
+        reason: &str,
+    ) -> AppError {
+        if let Err(error) = repository
+            .mark_needs_recovery(&operation.operation_id, reason, now_ms())
+            .await
+        {
+            tracing::error!(
+                operation_id = %operation.operation_id,
+                %error,
+                "failed to persist ambiguous knowledge-tree recovery state"
+            );
+        }
+        AppError::Conflict(reason.to_owned())
+    }
+
+    async fn finish_durable_relocation_locked(
+        &self,
+        repository: Arc<dyn IKnowledgeTreeOperationRepository>,
+        mut current: KnowledgeBaseRow,
+        operation: KnowledgeTreeOperationRow,
+        publish_event: bool,
+    ) -> Result<RelocateTreeEntryResult, AppError> {
+        if operation.state == KnowledgeTreeOperationState::Committed {
+            let receipt = Self::durable_relocation_receipt(&operation)?;
+            if publish_event {
+                self.publish_pending_tree_event_serialized(&repository, &operation)
+                    .await;
+            }
+            return Ok(receipt);
+        }
+        if operation.state != KnowledgeTreeOperationState::FilesystemCommitted {
+            return Err(AppError::Conflict(format!(
+                "knowledge-tree operation {} is not ready to finalize",
+                operation.operation_id
+            )));
+        }
+
+        let root = PathBuf::from(&current.root_path);
+        let inspect_root = root.clone();
+        let source_path = operation.source_rel_path.clone();
+        let destination_path = operation.destination_rel_path.clone();
+        let moved = tokio::task::spawn_blocking(move || {
+            inspect_committed_relocation(
+                &inspect_root,
+                &source_path,
+                &destination_path,
+            )
+        })
+        .await
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "tree relocation recovery inspection task failed: {error}"
+            ))
+        })??;
+
+        let mut projected_entry_id = None;
+        let mut projected_entry_revision = None;
+        let mut persisted_tree_revision = None;
+        if let Some(entry_repository) = self.entry_repository() {
+            let knowledge_base_id = operation.knowledge_base_id.clone();
+            let source_identity = portable_writeback_path_identity(
+                &operation.source_rel_path,
+            );
+            let destination_identity = portable_writeback_path_identity(
+                &operation.destination_rel_path,
+            );
+            let stable_entry = entry_repository
+                .get_entry_by_path(&knowledge_base_id, &source_identity)
+                .await?
+                .or(entry_repository
+                    .get_entry_by_path(&knowledge_base_id, &destination_identity)
+                    .await?);
+            let mut forced_ids = HashMap::new();
+            if let Some(entry) = stable_entry {
+                forced_ids.insert(
+                    destination_identity.clone(),
+                    entry.knowledge_entry_id,
+                );
+            }
+            self.mark_projection_dirty(&current);
+            let projection = self
+                .reconcile_projection_locked(&current, forced_ids)
+                .await?
+                .ok_or_else(|| {
+                    AppError::Internal(
+                        "knowledge entry repository disappeared during relocation recovery"
+                            .into(),
+                    )
+                })?;
+            if let Some(entry) = projection
+                .entries
+                .iter()
+                .find(|entry| entry.portable_rel_path == destination_identity)
+            {
+                projected_entry_id = Some(entry.knowledge_entry_id.clone());
+                projected_entry_revision = Some(entry.revision);
+            }
+            persisted_tree_revision = Some(projection.tree_revision);
+        }
+
+        let changed = operation.source_rel_path != operation.destination_rel_path;
+        let legacy_tree_revision = if changed && persisted_tree_revision.is_none() {
+            Some(self.next_tree_revision(&current))
+        } else {
+            None
+        };
+        let tree_revision = persisted_tree_revision
+            .or(legacy_tree_revision)
+            .unwrap_or_else(|| self.current_tree_revision(&current));
+
+        if changed {
+            self.invalidate_search_cache_prefix(
+                &root.join(&operation.source_rel_path),
+            );
+            self.invalidate_search_cache_prefix(
+                &root.join(&operation.destination_rel_path),
+            );
+            // `tree_revision` is a logical sequence stored separately in
+            // SQLite; `updated_at` remains an epoch timestamp exposed by the
+            // public base DTO. Mixing them rewound durable moves to 1970.
+            current.updated_at = now_ms();
+            self.repo.update_base(&current).await?;
+        }
+
+        let warnings = (!changed).then(|| {
+            vec!["The entry is already at the requested destination.".to_owned()]
+        });
+        let operation_id = operation.operation_id.to_string();
+        let result = RelocateTreeEntryResult {
+            operation_id: operation_id.clone(),
+            entry_id: projected_entry_id.clone(),
+            old_path: operation.source_rel_path.clone(),
+            new_path: operation.destination_rel_path.clone(),
+            kind: if moved.entry.is_dir {
+                KnowledgeEntryKind::Directory
+            } else {
+                KnowledgeEntryKind::File
+            },
+            moved_descendant_count: moved.moved_descendant_count,
+            revision: projected_entry_revision,
+            tree_revision,
+            undo_token: changed.then(|| format!("relocate:{operation_id}")),
+            warnings,
+        };
+        let event = KnowledgeTreeChangedEvent {
+            knowledge_base_id: operation.knowledge_base_id.clone(),
+            operation_id,
+            entry_id: projected_entry_id,
+            old_prefix: operation.source_rel_path,
+            new_prefix: operation.destination_rel_path,
+            kind: moved.kind,
+            moved_descendant_count: moved.moved_descendant_count,
+            tree_revision,
+            revision: projected_entry_revision,
+        };
+        let committed = repository
+            .commit_operation(&CommitKnowledgeTreeOperationParams {
+                operation_id: operation.operation_id,
+                receipt: serde_json::to_value(&result).map_err(|error| {
+                    AppError::Internal(format!(
+                        "failed to serialize knowledge-tree receipt: {error}"
+                    ))
+                })?,
+                event_payload: serde_json::to_value(&event).map_err(|error| {
+                    AppError::Internal(format!(
+                        "failed to serialize knowledge-tree event: {error}"
+                    ))
+                })?,
+                committed_at: now_ms(),
+            })
+            .await?;
+        if publish_event {
+            self.publish_pending_tree_event_serialized(&repository, &committed)
+                .await;
+        }
+
+        if changed {
+            match self.row_to_info(current).await {
+                Ok(info) => self.emitter.emit_base_updated(&info),
+                Err(error) => tracing::warn!(
+                    knowledge_base_id = %operation.knowledge_base_id,
+                    %error,
+                    "durable tree relocation committed but base-updated payload could not be built"
+                ),
+            }
+        }
+        Ok(result)
+    }
+
+    async fn resume_durable_relocation_locked(
+        &self,
+        repository: Arc<dyn IKnowledgeTreeOperationRepository>,
+        current: KnowledgeBaseRow,
+        operation: KnowledgeTreeOperationRow,
+        strict_recovery: bool,
+        publish_event: bool,
+    ) -> Result<RelocateTreeEntryResult, AppError> {
+        match operation.state {
+            KnowledgeTreeOperationState::Committed => {
+                let receipt = Self::durable_relocation_receipt(&operation)?;
+                if publish_event {
+                    self.publish_pending_tree_event_serialized(&repository, &operation)
+                        .await;
+                }
+                return Ok(receipt);
+            }
+            KnowledgeTreeOperationState::FilesystemCommitted => {
+                return self
+                    .finish_durable_relocation_locked(
+                        repository,
+                        current,
+                        operation,
+                        publish_event,
+                    )
+                    .await;
+            }
+            KnowledgeTreeOperationState::Prepared
+            | KnowledgeTreeOperationState::NeedsRecovery => {}
+        }
+
+        let root = PathBuf::from(&current.root_path);
+        let inspect_root = root.clone();
+        let source_path = operation.source_rel_path.clone();
+        let destination_path = operation.destination_rel_path.clone();
+        let temporary_path = durable_relocation_temporary_path(
+            &root,
+            &operation.destination_rel_path,
+            &operation.operation_id,
+        )?;
+        let (source_exists, destination_exists, temporary_exists) =
+            tokio::task::spawn_blocking(move || {
+                Ok::<_, AppError>((
+                    recovery_tree_path_exists(&inspect_root, &source_path)?,
+                    recovery_tree_path_exists(&inspect_root, &destination_path)?,
+                    recovery_absolute_path_exists(&inspect_root, &temporary_path)?,
+                ))
+            })
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "tree relocation recovery state inspection task failed: {error}"
+                ))
+            })??;
+
+        if operation.source_rel_path == operation.destination_rel_path {
+            if !source_exists || temporary_exists {
+                return Err(self
+                    .mark_tree_operation_ambiguous(
+                        &repository,
+                        &operation,
+                        "no-op tree relocation no longer has one unambiguous source entry",
+                    )
+                    .await);
+            }
+            let filesystem_committed = repository
+                .mark_filesystem_committed(&operation.operation_id, now_ms())
+                .await?;
+            return self
+                .finish_durable_relocation_locked(
+                    repository,
+                    current,
+                    filesystem_committed,
+                    publish_event,
+                )
+                .await;
+        }
+
+        if !source_exists && destination_exists && !temporary_exists {
+            if strict_recovery
+                && let Some(expected_identity) = operation.source_fs_identity.as_deref()
+            {
+                let identity_root = root.clone();
+                let identity_path = operation.destination_rel_path.clone();
+                let actual_identity = tokio::task::spawn_blocking(move || {
+                    recovery_tree_path_identity(&identity_root, &identity_path)
+                })
+                .await
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "tree relocation recovery identity task failed: {error}"
+                    ))
+                })??;
+                if actual_identity.as_deref() != Some(expected_identity) {
+                    return Err(self
+                        .mark_tree_operation_ambiguous(
+                            &repository,
+                            &operation,
+                            "knowledge-tree relocation destination identity does not match the prepared source; refusing to claim an unrelated target",
+                        )
+                        .await);
+                }
+            }
+            let filesystem_committed = repository
+                .mark_filesystem_committed(&operation.operation_id, now_ms())
+                .await?;
+            return self
+                .finish_durable_relocation_locked(
+                    repository,
+                    current,
+                    filesystem_committed,
+                    publish_event,
+                )
+                .await;
+        }
+
+        if !source_exists && !destination_exists && temporary_exists {
+            let target = root.join(&operation.destination_rel_path);
+            let temporary = durable_relocation_temporary_path(
+                &root,
+                &operation.destination_rel_path,
+                &operation.operation_id,
+            )?;
+            tokio::task::spawn_blocking(move || {
+                rename_path_no_replace(&temporary, &target)
+                    .map_err(|error| map_relocate_io_error(error, &temporary, &target))
+            })
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "tree relocation temporary recovery task failed: {error}"
+                ))
+            })??;
+            let filesystem_committed = repository
+                .mark_filesystem_committed(&operation.operation_id, now_ms())
+                .await?;
+            return self
+                .finish_durable_relocation_locked(
+                    repository,
+                    current,
+                    filesystem_committed,
+                    publish_event,
+                )
+                .await;
+        }
+
+        let portable_alias_rename = operation.source_rel_path
+            != operation.destination_rel_path
+            && portable_writeback_path_identity(&operation.source_rel_path)
+                == portable_writeback_path_identity(
+                    &operation.destination_rel_path,
+                );
+        if !source_exists
+            || temporary_exists
+            || (strict_recovery
+                && destination_exists
+                && !portable_alias_rename)
+        {
+            return Err(self
+                .mark_tree_operation_ambiguous(
+                    &repository,
+                    &operation,
+                    "knowledge-tree relocation source/destination state is ambiguous; manual recovery is required",
+                )
+                .await);
+        }
+
+        // A live request may safely retry a prepared command while the source
+        // is still at its original path. A pre-existing target simply causes
+        // the same no-replace conflict and leaves the journal retryable.
+        if self.entry_repository().is_some() && !self.projection_is_reconciled(&current) {
+            self.reconcile_projection_locked(&current, HashMap::new())
+                .await?;
+        }
+        let destination_parent = operation
+            .destination_rel_path
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .unwrap_or_default()
+            .to_owned();
+        let destination_name = operation
+            .destination_rel_path
+            .rsplit('/')
+            .next()
+            .expect("durable destination path is non-empty")
+            .to_owned();
+        let move_root = root.clone();
+        let move_source = operation.source_rel_path.clone();
+        let move_operation_id = operation.operation_id.clone();
+        let move_result = tokio::task::spawn_blocking(move || {
+            relocate_tree_entry_on_disk(
+                &move_root,
+                &move_source,
+                &destination_parent,
+                Some(&destination_name),
+                Some(&move_operation_id),
+            )
+        })
+        .await
+        .map_err(|error| {
+            AppError::Internal(format!("tree relocate task join error: {error}"))
+        })?;
+        if let Err(error) = move_result {
+            let inspect_root = root.clone();
+            let source_path = operation.source_rel_path.clone();
+            let destination_path = operation.destination_rel_path.clone();
+            let (source_still_exists, destination_now_exists) =
+                tokio::task::spawn_blocking(move || {
+                    Ok::<_, AppError>((
+                        recovery_tree_path_exists(&inspect_root, &source_path)?,
+                        recovery_tree_path_exists(&inspect_root, &destination_path)?,
+                    ))
+                })
+                .await
+                .map_err(|join_error| {
+                    AppError::Internal(format!(
+                        "tree relocation failure inspection task failed: {join_error}"
+                    ))
+                })??;
+            if source_still_exists {
+                return Err(error);
+            }
+            if destination_now_exists {
+                let filesystem_committed = repository
+                    .mark_filesystem_committed(&operation.operation_id, now_ms())
+                    .await?;
+                return self
+                    .finish_durable_relocation_locked(
+                        repository,
+                        current,
+                        filesystem_committed,
+                        publish_event,
+                    )
+                    .await;
+            }
+            return Err(self
+                .mark_tree_operation_ambiguous(
+                    &repository,
+                    &operation,
+                    &format!(
+                        "tree relocation failed after the source left its original path: {error}"
+                    ),
+                )
+                .await);
+        }
+
+        // This marker is intentionally the very next durable step after the
+        // rename. A crash before it is reconciled from source/target state.
+        let filesystem_committed = match repository
+            .mark_filesystem_committed(&operation.operation_id, now_ms())
+            .await
+        {
+            Ok(operation) => operation,
+            Err(error) => {
+                let _ = repository
+                    .mark_needs_recovery(
+                        &operation.operation_id,
+                        "filesystem rename committed but its journal marker failed",
+                        now_ms(),
+                    )
+                    .await;
+                return Err(error.into());
+            }
+        };
+        self.finish_durable_relocation_locked(
+            repository,
+            current,
+            filesystem_committed,
+            publish_event,
+        )
+        .await
+    }
+
+    async fn recover_one_pending_tree_operation(
+        &self,
+        repository: Arc<dyn IKnowledgeTreeOperationRepository>,
+        operation: KnowledgeTreeOperationRow,
+    ) -> bool {
+        let row = match self
+            .require_base(operation.knowledge_base_id.as_str())
+            .await
+        {
+            Ok(row) => row,
+            Err(error) => {
+                tracing::warn!(
+                    operation_id = %operation.operation_id,
+                    %error,
+                    "knowledge-tree recovery skipped an unavailable base"
+                );
+                return false;
+            }
+        };
+        let tree_guard = match self.acquire_document_tree_write_lock(&row).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                tracing::warn!(operation_id = %operation.operation_id, %error, "knowledge-tree recovery could not acquire its tree lock");
+                return false;
+            }
+        };
+        let base_guard = match self.acquire_base_lifecycle_lock(&row).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                tracing::warn!(operation_id = %operation.operation_id, %error, "knowledge-tree recovery could not acquire its lifecycle lock");
+                drop(tree_guard);
+                return false;
+            }
+        };
+        let current = match self
+            .require_base(operation.knowledge_base_id.as_str())
+            .await
+        {
+            Ok(current) if current.root_path == row.root_path => current,
+            Ok(_) => {
+                tracing::warn!(operation_id = %operation.operation_id, "knowledge-tree recovery observed a changed base root");
+                drop(base_guard);
+                drop(tree_guard);
+                return false;
+            }
+            Err(error) => {
+                tracing::warn!(operation_id = %operation.operation_id, %error, "knowledge-tree recovery lost its base registration");
+                drop(base_guard);
+                drop(tree_guard);
+                return false;
+            }
+        };
+        let recovered = match self
+            .resume_durable_relocation_locked(
+                repository,
+                current,
+                operation.clone(),
+                true,
+                false,
+            )
+            .await
+        {
+            Ok(_) => true,
+            Err(error) => {
+                tracing::warn!(
+                    operation_id = %operation.operation_id,
+                    %error,
+                    "knowledge-tree operation remains pending recovery"
+                );
+                false
+            }
+        };
+        drop(base_guard);
+        drop(tree_guard);
+        recovered
+    }
+
+    /// Reconcile non-terminal relocation journal rows before routes begin
+    /// serving. Recovered events stay pending until a realtime subscriber is
+    /// installed (or the first mutation drains them). Ambiguous rows remain
+    /// explicitly recoverable and do not block unrelated knowledge bases;
+    /// repository scan failures are surfaced.
+    pub async fn recover_pending_tree_operations(&self) -> Result<usize, AppError> {
+        let Some(repository) = self.tree_operation_repository() else {
+            return Ok(0);
+        };
+        let mut recovered = 0usize;
+        let mut scanned = 0usize;
+        let mut cursor: Option<KnowledgeTreeOperationPageCursor> = None;
+        while scanned < MAX_TREE_OPERATION_SWEEP_ROWS {
+            let page_limit = (MAX_TREE_OPERATION_SWEEP_ROWS - scanned)
+                .min(TREE_OPERATION_SWEEP_PAGE_SIZE as usize)
+                as u32;
+            let pending = repository
+                .list_pending_recovery_after(page_limit, cursor.as_ref())
+                .await?;
+            if pending.is_empty() {
+                break;
+            }
+            let page_len = pending.len();
+            let last = pending.last().expect("non-empty recovery page");
+            let next_cursor = KnowledgeTreeOperationPageCursor {
+                timestamp: last.created_at,
+                operation_id: last.operation_id.clone(),
+            };
+            for operation in pending {
+                recovered += usize::from(
+                    self.recover_one_pending_tree_operation(repository.clone(), operation)
+                        .await,
+                );
+            }
+            scanned += page_len;
+            cursor = Some(next_cursor);
+            if page_len < page_limit as usize {
+                break;
+            }
+        }
+        if scanned == MAX_TREE_OPERATION_SWEEP_ROWS {
+            tracing::warn!(
+                scanned,
+                "knowledge-tree recovery sweep reached its fairness limit; remaining rows stay pending"
+            );
+        }
+        Ok(recovered)
+    }
+
+    /// Late-wire the one install-wide retrieval preference source and the
+    /// same model invocation service used by every other multimodal consumer.
+    pub fn set_retrieval_runtime(
+        &self,
+        preferences: Arc<dyn IClientPreferenceRepository>,
+        model_invoke: Arc<ModelInvokeService>,
+    ) {
+        self.set_retrieval_preferences(preferences);
+        self.set_model_invoke(model_invoke);
+    }
+
+    /// Wire the durable policy source independently for route-level tests and
+    /// embedders that intentionally expose local-only retrieval.
+    pub fn set_retrieval_preferences(
+        &self,
+        preferences: Arc<dyn IClientPreferenceRepository>,
+    ) {
+        *self
+            .retrieval_preferences
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(preferences);
+    }
+
+    /// Wire exact task invocation. Kept separate from preference storage so a
+    /// local-only installation does not need a dummy invocation graph.
+    pub fn set_model_invoke(&self, model_invoke: Arc<ModelInvokeService>) {
+        *self
+            .model_invoke
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(model_invoke);
+    }
+
+    /// Read the one persisted retrieval policy. An absent preference is the
+    /// explicit two-stage local default; malformed durable state is an error,
+    /// never reinterpreted as local.
+    pub async fn retrieval_config(&self) -> Result<KnowledgeRetrievalConfig, AppError> {
+        let preferences = self
+            .retrieval_preferences
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(preferences) = preferences else {
+            return Ok(KnowledgeRetrievalConfig::default());
+        };
+        let rows = preferences
+            .get_by_keys(&[KNOWLEDGE_RETRIEVAL_KEY])
+            .await?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(KnowledgeRetrievalConfig::default());
+        };
+        serde_json::from_str(&row.value).map_err(|error| {
+            AppError::Internal(format!(
+                "stored {KNOWLEDGE_RETRIEVAL_KEY} preference is invalid: {error}"
+            ))
+        })
+    }
+
+    /// Validate every configured remote stage against the exact persisted
+    /// capability graph, then atomically replace the single preference row.
+    pub async fn update_retrieval_config(
+        &self,
+        config: KnowledgeRetrievalConfig,
+    ) -> Result<KnowledgeRetrievalConfig, AppError> {
+        let preferences = self
+            .retrieval_preferences
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .ok_or_else(|| {
+                AppError::Conflict("knowledge retrieval preferences are not wired".into())
+            })?;
+        let invoke = self
+            .model_invoke
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+
+        for (selection, task) in [
+            (config.embedding.remote_model(), ModelTask::Embedding),
+            (config.rerank.remote_model(), ModelTask::Rerank),
+        ] {
+            let Some((provider_id, model)) = selection else {
+                continue;
+            };
+            let invoke = invoke.as_ref().ok_or_else(|| {
+                AppError::Conflict("knowledge model invocation is not wired".into())
+            })?;
+            invoke
+                .resolve_task_config(
+                    &ModelRef {
+                        provider_id: provider_id.to_owned(),
+                        model: model.to_owned(),
+                    },
+                    task,
+                )
+                .await
+                .map_err(AppError::from)?;
+        }
+
+        let value = serde_json::to_string(&config).map_err(|error| {
+            AppError::Internal(format!("knowledge retrieval config serialize failed: {error}"))
+        })?;
+        preferences
+            .upsert_batch(&[(KNOWLEDGE_RETRIEVAL_KEY, value.as_str())])
+            .await?;
+        Ok(config)
+    }
+
+    /// Register an additional backend-managed workspace root (e.g. the
+    /// terminal work dir). Paths under any registered root resolve to the
+    /// `__default__` workpath key in this service's live cwd resolvers,
+    /// matching the key the owning subsystem writes bindings under.
+    ///
+    /// Deliberately NOT canonicalized: the terminal service compares its raw
+    /// configured `work_dir` prefix (`session_workpath_key(cwd, work_dir)`),
+    /// so the exact same value must be registered here for the two
+    /// derivations to agree byte-for-byte.
+    pub fn add_managed_root(&self, root: &Path) {
+        if root.as_os_str().is_empty() {
+            return;
+        }
+        if let Ok(mut guard) = self.extra_managed_roots.write() {
+            if !guard.iter().any(|r| r == root) {
+                guard.push(root.to_path_buf());
+            }
+        }
+    }
+
+    /// Late-wire the in-process binding-change observer (app layer only).
+    pub fn set_binding_changed_hook(&self, hook: Arc<dyn Fn(&str, &str) + Send + Sync>) {
+        if let Ok(mut guard) = self.binding_changed_hook.write() {
+            *guard = Some(hook);
+        }
+    }
+
+    /// The workpath key a cwd resolves to for THIS installation: `__default__`
+    /// when the path sits under `data_dir` or any registered managed root,
+    /// otherwise its normalized literal key. This is the single derivation the
+    /// live MCP resolvers use, kept aligned with the terminal service's
+    /// `session_workpath_key(cwd, work_dir)` via [`Self::add_managed_root`].
+    fn workpath_key_for_cwd(&self, cwd: &str) -> String {
+        use crate::workpath::{DEFAULT_WORKPATH_KEY, session_workpath_key};
+        if cwd.trim().is_empty() {
+            return DEFAULT_WORKPATH_KEY.to_owned();
+        }
+        let path = std::path::Path::new(cwd);
+        let key = session_workpath_key(path, &self.data_dir);
+        if key == DEFAULT_WORKPATH_KEY {
+            return key;
+        }
+        if let Ok(roots) = self.extra_managed_roots.read() {
+            for root in roots.iter() {
+                if session_workpath_key(path, root) == DEFAULT_WORKPATH_KEY {
+                    return DEFAULT_WORKPATH_KEY.to_owned();
+                }
+            }
+        }
+        key
+    }
+
+    /// The workpath key a TERMINAL session's cwd resolves to. Must agree
+    /// byte-for-byte with the terminal service's
+    /// `session_workpath_key(cwd, work_dir)` — the registered managed roots
+    /// (the terminal work dirs) take precedence, and `data_dir` is only the
+    /// safety-net fallback while NO root has been registered. Checking
+    /// `data_dir` first (like the conversation derivation above) would map a
+    /// custom terminal cwd under `data_dir` to `__default__` when
+    /// `work_dir != data_dir`, while the terminal binds/mounts under the
+    /// literal key — live tools would then consult the wrong binding row.
+    fn terminal_workpath_key_for_cwd(&self, cwd: &str) -> String {
+        use crate::workpath::{DEFAULT_WORKPATH_KEY, session_workpath_key, workpath_key};
+        if cwd.trim().is_empty() {
+            return DEFAULT_WORKPATH_KEY.to_owned();
+        }
+        let path = std::path::Path::new(cwd);
+        if let Ok(roots) = self.extra_managed_roots.read()
+            && !roots.is_empty()
+        {
+            for root in roots.iter() {
+                if session_workpath_key(path, root) == DEFAULT_WORKPATH_KEY {
+                    return DEFAULT_WORKPATH_KEY.to_owned();
+                }
+            }
+            return workpath_key(cwd);
+        }
+        session_workpath_key(path, &self.data_dir)
+    }
+
+    /// Replace the URL fetcher. Accepts any [`PageFetcher`] (tests pass a
+    /// loopback-permitting [`HttpFetcher`]; the production rendering backend
+    /// late-wires its `BrowserFetcher`), wrapping it in the `Arc<dyn …>` the
+    /// service stores.
+    pub fn with_url_fetcher(mut self, fetcher: impl PageFetcher + 'static) -> Self {
+        self.fetcher = Arc::new(fetcher);
+        self
+    }
+
+    /// Late-wire the production LLM completer (see `nomifun-ai-agent`'s
+    /// `LiveKnowledgeCompleter`).
+    pub fn set_completer(&self, completer: Arc<dyn KnowledgeCompleter>) {
+        *self.completer.write().expect("knowledge completer lock poisoned") = Some(completer);
+    }
+
+    /// **P3-K2: late-wire the rendering page-fetcher** (the engine-backed
+    /// `BrowserFetcher` from `nomifun-ai-agent`, wired by the app layer when the
+    /// `browser-use` feature is on). Interior-mutable so it can be set on the shared
+    /// `Arc<KnowledgeService>` after construction (the agent stack is built after
+    /// this service — same late-wire timing as [`Self::set_completer`]).
+    ///
+    /// This only *registers* the backend. It does **not** change which sources use
+    /// it: the default [`Self::fetcher`] (HTTP) stays the active path for every
+    /// source, so HTTP knowledge sources are unaffected (zero regression). Routing
+    /// a source to this backend (the `rendered` flag) is K3.
+    pub fn set_render_fetcher(&self, fetcher: Arc<dyn PageFetcher>) {
+        *self.render_fetcher.write().expect("knowledge render fetcher lock poisoned") = Some(fetcher);
+    }
+
+    /// The wired rendering page-fetcher, if any (K3 reads this to route `rendered`
+    /// sources). `None` ⇒ no browser backend → fall back to the HTTP [`Self::fetcher`].
+    fn render_fetcher(&self) -> Option<Arc<dyn PageFetcher>> {
+        self.render_fetcher.read().ok().and_then(|guard| guard.clone())
+    }
+
+    /// **P3-K3 backend selection**: pick the page-fetcher for one source entry.
+    /// `rendered == true` AND a [`Self::render_fetcher`] is wired ⇒ the browser
+    /// backend (`BrowserFetcher`); every other case ⇒ the default HTTP
+    /// [`Self::fetcher`]. In particular `rendered == true` with **no** render
+    /// backend wired (`browser-use` feature off / not injected) gracefully
+    /// degrades to HTTP rather than failing — the flag is best-effort, never a
+    /// hard requirement. Returns an owned `Arc` clone so the caller can `.await`
+    /// across the fetch without holding the `RwLock`.
+    fn fetcher_for(&self, rendered: bool) -> Arc<dyn PageFetcher> {
+        if rendered && let Some(render) = self.render_fetcher() {
+            render
+        } else {
+            Arc::clone(&self.fetcher)
+        }
+    }
+
+    fn completer(&self) -> Option<Arc<dyn KnowledgeCompleter>> {
+        self.completer.read().ok().and_then(|guard| guard.clone())
+    }
+
+    /// The wired completer, or the autogen-wide 409 ("configure a model
+    /// provider first") shared by every AI endpoint of this crate.
+    fn require_completer(&self) -> Result<Arc<dyn KnowledgeCompleter>, AppError> {
+        self.completer().ok_or_else(|| {
+            AppError::Conflict(
+                "knowledge autogen unavailable: no AI completer is configured (add an enabled model provider first)"
+                    .into(),
+            )
+        })
+    }
+
+    // ── Base registry ───────────────────────────────────────────────
+
+    pub async fn list_bases(&self) -> Result<Vec<KnowledgeBaseInfo>, AppError> {
+        let rows = self.repo.list_bases().await?;
+        // Materialize each base concurrently (bounded), preserving registry
+        // order. Sequentially, one slow/NAS-bound base's walk would block
+        // materialization of every other (fast, local) base and could push the
+        // whole list past the client timeout; `.buffered` caps that to roughly
+        // one base's [`BASE_WALK_BUDGET`] regardless of how many bases exist.
+        let infos = stream::iter(rows.into_iter().map(|row| self.row_to_info(row)))
+            .buffered(LIST_BASES_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        infos.into_iter().collect()
+    }
+
+    /// Registered base ids only, straight from the registry (DB) — performs NO
+    /// filesystem access. Callers that merely need to validate that an id
+    /// exists (knowledge binding, `ensure_known_kb_ids`) MUST use this rather
+    /// than [`Self::list_bases`], which walks every base's directory tree and
+    /// would pay a full (possibly NAS-bound) walk just to produce a set of ids.
+    pub async fn list_base_ids(&self) -> Result<Vec<String>, AppError> {
+        Ok(self.repo
+            .list_bases()
+            .await?
+            .into_iter()
+            .map(|row| row.knowledge_base_id)
+            .collect())
+    }
+
+    pub async fn get_base_info(&self, id: &str) -> Result<KnowledgeBaseInfo, AppError> {
+        let row = self.require_base(id).await?;
+        self.row_to_info(row).await
+    }
+
+    /// Create a base. With `root_path = None` the directory is provisioned
+    /// under `{data_dir}/knowledge/{id}/` (managed); otherwise the given
+    /// existing directory is registered as an external reference. External
+    /// content is mutated only when its first-class `tree_access` policy is
+    /// explicitly `editable`.
+    ///
+    /// An optional URL `source` is persisted into the registry row's
+    /// `extra.source`. `live` mode stores it without fetching (the URLs are
+    /// surfaced to agents as realtime sources at mount time); `snapshot`
+    /// mode fetches every entry synchronously into a managed Markdown entry
+    /// (`snapshots/` is only the initial default folder) and
+    /// then chains a best-effort AI overview run (silently skipped when no
+    /// completer is wired).
+    pub async fn create_base(
+        &self,
+        name: &str,
+        description: &str,
+        root_path: Option<&str>,
+        source: Option<KnowledgeSource>,
+    ) -> Result<KnowledgeBaseInfo, AppError> {
+        // Internal callers historically use this helper to create test/import
+        // fixtures they immediately mutate. Public create routes call
+        // `create_base_with_access` and retain the safe external-read-only
+        // default when no explicit consent is supplied.
+        self.create_base_with_access(
+            name,
+            description,
+            root_path,
+            source,
+            Some(KnowledgeTreeAccess::Editable),
+        )
+            .await
+    }
+
+    /// Create a base with an explicit filesystem mutation policy. Managed
+    /// directories default to editable; externally owned directories default to
+    /// read-only unless the user deliberately grants write access.
+    pub async fn create_base_with_access(
+        &self,
+        name: &str,
+        description: &str,
+        root_path: Option<&str>,
+        source: Option<KnowledgeSource>,
+        requested_access: Option<KnowledgeTreeAccess>,
+    ) -> Result<KnowledgeBaseInfo, AppError> {
+        let (row, info, snapshot_source) = self
+            .register_base(name, description, root_path, source, requested_access)
+            .await?;
+        match snapshot_source {
+            Some(src) => self.fetch_source_and_autogen(row, src).await,
+            None => Ok(info),
+        }
+    }
+
+    /// [`Self::create_base`] for MCP/gateway callers: identical registration
+    /// (the response already carries id/seq and `extra.source` is persisted),
+    /// but a snapshot-mode fetch and its chained autogen are dispatched to a
+    /// background task instead of running before the response. The worst-case
+    /// synchronous fetch (16 URLs × redirect hops × LLM compression) takes
+    /// minutes — far beyond MCP client timeouts, after which the client gives
+    /// up while the server keeps working and the agent may retry-create a
+    /// duplicate. The returned info therefore never carries a `source_fetch`
+    /// summary; completion is announced by the `knowledge.base-updated` event
+    /// the pipeline emits when it finishes. Background failures are warn-only
+    /// — the base stays registered and usable, and `refresh_source` can retry.
+    pub async fn create_base_with_background_fetch(
+        self: Arc<Self>,
+        name: &str,
+        description: &str,
+        root_path: Option<&str>,
+        source: Option<KnowledgeSource>,
+    ) -> Result<KnowledgeBaseInfo, AppError> {
+        let (row, info, snapshot_source) = self
+            .register_base(name, description, root_path, source, None)
+            .await?;
+        if let Some(src) = snapshot_source {
+            // Same pattern as the import handler's spawned autogen
+            // (`routes.rs::import_base`): the task holds its own Arc so it
+            // outlives the request.
+            let service = Arc::clone(&self);
+            tokio::spawn(async move {
+                let kb_id = row.knowledge_base_id.clone();
+                if let Err(e) = service.fetch_source_and_autogen(row, src).await {
+                    tracing::warn!(kb_id = %kb_id, error = %e, "background knowledge source fetch failed");
+                }
+            });
+        }
+        Ok(info)
+    }
+
+    /// Shared first phase of base creation: validate, provision/verify the
+    /// root directory, insert the row (with `extra.source` already
+    /// persisted), and emit `knowledge.base-created`. Returns the row, its
+    /// info, and — for snapshot-mode sources — the source whose fetch the
+    /// caller still owes.
+    async fn register_base(
+        &self,
+        name: &str,
+        description: &str,
+        root_path: Option<&str>,
+        source: Option<KnowledgeSource>,
+        requested_access: Option<KnowledgeTreeAccess>,
+    ) -> Result<(KnowledgeBaseRow, KnowledgeBaseInfo, Option<KnowledgeSource>), AppError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(AppError::BadRequest("knowledge base name must not be empty".into()));
+        }
+        let mut source = source;
+        if let Some(src) = &mut source {
+            sanitize_source_entries(src);
+            src.source_id = Some(KnowledgeSourceId::new());
+            src.revision = 0;
+            src.default_parent_entry_id = None;
+            for item in &mut src.entries {
+                item.source_item_id = Some(KnowledgeSourceItemId::new());
+                item.snapshot_entry_id = None;
+                item.sync_status = KnowledgeSourceSyncStatus::Pending;
+                item.last_success_at = None;
+                item.last_error = None;
+            }
+            validate_source(src)?;
+            validate_unique_source_urls(src)?;
+            // Server-assigned; a client-sent value would lie until the first fetch.
+            src.last_fetched_at = None;
+        }
+
+        let id = KnowledgeBaseId::new();
+        let (root, managed) = match root_path.map(str::trim).filter(|p| !p.is_empty()) {
+            None => {
+                let managed_parent =
+                    self.data_dir.join(KB_MANAGED_REL_DIR);
+                tokio::fs::create_dir_all(&managed_parent)
+                    .await
+                    .map_err(|e| AppError::Internal(format!("failed to create managed knowledge root: {e}")))?;
+                let parent_metadata =
+                    tokio::fs::symlink_metadata(&managed_parent)
+                        .await
+                        .map_err(|e| AppError::Internal(format!("failed to inspect managed knowledge root: {e}")))?;
+                if metadata_is_link_or_reparse(
+                    &managed_parent,
+                    &parent_metadata,
+                ) {
+                    return Err(AppError::Conflict(
+                        "managed knowledge root must not be a symlink, junction, or name-surrogate reparse point"
+                            .into(),
+                    ));
+                }
+                let dir = managed_parent.join(id.as_str());
+                tokio::fs::create_dir_all(&dir)
+                    .await
+                    .map_err(|e| AppError::Internal(format!("failed to create knowledge dir: {e}")))?;
+                (dir, true)
+            }
+            Some(path) => {
+                let requested_dir = PathBuf::from(path);
+                if !requested_dir.is_absolute() {
+                    return Err(AppError::BadRequest("external root_path must be absolute".into()));
+                }
+                if !requested_dir
+                    .components()
+                    .any(|component| matches!(component, Component::Normal(_)))
+                {
+                    return Err(AppError::BadRequest(
+                        "a filesystem, drive, or network-share root cannot be registered as a knowledge base"
+                            .into(),
+                    ));
+                }
+                let root_metadata = tokio::fs::symlink_metadata(&requested_dir)
+                    .await
+                    .map_err(|_| {
+                        AppError::BadRequest(format!(
+                            "directory does not exist: {path}"
+                        ))
+                    })?;
+                if !root_metadata.is_dir()
+                    || metadata_is_link_or_reparse(&requested_dir, &root_metadata)
+                {
+                    return Err(AppError::BadRequest(
+                        "knowledge base root must be a real directory, not a symlink, junction, or name-surrogate reparse point"
+                            .into(),
+                    ));
+                }
+                // Persist the physical root. A parent symlink can otherwise be
+                // retargeted after registration while the process-wide lock
+                // cache still protects the old target.
+                let dir = tokio::fs::canonicalize(&requested_dir)
+                    .await
+                    .map_err(|error| {
+                        AppError::BadRequest(format!(
+                            "failed to resolve knowledge directory {path}: {error}"
+                        ))
+                    })?;
+                if !dir
+                    .components()
+                    .any(|component| matches!(component, Component::Normal(_)))
+                {
+                    return Err(AppError::BadRequest(
+                        "a filesystem, drive, or network-share root cannot be registered as a knowledge base"
+                            .into(),
+                    ));
+                }
+                (dir, false)
+            }
+        };
+
+        // Persist one physical, Unicode path for both managed and external
+        // roots. Lossy conversion would replace non-UTF-8 bytes with U+FFFD,
+        // leaving a permanently broken registration and potentially merging
+        // unrelated lock identities. The Windows verbatim (`\\?\`) prefix is
+        // stripped so persisted roots stay comparable and presentable.
+        let root = tokio::fs::canonicalize(&root)
+            .await
+            .map(|canonical| nomifun_common::paths::simplified(&canonical))
+            .map_err(|error| {
+                AppError::BadRequest(format!(
+                    "failed to resolve the physical knowledge directory: {error}"
+                ))
+            })?;
+        let root_path = root
+            .to_str()
+            .ok_or_else(|| {
+                AppError::BadRequest(
+                    "the physical knowledge directory must have a Unicode path on every supported platform"
+                        .into(),
+                )
+            })?
+            .to_owned();
+
+        let tree_access = requested_access.unwrap_or(if managed {
+            KnowledgeTreeAccess::Editable
+        } else {
+            KnowledgeTreeAccess::ReadOnly
+        });
+        if tree_access == KnowledgeTreeAccess::ReadOnly
+            && source
+                .as_ref()
+                .is_some_and(|source| source.mode == KnowledgeSourceMode::Snapshot)
+        {
+            return Err(AppError::BadRequest(
+                "snapshot knowledge sources require editable tree access".into(),
+            ));
+        }
+        let mut extra = serde_json::Map::new();
+        if let Some(source) = &source {
+            extra.insert(
+                "source".into(),
+                serde_json::to_value(source)
+                    .map_err(|error| AppError::Internal(format!("failed to serialize knowledge source: {error}")))?,
+            );
+        }
+        let extra = serde_json::Value::Object(extra).to_string();
+        let now = now_ms();
+        let row = KnowledgeBaseRow {
+            id: 0,
+            knowledge_base_id: id.into_string(),
+            name: name.to_owned(),
+            description: description.trim().to_owned(),
+            root_path,
+            managed,
+            tree_access: persisted_knowledge_tree_access(tree_access).into(),
+            extra,
+            created_at: now,
+            updated_at: now,
+            tags: None,
+        };
+        self.repo.insert_base(&row).await?;
+        let info = self.row_to_info(row.clone()).await?;
+        self.emitter.emit_base_created(&info);
+        // Only URL sources owe a create-time snapshot fetch.
+        let snapshot_source =
+            source.filter(|s| s.mode == KnowledgeSourceMode::Snapshot && s.kind == "url");
+        Ok((row, info, snapshot_source))
+    }
+
+    /// Boot-time resume of interrupted snapshot fetches. A snapshot-mode
+    /// source is persisted into `extra.source` BEFORE its (possibly
+    /// background) fetch runs, so a base whose source has entries but no
+    /// `lastFetchedAt` stamp means the app exited mid-fetch (or the fetch
+    /// never started). Re-run the regular fetch+autogen pipeline for each —
+    /// slugs derive from the configured URLs, so a re-run overwrites in place
+    /// (idempotent). Live-mode sources and already-stamped bases are never
+    /// touched unless an explicit live-source refresh was interrupted. The
+    /// normalized state machine also resumes `syncing` items and managed
+    /// entries whose file disappeared between filesystem and database commit.
+    /// Failures stay warn-only; the next boot or a manual refresh can retry.
+    pub async fn resume_pending_source_fetches(self: Arc<Self>) {
+        let rows = match self.repo.list_bases().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = %e, "knowledge boot-resume: listing bases failed");
+                return;
+            }
+        };
+        let mut pending: Vec<(KnowledgeBaseRow, KnowledgeSource)> = Vec::new();
+        for mut row in rows {
+            let mut source = match source_from_extra(&row.extra) {
+                Ok(source) => source,
+                Err(error) => {
+                    tracing::warn!(
+                        knowledge_base_id = %row.knowledge_base_id,
+                        %error,
+                        "knowledge boot-resume: stored source JSON is invalid; skipping base"
+                    );
+                    continue;
+                }
+            };
+            if self.source_repository().is_some()
+                && let Some(cached) = source.as_mut()
+            {
+                if let Err(error) = self
+                    .refresh_legacy_source_cache(&mut row, cached)
+                    .await
+                {
+                    tracing::warn!(
+                        knowledge_base_id = %row.knowledge_base_id,
+                        %error,
+                        "knowledge boot-resume: failed to repair source cache from normalized state"
+                    );
+                }
+                source = match source_from_extra(&row.extra) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        tracing::warn!(
+                            knowledge_base_id = %row.knowledge_base_id,
+                            %error,
+                            "knowledge boot-resume: repaired source cache is invalid"
+                        );
+                        continue;
+                    }
+                };
+            }
+            let Some(src) = source else { continue };
+            let normalized_pending = if self.source_repository().is_some() {
+                match self.ensure_normalized_source(&row).await {
+                    Ok(Some(normalized)) => {
+                        let mut needs_resume = false;
+                        let source_repository = self.source_repository();
+                        let entry_repository = self.entry_repository();
+                        for item in normalized
+                            .items
+                            .iter()
+                            .filter(|item| item.state == KnowledgeSourceState::Active)
+                        {
+                            if item.sync_status == KnowledgeSourceItemSyncStatus::Syncing
+                                || (normalized.source.mode
+                                    == PersistedKnowledgeSourceMode::Snapshot
+                                    && item.sync_status
+                                        == KnowledgeSourceItemSyncStatus::Pending)
+                            {
+                                needs_resume = true;
+                                break;
+                            }
+                            if let (Some(source_repository), Some(entry_repository)) =
+                                (source_repository.as_ref(), entry_repository.as_ref())
+                                && let Ok(Some(provenance)) = source_repository
+                                    .get_managed_entry_provenance(
+                                        &item.knowledge_source_item_id,
+                                    )
+                                    .await
+                            {
+                                let entry = entry_repository
+                                    .get_entry(
+                                        &normalized.source.knowledge_base_id,
+                                        &provenance.knowledge_entry_id,
+                                    )
+                                    .await
+                                    .ok()
+                                    .flatten();
+                                if entry.as_ref().is_none_or(|entry| {
+                                    entry.is_deleted()
+                                        || std::fs::symlink_metadata(
+                                            Path::new(&row.root_path).join(&entry.rel_path),
+                                        )
+                                        .is_err()
+                                }) {
+                                    needs_resume = true;
+                                    break;
+                                }
+                            }
+                        }
+                        needs_resume
+                    }
+                    Ok(None) => false,
+                    Err(error) => {
+                        tracing::warn!(
+                            knowledge_base_id = %row.knowledge_base_id,
+                            %error,
+                            "knowledge boot-resume: normalized source state is unavailable"
+                        );
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            if normalized_pending
+                || (self.source_repository().is_none()
+                    && src.mode == KnowledgeSourceMode::Snapshot
+                    && !src.entries.is_empty()
+                    && src.last_fetched_at.is_none())
+            {
+                pending.push((row, src));
+            }
+        }
+        if pending.is_empty() {
+            return;
+        }
+        tracing::info!(
+            count = pending.len(),
+            "knowledge boot-resume: re-fetching interrupted snapshot sources"
+        );
+        for (row, src) in pending {
+            let kb_id = row.knowledge_base_id.clone();
+            if let Err(e) = self.fetch_source_and_autogen(row, src).await {
+                tracing::warn!(kb_id = %kb_id, error = %e, "knowledge boot-resume fetch failed");
+            }
+        }
+    }
+
+    /// Create-time snapshot pipeline, shared by the synchronous REST create
+    /// and the gateway's background dispatch: fetch every entry into
+    /// managed entries, persist the (title-backfilled, stamped) source,
+    /// chain the best-effort autogen, then re-read + re-emit
+    /// `knowledge.base-updated` so clients see the final stats/description.
+    /// The returned info carries the per-entry `source_fetch` summary (the
+    /// sync REST path returns it to the creating client; the background path
+    /// drops it). Errs only when the final re-read fails (e.g. the base was
+    /// deleted mid-run).
+    async fn fetch_source_and_autogen(
+        &self,
+        mut row: KnowledgeBaseRow,
+        mut src: KnowledgeSource,
+    ) -> Result<KnowledgeBaseInfo, AppError> {
+        let (fetched, errors, persisted_stamp, fatal_error) =
+            if self.source_repository().is_some() && self.entry_repository().is_some() {
+                self.ensure_projection_reconciled(&row).await?;
+                self.recover_pending_source_publications(&row).await?;
+                let normalized = self
+                    .ensure_normalized_source(&row)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::Internal(
+                            "knowledge source normalization did not produce an aggregate".into(),
+                        )
+                    })?;
+                let (files, mut errors) = self
+                    .prepare_managed_source_items(&normalized.items)
+                    .await?;
+                let publication = self
+                    .publish_managed_source_items(&mut row, &normalized.source, files)
+                    .await;
+                errors.extend(publication.errors);
+                if publication.fatal_error.is_none() {
+                    self.refresh_legacy_source_cache(&mut row, &mut src)
+                        .await?;
+                }
+                (
+                    publication.fetched,
+                    errors,
+                    publication.persisted_stamp,
+                    publication.fatal_error,
+                )
+            } else {
+                let (files, mut errors) =
+                    self.prepare_source_snapshots(&mut src.entries).await;
+                let publication = self
+                    .publish_prepared_url_source(&mut row, &mut src, files, false)
+                    .await;
+                errors.extend(publication.errors);
+                (
+                    publication.fetched,
+                    errors,
+                    publication.persisted_stamp,
+                    publication.fatal_error,
+                )
+            };
+        if !errors.is_empty() {
+            tracing::warn!(kb_id = %row.knowledge_base_id, ?errors, "some URL sources failed to fetch at create time");
+        }
+        // The stamp the summary may honestly claim: only a PERSISTED stamp
+        // counts. When persisting fails, the registry still holds the old
+        // value — reporting the aspirational new stamp would lie to the
+        // client about freshness state.
+        if let Some(error) = fatal_error {
+            tracing::warn!(
+                kb_id = %row.knowledge_base_id,
+                %error,
+                "failed to publish or persist source fetch state"
+            );
+        }
+        // Chained creation-time autogen: best-effort, silently skipped
+        // when no completer is wired (or nothing was fetched). A
+        // user-supplied description is preserved — autogen only
+        // backfills an empty one (the README is generated either way).
+        // `None`: server-driven background curation always uses the
+        // completer's default model — never a transient UI model pick.
+        if fetched > 0 && self.completer().is_some() {
+            if let Err(e) = self.generate_overview_opts(&row.knowledge_base_id, false, true, None).await {
+                tracing::warn!(kb_id = %row.knowledge_base_id, error = %e, "create-time knowledge autogen skipped");
+            }
+        }
+        // Re-read + re-emit so clients see final stats/description.
+        let row = self.require_base(&row.knowledge_base_id).await?;
+        let mut info = self.row_to_info(row).await?;
+        self.emitter.emit_base_updated(&info);
+        // Surface the per-entry fetch outcome to the creating client
+        // (response-only; events/list/get never carry it).
+        info.source_fetch = Some(RefreshSourceSummary {
+            fetched,
+            failed: errors.len(),
+            errors,
+            last_fetched_at: persisted_stamp,
+        });
+        Ok(info)
+    }
+
+    pub async fn update_base(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        description: Option<&str>,
+        tags: Option<Vec<String>>,
+    ) -> Result<KnowledgeBaseInfo, AppError> {
+        self.update_base_with_access(id, name, description, tags, None)
+            .await
+    }
+
+    pub async fn update_base_with_access(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        description: Option<&str>,
+        tags: Option<Vec<String>>,
+        tree_access: Option<KnowledgeTreeAccess>,
+    ) -> Result<KnowledgeBaseInfo, AppError> {
+        let initial = self.require_base(id).await?;
+        let _base_guard =
+            self.acquire_base_lifecycle_write_lock(&initial).await?;
+        let mut row = self.require_base(id).await?;
+        if row.root_path != initial.root_path {
+            return Err(AppError::Conflict(
+                "knowledge base root changed while metadata was being updated; retry"
+                    .into(),
+            ));
+        }
+        if let Some(name) = name {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(AppError::BadRequest("knowledge base name must not be empty".into()));
+            }
+            row.name = name.to_owned();
+        }
+        if let Some(description) = description {
+            row.description = description.trim().to_owned();
+        }
+        if let Some(ref tag_keys) = tags {
+            row.tags = if tag_keys.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(tag_keys).unwrap())
+            };
+        }
+        if let Some(tree_access) = tree_access {
+            row.tree_access = persisted_knowledge_tree_access(tree_access).into();
+        }
+        row.updated_at = now_ms();
+        self.repo.update_base(&row).await?;
+        drop(_base_guard);
+        let info = self.row_to_info(row).await?;
+        self.emitter.emit_base_updated(&info);
+        Ok(info)
+    }
+
+    /// Delete a base registration and its logical binding references.
+    ///
+    /// `purge` additionally removes the files on disk, but only for managed
+    /// bases whose path is strictly below `{data_dir}/knowledge/`. The database
+    /// deletion is authoritative: if post-commit file cleanup fails, the
+    /// directory is logged as an orphan and the registration is not restored.
+    pub async fn delete_base(&self, id: &str, purge: bool) -> Result<(), AppError> {
+        let row = self.require_base(id).await?;
+        let _base_guard =
+            self.acquire_base_lifecycle_write_lock(&row).await?;
+        let current = self.require_base(id).await?;
+        if current.root_path != row.root_path {
+            return Err(AppError::Conflict(
+                "knowledge base root changed while deletion was starting; retry".into(),
+            ));
+        }
+        if purge && !row.managed {
+            return Err(AppError::BadRequest(
+                "cannot purge an external knowledge base; delete only removes its registration"
+                    .into(),
+            ));
+        }
+        if purge {
+            let root = PathBuf::from(&row.root_path);
+            validate_knowledge_root_bounded(root.clone()).await?;
+            let managed_parent_lexical =
+                self.data_dir.join(KB_MANAGED_REL_DIR);
+            let managed_parent = tokio::time::timeout(
+                KNOWLEDGE_PATH_INSPECTION_TIMEOUT,
+                tokio::fs::canonicalize(&managed_parent_lexical),
+            )
+            .await
+            .map_err(|_| {
+                AppError::Timeout(
+                    "managed knowledge root inspection timed out".into(),
+                )
+            })?
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to resolve managed knowledge root: {error}"
+                ))
+            })?;
+            // Compare simplified spellings: rows written by older releases
+            // carry the Windows verbatim (`\\?\`) prefix while newer rows and
+            // the canonicalized parent may not (or vice versa).
+            let root = nomifun_common::paths::simplified(&root);
+            let managed_parent =
+                nomifun_common::paths::simplified(&managed_parent);
+            if !root.starts_with(&managed_parent) || root == managed_parent {
+                return Err(AppError::Internal(format!(
+                    "managed knowledge base {} has unsafe purge path '{}'",
+                    row.knowledge_base_id,
+                    root.display()
+                )));
+            }
+        }
+        self.repo.delete_base(id).await?;
+        self.projection_reconciled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&row.knowledge_base_id);
+        self.root_lock_identity_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&format!(
+                "{}\0{}",
+                row.knowledge_base_id, row.root_path
+            ));
+
+        if purge {
+            let root = PathBuf::from(&row.root_path);
+            if let Err(error) = tokio::fs::remove_dir_all(&root).await {
+                tracing::warn!(
+                    knowledge_base_id = %row.knowledge_base_id,
+                    path = %root.display(),
+                    %error,
+                    "knowledge registration and logical references were deleted, but managed directory cleanup failed; directory remains as an orphan"
+                );
+            }
+        }
+        let id = KnowledgeBaseId::parse(&row.knowledge_base_id)
+            .map_err(|error| AppError::Internal(format!(
+                "stored knowledge base id '{}' is invalid: {error}",
+                row.knowledge_base_id
+            )))?;
+        self.emitter.emit_base_deleted(&id);
+        Ok(())
+    }
+
+    // ── File access (md only, directory is the source of truth) ─────
+
+    pub async fn list_files(&self, id: &str) -> Result<Vec<KbFileEntry>, AppError> {
+        let row = self.require_base(id).await?;
+        if let Err(error) = self.ensure_projection_reconciled(&row).await {
+            tracing::warn!(
+                kb_id = %row.knowledge_base_id,
+                %error,
+                "knowledge file listing is continuing without a reconciled entry projection"
+            );
+        }
+        let _tree_guard = self.acquire_document_tree_read_lock(&row).await?;
+        let _base_guard = self.acquire_base_lifecycle_lock(&row).await?;
+        let current = self.require_base(id).await?;
+        if current.root_path != row.root_path {
+            return Err(AppError::Conflict(
+                "knowledge base root changed while its files were being listed; retry".into(),
+            ));
+        }
+        let root = PathBuf::from(&row.root_path);
+        let lock_root = root.clone();
+        // Bounded so a slow/stale NAS root degrades to an empty listing instead
+        // of hanging the detail view (and the agent write-path collision check).
+        let mut files = bounded_root_blocking(
+                &lock_root,
+                BASE_WALK_BUDGET,
+                Vec::new(),
+                move || list_md_files(&root),
+            )
+            .await;
+        if let Some(repository) = self.entry_repository() {
+            let knowledge_base_id = KnowledgeBaseId::parse(&current.knowledge_base_id).map_err(
+                |error| {
+                    AppError::Internal(format!(
+                        "stored knowledge base id '{}' is invalid: {error}",
+                        current.knowledge_base_id
+                    ))
+                },
+            )?;
+            if let Ok(projected) = repository
+                .list_entries_for_base(&knowledge_base_id, false)
+                .await
+            {
+                let source_by_entry = self.source_metadata_by_entry(&current).await?;
+                hydrate_file_entries(
+                    &mut files,
+                    &projected,
+                    knowledge_tree_access(&current)?,
+                    &source_by_entry,
+                );
+            }
+        }
+        Ok(files)
+    }
+
+    fn projection_is_reconciled(&self, row: &KnowledgeBaseRow) -> bool {
+        self.projection_reconciled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&row.knowledge_base_id)
+    }
+
+    fn mark_projection_reconciled(&self, row: &KnowledgeBaseRow) {
+        self.projection_reconciled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(row.knowledge_base_id.clone());
+    }
+
+    fn mark_projection_dirty(&self, row: &KnowledgeBaseRow) {
+        self.projection_reconciled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&row.knowledge_base_id);
+    }
+
+    /// Lazily migrate the legacy `extra.source` aggregate into normalized,
+    /// queryable source identities. The operation is idempotent and never
+    /// rewrites an existing source/item from stale JSON; explicit source APIs
+    /// own subsequent mutations.
+    async fn ensure_normalized_source(
+        &self,
+        row: &KnowledgeBaseRow,
+    ) -> Result<Option<NormalizedSourceAggregate>, AppError> {
+        let Some(repository) = self.source_repository() else {
+            return Ok(None);
+        };
+        let Some(legacy) = source_from_extra(&row.extra)
+            .map_err(|error| knowledge_row_json_error(&row.knowledge_base_id, error))?
+        else {
+            return Ok(None);
+        };
+        validate_source(&legacy)?;
+        let knowledge_base_id = KnowledgeBaseId::parse(&row.knowledge_base_id).map_err(
+            |error| {
+                AppError::Internal(format!(
+                    "stored knowledge base id '{}' is invalid: {error}",
+                    row.knowledge_base_id
+                ))
+            },
+        )?;
+        let requested_source_id = legacy
+            .source_id
+            .clone()
+            .unwrap_or_else(KnowledgeSourceId::new);
+        let source = if let Some(existing) = repository
+            .get_source(&requested_source_id)
+            .await?
+        {
+            existing
+        } else {
+            repository
+                .ensure_source(&EnsureKnowledgeSourceParams {
+                    knowledge_source_id: requested_source_id,
+                    knowledge_base_id,
+                    kind: KnowledgeSourceKind::Url,
+                    mode: persisted_source_mode(legacy.mode),
+                    default_parent_entry_id: legacy.default_parent_entry_id.clone(),
+                    created_at: row.created_at.max(0),
+                })
+                .await?
+                .source
+        };
+        let mut all_items = repository
+            .list_source_items(&source.knowledge_source_id, true)
+            .await?;
+        if source.state == KnowledgeSourceState::Removed {
+            return Ok(Some(NormalizedSourceAggregate {
+                source,
+                items: all_items,
+            }));
+        }
+        let mut items = all_items
+            .iter()
+            .filter(|item| !item.is_removed())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut occupied_ordinals = items
+            .iter()
+            .map(|item| item.ordinal)
+            .collect::<HashSet<_>>();
+        let mut next_ordinal = occupied_ordinals
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(-1)
+            .saturating_add(1);
+        for (index, legacy_item) in legacy.entries.iter().enumerate() {
+            let normalized_url = normalize_source_url(&legacy_item.url).map_err(|error| {
+                AppError::Internal(format!(
+                    "stored knowledge source URL '{}' is invalid: {error}",
+                    legacy_item.url
+                ))
+            })?;
+            let existing = repository
+                .get_live_source_item_by_url(
+                    &source.knowledge_source_id,
+                    &normalized_url,
+                )
+                .await?;
+            let removed_item = all_items.iter().find(|item| {
+                item.normalized_url == normalized_url && item.is_removed()
+            });
+            let explicit_readd = removed_item.is_some_and(|removed| {
+                legacy_item.source_item_id.as_ref()
+                    != Some(&removed.knowledge_source_item_id)
+                    && legacy_item.source_item_id.is_some()
+            });
+            let item = if let Some(item) = existing {
+                item
+            } else if removed_item.is_some() && !explicit_readd {
+                continue;
+            } else {
+                let desired = i64::try_from(index).unwrap_or(i64::MAX);
+                let ordinal = if occupied_ordinals.insert(desired) {
+                    desired
+                } else {
+                    while !occupied_ordinals.insert(next_ordinal) {
+                        next_ordinal = next_ordinal.saturating_add(1);
+                    }
+                    let allocated = next_ordinal;
+                    next_ordinal = next_ordinal.saturating_add(1);
+                    allocated
+                };
+                let migrated_state = if legacy_item.sync_status
+                    == KnowledgeSourceSyncStatus::Paused
+                {
+                    KnowledgeSourceState::Paused
+                } else {
+                    KnowledgeSourceState::Active
+                };
+                let migrated_status = if matches!(
+                    legacy_item.sync_status,
+                    KnowledgeSourceSyncStatus::Paused | KnowledgeSourceSyncStatus::Syncing
+                ) {
+                    KnowledgeSourceItemSyncStatus::Pending
+                } else {
+                    persisted_sync_status(legacy_item.sync_status)
+                };
+                let created = repository
+                    .create_source_item(&CreateKnowledgeSourceItemParams {
+                        knowledge_source_item_id: legacy_item
+                            .source_item_id
+                            .clone()
+                            .unwrap_or_else(KnowledgeSourceItemId::new),
+                        knowledge_source_id: source.knowledge_source_id.clone(),
+                        requested_url: legacy_item.url.trim().to_owned(),
+                        normalized_url,
+                        final_url: None,
+                        rendered: legacy_item.rendered,
+                        title: legacy_item.title.clone(),
+                        ordinal,
+                        state: migrated_state,
+                        sync_status: migrated_status,
+                        etag: None,
+                        http_last_modified: None,
+                        last_attempt_at: legacy_item.last_success_at,
+                        last_success_at: legacy_item.last_success_at,
+                        last_error: legacy_item.last_error.clone(),
+                        last_published_hash: None,
+                        pending_published_hash: None,
+                        pending_final_url: None,
+                        pending_title: None,
+                        pending_publication_at: None,
+                        removed_at: None,
+                        created_at: row.created_at.max(0),
+                    })
+                    .await?;
+                all_items.push(created.clone());
+                created
+            };
+            if item.state == KnowledgeSourceState::Active
+                && let Some(entry_id) = legacy_item.snapshot_entry_id.clone()
+                && repository
+                    .get_entry_provenance(&entry_id)
+                    .await?
+                    .is_none()
+            {
+                repository
+                    .bind_managed_entry(&BindManagedKnowledgeEntryParams {
+                        knowledge_entry_id: entry_id,
+                        knowledge_source_item_id: item.knowledge_source_item_id.clone(),
+                        created_at: item.created_at,
+                    })
+                    .await?;
+            }
+        }
+        items = repository
+            .list_source_items(&source.knowledge_source_id, false)
+            .await?;
+        Ok(Some(NormalizedSourceAggregate { source, items }))
+    }
+
+    async fn source_projection_hints(
+        &self,
+        row: &KnowledgeBaseRow,
+    ) -> Result<SourceProjectionHints, AppError> {
+        let mut hints = SourceProjectionHints::default();
+        if let Some(repository) = self.source_repository() {
+            let _ = self.ensure_normalized_source(row).await?;
+            let knowledge_base_id = KnowledgeBaseId::parse(&row.knowledge_base_id).map_err(
+                |error| {
+                    AppError::Internal(format!(
+                        "stored knowledge base id '{}' is invalid: {error}",
+                        row.knowledge_base_id
+                    ))
+                },
+            )?;
+            for source in repository
+                .list_sources_for_base(&knowledge_base_id, true)
+                .await?
+            {
+                for provenance in repository
+                    .list_entry_provenance_for_source(&source.knowledge_source_id)
+                    .await?
+                {
+                    hints
+                        .web_provenance_entry_ids
+                        .insert(provenance.knowledge_entry_id);
+                }
+                if source.state != KnowledgeSourceState::Active {
+                    continue;
+                }
+                for item in repository
+                    .list_source_items(&source.knowledge_source_id, false)
+                    .await?
+                    .into_iter()
+                    .filter(|item| item.state == KnowledgeSourceState::Active)
+                {
+                    let provenance = repository
+                        .get_managed_entry_provenance(&item.knowledge_source_item_id)
+                        .await?;
+                    if source.mode == PersistedKnowledgeSourceMode::Snapshot
+                        || provenance.is_some()
+                    {
+                        hints
+                            .managed_item_ids
+                            .insert(item.knowledge_source_item_id.clone());
+                    }
+                    if source.mode == PersistedKnowledgeSourceMode::Snapshot {
+                        hints.managed_urls.insert(item.normalized_url.clone());
+                    }
+                    if let Some(provenance) = provenance {
+                        hints.entry_ids_by_item.insert(
+                            item.knowledge_source_item_id,
+                            provenance.knowledge_entry_id.clone(),
+                        );
+                        hints.entry_ids_by_url.insert(
+                            item.normalized_url,
+                            provenance.knowledge_entry_id,
+                        );
+                    }
+                }
+            }
+            return Ok(hints);
+        }
+        let Some(source) = source_from_extra(&row.extra)
+            .map_err(|error| knowledge_row_json_error(&row.knowledge_base_id, error))?
+        else {
+            return Ok(hints);
+        };
+        for item in source.entries {
+            let normalized_url = normalize_source_url(&item.url).map_err(|error| {
+                AppError::Internal(format!(
+                    "stored knowledge source URL '{}' is invalid: {error}",
+                    item.url
+                ))
+            })?;
+            hints.managed_urls.insert(normalized_url.clone());
+            if let Some(source_item_id) = item.source_item_id {
+                hints.managed_item_ids.insert(source_item_id.clone());
+                if let Some(entry_id) = item.snapshot_entry_id.clone() {
+                    hints
+                        .entry_ids_by_item
+                        .insert(source_item_id, entry_id.clone());
+                    hints.entry_ids_by_url.insert(normalized_url, entry_id);
+                }
+            } else if let Some(entry_id) = item.snapshot_entry_id {
+                hints.entry_ids_by_url.insert(normalized_url, entry_id);
+            }
+        }
+        Ok(hints)
+    }
+
+    async fn source_metadata_by_entry(
+        &self,
+        row: &KnowledgeBaseRow,
+    ) -> Result<SourceMetadataByEntry, AppError> {
+        let Some(repository) = self.source_repository() else {
+            return Ok(HashMap::new());
+        };
+        let _ = self.ensure_normalized_source(row).await?;
+        let knowledge_base_id = KnowledgeBaseId::parse(&row.knowledge_base_id).map_err(
+            |error| {
+                AppError::Internal(format!(
+                    "stored knowledge base id '{}' is invalid: {error}",
+                    row.knowledge_base_id
+                ))
+            },
+        )?;
+        let mut by_entry = HashMap::new();
+        for source in repository
+            .list_sources_for_base(&knowledge_base_id, true)
+            .await?
+        {
+            let items = repository
+                .list_source_items(&source.knowledge_source_id, true)
+                .await?
+                .into_iter()
+                .map(|item| (item.knowledge_source_item_id.clone(), item))
+                .collect::<HashMap<_, _>>();
+            for relation in repository
+                .list_entry_provenance_for_source(&source.knowledge_source_id)
+                .await?
+            {
+                let Some(item) = items.get(&relation.knowledge_source_item_id) else {
+                    continue;
+                };
+                by_entry.insert(
+                    relation.knowledge_entry_id,
+                    KnowledgeEntrySourceInfo {
+                        source_id: source.knowledge_source_id.clone(),
+                        source_item_id: item.knowledge_source_item_id.clone(),
+                        source_url: item.requested_url.clone(),
+                        relationship: api_source_relationship(relation.relationship),
+                        sync_status: api_sync_status(item.state, item.sync_status),
+                        final_url: item.final_url.clone(),
+                        last_success_at: item.last_success_at,
+                        last_error: item.last_error.clone(),
+                    },
+                );
+            }
+        }
+        Ok(by_entry)
+    }
+
+    async fn validate_content_write_target(
+        &self,
+        row: &KnowledgeBaseRow,
+        rel_path: &str,
+    ) -> Result<(), AppError> {
+        let canonical = normalize_tree_rel_path(rel_path)?;
+        if canonical.is_empty() {
+            return Err(AppError::BadRequest("file path must not be empty".into()));
+        }
+        if let (Some(entry_repository), Some(source_repository)) =
+            (self.entry_repository(), self.source_repository())
+        {
+            let knowledge_base_id = KnowledgeBaseId::parse(&row.knowledge_base_id).map_err(
+                |error| {
+                    AppError::Internal(format!(
+                        "stored knowledge base id '{}' is invalid: {error}",
+                        row.knowledge_base_id
+                    ))
+                },
+            )?;
+            if let Some(entry) = entry_repository
+                .get_entry_by_path(
+                    &knowledge_base_id,
+                    &portable_writeback_path_identity(&canonical),
+                )
+                .await?
+                && let Some(provenance) = source_repository
+                    .get_entry_provenance(&entry.knowledge_entry_id)
+                    .await?
+                && provenance.relationship == KnowledgeEntryProvenanceRelationship::Managed
+            {
+                return Err(AppError::Forbidden(
+                    "this document body is managed by its web source; detach it or copy it as an editable note before editing"
+                        .into(),
+                ));
+            }
+        }
+
+        // Fail closed during projection degradation or legacy migration by
+        // inspecting the managed header itself. A user-authored file merely
+        // placed in a directory named `snapshots` remains editable.
+        let path = PathBuf::from(&row.root_path).join(&canonical);
+        if std::fs::symlink_metadata(&path).is_ok_and(|metadata| {
+            metadata.is_file() && !metadata_is_link_or_reparse(&path, &metadata)
+        }) {
+            let (source_item_id, source_url, relationship) =
+                read_snapshot_projection_identity(&path);
+            let hints = self.source_projection_hints(row).await?;
+            let managed = relationship
+                .as_deref()
+                .is_none_or(|relationship| relationship == "managed");
+            if managed
+                && (source_item_id
+                    .as_ref()
+                    .is_some_and(|id| hints.managed_item_ids.contains(id))
+                    || source_url
+                        .as_ref()
+                        .is_some_and(|url| hints.managed_urls.contains(url)))
+            {
+                return Err(AppError::Forbidden(
+                    "this document body is managed by its web source; detach it or copy it as an editable note before editing"
+                        .into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn resolve_source_entry(
+        &self,
+        row: &KnowledgeBaseRow,
+        entry_id: &KnowledgeEntryId,
+        expected_revision: i64,
+    ) -> Result<ResolvedSourceEntry, AppError> {
+        if expected_revision < 0 {
+            return Err(AppError::BadRequest(
+                "expected_revision must be non-negative".into(),
+            ));
+        }
+        let entry_repository = self.entry_repository().ok_or_else(|| {
+            AppError::Conflict("stable knowledge entry validation is unavailable".into())
+        })?;
+        let source_repository = self.source_repository().ok_or_else(|| {
+            AppError::Conflict("knowledge source identity validation is unavailable".into())
+        })?;
+        let knowledge_base_id = KnowledgeBaseId::parse(&row.knowledge_base_id).map_err(
+            |error| {
+                AppError::Internal(format!(
+                    "stored knowledge base id '{}' is invalid: {error}",
+                    row.knowledge_base_id
+                ))
+            },
+        )?;
+        let entry = entry_repository
+            .get_entry(&knowledge_base_id, entry_id)
+            .await?
+            .filter(|entry| !entry.is_deleted())
+            .ok_or_else(|| {
+                AppError::Conflict(format!(
+                    "knowledge entry identity no longer resolves in this knowledge base: {entry_id}"
+                ))
+            })?;
+        if entry.revision != expected_revision {
+            return Err(AppError::Conflict(format!(
+                "knowledge entry revision conflict: expected {expected_revision}, current {}",
+                entry.revision
+            )));
+        }
+        if entry.kind != KNOWLEDGE_ENTRY_KIND_FILE || entry.is_directory() {
+            return Err(AppError::BadRequest(
+                "source action requires a document entry".into(),
+            ));
+        }
+        let provenance = source_repository
+            .get_entry_provenance(entry_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::BadRequest("knowledge entry is not related to a web source".into())
+            })?;
+        let item = source_repository
+            .get_source_item(&provenance.knowledge_source_item_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::Internal("knowledge source item referenced by the entry is missing".into())
+            })?;
+        let source = source_repository
+            .get_source(&item.knowledge_source_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::Internal("knowledge source aggregate referenced by the item is missing".into())
+            })?;
+        if source.knowledge_base_id != knowledge_base_id {
+            return Err(AppError::Conflict(
+                "knowledge source entry belongs to another knowledge base".into(),
+            ));
+        }
+        Ok(ResolvedSourceEntry {
+            entry,
+            provenance,
+            item,
+            source,
+        })
+    }
+
+    async fn list_entry_by_id(
+        &self,
+        knowledge_base_id: &str,
+        entry_id: &KnowledgeEntryId,
+    ) -> Result<KbTreeEntry, AppError> {
+        let row = self.require_base(knowledge_base_id).await?;
+        self.ensure_projection_reconciled(&row).await?;
+        let repository = self.entry_repository().ok_or_else(|| {
+            AppError::Conflict("stable knowledge entry validation is unavailable".into())
+        })?;
+        let kb_id = KnowledgeBaseId::parse(&row.knowledge_base_id).map_err(|error| {
+            AppError::Internal(format!(
+                "stored knowledge base id '{}' is invalid: {error}",
+                row.knowledge_base_id
+            ))
+        })?;
+        let entry = repository
+            .get_entry(&kb_id, entry_id)
+            .await?
+            .filter(|entry| !entry.is_deleted())
+            .ok_or_else(|| AppError::NotFound(format!("knowledge entry not found: {entry_id}")))?;
+        let parent = tree_parent_rel_path(&entry.rel_path).to_owned();
+        self.list_tree(knowledge_base_id, &parent)
+            .await?
+            .into_iter()
+            .find(|candidate| candidate.entry_id.as_ref() == Some(entry_id))
+            .ok_or_else(|| {
+                AppError::Internal(format!(
+                    "knowledge entry {entry_id} could not be listed at its current path"
+                ))
+            })
+    }
+
+    /// Reconcile once per process before serving projected identities. This
+    /// method owns the same tree→lifecycle lock order used by every mutation;
+    /// callers already holding those locks use `reconcile_projection_locked`
+    /// directly to avoid re-entrant deadlocks.
+    async fn ensure_projection_reconciled(
+        &self,
+        row: &KnowledgeBaseRow,
+    ) -> Result<(), AppError> {
+        if self.entry_repository().is_none() || self.projection_is_reconciled(row) {
+            return Ok(());
+        }
+        let _tree_guard = self.acquire_document_tree_write_lock(row).await?;
+        let _base_guard = self.acquire_base_lifecycle_lock(row).await?;
+        let current = self.require_base(&row.knowledge_base_id).await?;
+        if current.root_path != row.root_path {
+            return Err(AppError::Conflict(
+                "knowledge base root changed while its entry projection was reconciling; retry"
+                    .into(),
+            ));
+        }
+        if !self.projection_is_reconciled(&current) {
+            self.reconcile_projection_locked(&current, HashMap::new())
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Rebuild the complete identity projection from the real filesystem.
+    /// Existing IDs win first by portable path, then by platform file identity;
+    /// `forced_ids` bridges the narrow post-rename recovery window even on a
+    /// filesystem that cannot expose a stable inode/file-index.
+    async fn reconcile_projection_locked(
+        &self,
+        row: &KnowledgeBaseRow,
+        forced_ids: HashMap<String, KnowledgeEntryId>,
+    ) -> Result<Option<ProjectionState>, AppError> {
+        let Some(repository) = self.entry_repository() else {
+            return Ok(None);
+        };
+        let knowledge_base_id = KnowledgeBaseId::parse(&row.knowledge_base_id).map_err(|error| {
+            AppError::Internal(format!(
+                "stored knowledge base id '{}' is invalid: {error}",
+                row.knowledge_base_id
+            ))
+        })?;
+        let existing = repository
+            .list_entries_for_base(&knowledge_base_id, true)
+            .await?;
+        let expected_tree_revision = repository.tree_revision(&knowledge_base_id).await?;
+        let source_hints = self.source_projection_hints(row).await?;
+        let root = PathBuf::from(&row.root_path);
+        let scan_root = root.clone();
+        let scan_knowledge_base_id = knowledge_base_id.clone();
+        let snapshot = bounded_root_blocking(
+            &root,
+            BASE_WALK_BUDGET,
+            Err(AppError::Timeout(format!(
+                "knowledge entry projection scan timed out: {}",
+                root.display()
+            ))),
+            move || {
+                scan_knowledge_entry_projection(
+                    &scan_root,
+                    &scan_knowledge_base_id,
+                    &existing,
+                    source_hints,
+                    &forced_ids,
+                )
+            },
+        )
+        .await?;
+
+        let current_live = repository
+            .list_entries_for_base(&knowledge_base_id, false)
+            .await?;
+        let tree_revision = if projection_snapshot_matches(&current_live, &snapshot) {
+            expected_tree_revision
+        } else {
+            repository
+                .replace_projection(
+                    &knowledge_base_id,
+                    Some(expected_tree_revision),
+                    &snapshot,
+                )
+                .await?
+                .tree_revision
+        };
+        let entries = repository
+            .list_entries_for_base(&knowledge_base_id, false)
+            .await?;
+        self.reconcile_source_provenance_locked(row, &entries).await?;
+        self.mark_projection_reconciled(row);
+        Ok(Some(ProjectionState {
+            entries,
+            tree_revision: non_negative_tree_revision(tree_revision)?,
+        }))
+    }
+
+    async fn reconcile_source_provenance_locked(
+        &self,
+        row: &KnowledgeBaseRow,
+        entries: &[KnowledgeEntryRow],
+    ) -> Result<(), AppError> {
+        let Some(repository) = self.source_repository() else {
+            return Ok(());
+        };
+        let Some(normalized) = self.ensure_normalized_source(row).await? else {
+            return Ok(());
+        };
+        let active_items = normalized
+            .items
+            .into_iter()
+            .filter(|item| item.state == KnowledgeSourceState::Active)
+            .collect::<Vec<_>>();
+        if active_items.is_empty() {
+            return Ok(());
+        }
+
+        let root = PathBuf::from(&row.root_path);
+        let scan_root = root.clone();
+        let files = entries
+            .iter()
+            .filter(|entry| entry.kind == KNOWLEDGE_ENTRY_KIND_FILE)
+            .map(|entry| (entry.knowledge_entry_id.clone(), entry.rel_path.clone()))
+            .collect::<Vec<_>>();
+        let identities = bounded_root_blocking(
+            &root,
+            BASE_WALK_BUDGET,
+            Err(AppError::Timeout(format!(
+                "knowledge source identity scan timed out: {}",
+                root.display()
+            ))),
+            move || {
+                Ok::<_, AppError>(
+                    files
+                        .into_iter()
+                        .map(|(entry_id, rel_path)| {
+                            let (source_item_id, source_url, relationship) =
+                                read_snapshot_projection_identity(&scan_root.join(&rel_path));
+                            (entry_id, rel_path, source_item_id, source_url, relationship)
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            },
+        )
+        .await?;
+
+        for mut item in active_items {
+            let existing_provenance = repository
+                .get_managed_entry_provenance(&item.knowledge_source_item_id)
+                .await?;
+            let marker_matches = identities
+                .iter()
+                .filter(|(_, _, source_item_id, _, relationship)| {
+                    relationship
+                        .as_deref()
+                        .is_none_or(|relationship| relationship == "managed")
+                        && source_item_id.as_ref() == Some(&item.knowledge_source_item_id)
+                })
+                .map(|(entry_id, rel_path, _, _, _)| {
+                    (entry_id.clone(), rel_path.clone())
+                })
+                .collect::<Vec<_>>();
+            let matches = if marker_matches.is_empty()
+                && normalized.source.mode == PersistedKnowledgeSourceMode::Snapshot
+            {
+                identities
+                    .iter()
+                    .filter(|(_, _, source_item_id, source_url, relationship)| {
+                        relationship
+                            .as_deref()
+                            .is_none_or(|relationship| relationship == "managed")
+                            &&
+                        source_item_id.is_none()
+                            && source_url.as_deref() == Some(item.normalized_url.as_str())
+                    })
+                    .map(|(entry_id, rel_path, _, _, _)| {
+                        (entry_id.clone(), rel_path.clone())
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                marker_matches
+            };
+            let ambiguous = matches.len() > 1
+                || matches.first().is_some_and(|(entry_id, _)| {
+                    existing_provenance.as_ref().is_some_and(|provenance| {
+                        provenance.knowledge_entry_id != *entry_id
+                    })
+                });
+            if ambiguous {
+                let attempted = repository
+                    .record_sync_attempt(
+                        &item.knowledge_source_item_id,
+                        item.revision,
+                        now_ms(),
+                    )
+                    .await?;
+                repository
+                    .record_sync_failure(&RecordKnowledgeSourceSyncFailureParams {
+                        knowledge_source_item_id: item.knowledge_source_item_id.clone(),
+                        expected_revision: attempted.revision,
+                        status: KnowledgeSourceItemSyncStatus::Conflicted,
+                        error: "multiple documents claim the same managed source identity; refresh was disabled to prevent an overwrite".into(),
+                        failed_at: now_ms(),
+                    })
+                    .await?;
+                continue;
+            }
+            if let Some(existing_provenance) = existing_provenance {
+                if item.last_published_hash.is_none()
+                    && item.pending_published_hash.is_none()
+                    && let Some(rel_path) = matches
+                        .first()
+                        .map(|(_, rel_path)| rel_path.as_str())
+                        .or_else(|| {
+                            entries
+                                .iter()
+                                .find(|entry| {
+                                    entry.knowledge_entry_id
+                                        == existing_provenance.knowledge_entry_id
+                                })
+                                .map(|entry| entry.rel_path.as_str())
+                        })
+                {
+                    let content = tokio::fs::read_to_string(root.join(rel_path))
+                        .await
+                        .map_err(|error| {
+                            AppError::Conflict(format!(
+                                "failed to establish a safe baseline for legacy source document {rel_path}: {error}"
+                            ))
+                        })?;
+                    let attempted = repository
+                        .record_sync_attempt(
+                            &item.knowledge_source_item_id,
+                            item.revision,
+                            now_ms(),
+                        )
+                        .await?;
+                    repository
+                        .record_sync_success(&RecordKnowledgeSourceSyncSuccessParams {
+                            knowledge_source_item_id: item
+                                .knowledge_source_item_id
+                                .clone(),
+                            expected_revision: attempted.revision,
+                            final_url: item.final_url.clone(),
+                            title: item.title.clone(),
+                            etag: item.etag.clone(),
+                            http_last_modified: item.http_last_modified.clone(),
+                            last_published_hash: sha256_text(&content),
+                            succeeded_at: now_ms(),
+                        })
+                        .await?;
+                }
+                continue;
+            }
+            match matches.as_slice() {
+                [(entry_id, rel_path)] => {
+                    if item.last_published_hash.is_none()
+                        && item.pending_published_hash.is_none()
+                    {
+                        let content = tokio::fs::read_to_string(root.join(rel_path))
+                            .await
+                            .map_err(|error| {
+                                AppError::Conflict(format!(
+                                    "failed to establish a safe baseline for legacy source document {rel_path}: {error}"
+                                ))
+                            })?;
+                        let attempted = repository
+                            .record_sync_attempt(
+                                &item.knowledge_source_item_id,
+                                item.revision,
+                                now_ms(),
+                            )
+                            .await?;
+                        item = repository
+                            .record_sync_success(&RecordKnowledgeSourceSyncSuccessParams {
+                                knowledge_source_item_id: item
+                                    .knowledge_source_item_id
+                                    .clone(),
+                                expected_revision: attempted.revision,
+                                final_url: item.final_url.clone(),
+                                title: item.title.clone(),
+                                etag: item.etag.clone(),
+                                http_last_modified: item.http_last_modified.clone(),
+                                last_published_hash: sha256_text(&content),
+                                succeeded_at: now_ms(),
+                            })
+                            .await?;
+                    }
+                    repository
+                        .bind_managed_entry(&BindManagedKnowledgeEntryParams {
+                            knowledge_entry_id: entry_id.clone(),
+                            knowledge_source_item_id: item.knowledge_source_item_id.clone(),
+                            created_at: now_ms(),
+                        })
+                        .await?;
+                }
+                [] => {}
+                _ => unreachable!("ambiguous source identities returned above"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Serialize a projection refresh after a tree-level mismatch. The caller
+    /// must not retain a tree read guard: upgrading an async `RwLock` in place
+    /// would deadlock behind itself.
+    async fn reconcile_projection_after_tree_mismatch(
+        &self,
+        row: &KnowledgeBaseRow,
+    ) -> Result<(), AppError> {
+        if self.entry_repository().is_none() {
+            return Ok(());
+        }
+        self.mark_projection_dirty(row);
+        let _tree_guard = self.acquire_document_tree_write_lock(row).await?;
+        let _base_guard = self.acquire_base_lifecycle_lock(row).await?;
+        let current = self.require_base(&row.knowledge_base_id).await?;
+        if current.root_path != row.root_path {
+            return Err(AppError::Conflict(
+                "knowledge base root changed while its entry projection was refreshing; retry"
+                    .into(),
+            ));
+        }
+        self.reconcile_projection_locked(&current, HashMap::new())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_tree(&self, id: &str, rel_path: &str) -> Result<Vec<KbTreeEntry>, AppError> {
+        let row = self.require_base(id).await?;
+        if let Err(error) = self.ensure_projection_reconciled(&row).await {
+            tracing::warn!(
+                kb_id = %row.knowledge_base_id,
+                %error,
+                "knowledge tree listing is continuing without a reconciled entry projection"
+            );
+        }
+        let rel_path = normalize_tree_rel_path(rel_path)?;
+        // A list must observe the filesystem and its identity projection under
+        // one tree snapshot. Without this reader, a concurrent relocation can
+        // leave us hydrating pre-move paths with post-move IDs. On mismatch we
+        // drop both readers, rebuild under the writer, and list once more.
+        for attempt in 0..2 {
+            let _tree_guard = self.acquire_document_tree_read_lock(&row).await?;
+            let _base_guard = self.acquire_base_lifecycle_lock(&row).await?;
+            let current = self.require_base(id).await?;
+            if current.root_path != row.root_path {
+                return Err(AppError::Conflict(
+                    "knowledge base root changed while its tree was being listed; retry".into(),
+                ));
+            }
+            let root = PathBuf::from(&current.root_path);
+            let lock_root = root.clone();
+            let listed_rel_path = rel_path.clone();
+            let mut entries = bounded_root_blocking(
+                &lock_root,
+                BASE_WALK_BUDGET,
+                Ok(Vec::new()),
+                move || list_tree_level(&root, &listed_rel_path),
+            )
+            .await?;
+
+            let Some(repository) = self.entry_repository() else {
+                return Ok(entries);
+            };
+            let knowledge_base_id = KnowledgeBaseId::parse(&current.knowledge_base_id).map_err(
+                |error| {
+                    AppError::Internal(format!(
+                        "stored knowledge base id '{}' is invalid: {error}",
+                        current.knowledge_base_id
+                    ))
+                },
+            )?;
+            let projected = match repository
+                .list_entries_for_base(&knowledge_base_id, false)
+                .await
+            {
+                Ok(projected) => projected,
+                Err(error) => {
+                    tracing::warn!(
+                        kb_id = %row.knowledge_base_id,
+                        path = %rel_path,
+                        %error,
+                        "knowledge tree listing is continuing with path-only entries"
+                    );
+                    return Ok(entries);
+                }
+            };
+            if projection_tree_level_matches(
+                Path::new(&current.root_path),
+                &rel_path,
+                &entries,
+                &projected,
+            ) {
+                let source_by_entry = self.source_metadata_by_entry(&current).await?;
+                hydrate_tree_entries(
+                    &mut entries,
+                    &projected,
+                    knowledge_tree_access(&current)?,
+                    &source_by_entry,
+                );
+                return Ok(entries);
+            }
+
+            drop(_base_guard);
+            drop(_tree_guard);
+            if attempt == 0 {
+                if let Err(error) = self
+                    .reconcile_projection_after_tree_mismatch(&row)
+                    .await
+                {
+                    tracing::warn!(
+                        kb_id = %row.knowledge_base_id,
+                        path = %rel_path,
+                        %error,
+                        "knowledge tree listing is continuing with path-only entries after projection refresh failed"
+                    );
+                    return Ok(entries);
+                }
+                continue;
+            }
+            tracing::warn!(
+                kb_id = %row.knowledge_base_id,
+                path = %rel_path,
+                "knowledge entry projection changed again while listing; returning current path-only entries"
+            );
+            return Ok(entries);
+        }
+        unreachable!("bounded tree listing attempts always return")
+    }
+
+    /// Copy every portable UTF-8 Markdown document from `source_path` into a
+    /// collision-free top-level folder in an existing base. Source I/O is
+    /// completed and bounded before the destination tree writer is acquired;
+    /// publication is then all-or-rollback from the app's point of view.
+    pub async fn import_markdown_folder(
+        &self,
+        id: &str,
+        source_path: &str,
+    ) -> Result<FolderImportSummary, AppError> {
+        self.import_markdown_folder_into(id, source_path, "").await
+    }
+
+    pub async fn import_markdown_folder_into(
+        &self,
+        id: &str,
+        source_path: &str,
+        destination_parent_path: &str,
+    ) -> Result<FolderImportSummary, AppError> {
+        let initial = self.require_base(id).await?;
+        require_editable_knowledge_tree(&initial)?;
+        let destination_parent_path = normalize_tree_rel_path(destination_parent_path)?;
+        let destination_root = PathBuf::from(&initial.root_path);
+        let source_path = PathBuf::from(source_path.trim());
+        let prepared_destination = destination_root.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+            prepare_folder_import(&source_path, &prepared_destination)
+        })
+        .await
+        .map_err(|error| {
+            AppError::Internal(format!("folder import preparation task failed: {error}"))
+        })??;
+
+        let imported = prepared.files.len();
+        let skipped = prepared.skipped;
+        let total_size = prepared.total_size;
+        let _tree_guard = self.acquire_document_tree_write_lock(&initial).await?;
+        let _base_guard = self.acquire_base_lifecycle_write_lock(&initial).await?;
+        let mut current = self.require_base(id).await?;
+        if current.root_path != initial.root_path {
+            return Err(AppError::Conflict(
+                "knowledge base root changed while folder import was being prepared; retry".into(),
+            ));
+        }
+        // Access can be revoked while the potentially slow source scan is in
+        // progress. Revalidate after taking the lifecycle writer so revocation
+        // cannot race publication.
+        require_editable_knowledge_tree(&current)?;
+        validate_knowledge_root_bounded(destination_root.clone()).await?;
+
+        let preferred_name = prepared.source_name.clone();
+        let allocation_root = destination_root.clone();
+        let allocation_parent_path = destination_parent_path.clone();
+        let (allocated_name, target_path) = tokio::task::spawn_blocking(move || {
+            let allocation_parent = if allocation_parent_path.is_empty() {
+                allocation_root
+            } else {
+                let (path, metadata) =
+                    resolve_tree_existing_path(&allocation_root, &allocation_parent_path)?;
+                if !metadata.is_dir() {
+                    return Err(AppError::BadRequest(format!(
+                        "import destination is not a directory: {allocation_parent_path}"
+                    )));
+                }
+                path
+            };
+            create_unique_import_directory(&allocation_parent, &preferred_name)
+        })
+        .await
+        .map_err(|error| {
+            AppError::Internal(format!("folder import allocation task failed: {error}"))
+        })??;
+        let target_directory = join_tree_rel_path(&destination_parent_path, &allocated_name);
+        // Allocation itself changed the tree. Mark the identity projection
+        // dirty before publishing children so every partial-failure/rollback
+        // branch is conservative as well.
+        self.mark_projection_dirty(&current);
+
+        let mut published_paths = Vec::with_capacity(imported);
+        let publish_result: Result<(), AppError> = async {
+            for file in prepared.files {
+                let rel_path = join_tree_rel_path(&target_directory, &file.rel_path);
+                let path = safe_md_path_bounded(
+                    destination_root.clone(),
+                    rel_path.clone(),
+                )
+                .await?;
+                write_text_atomic(&path, &file.content).await?;
+                self.invalidate_search_cache_path(&path);
+                published_paths.push(rel_path);
+            }
+            Ok(())
+        }
+        .await;
+
+        if let Err(error) = publish_result {
+            let cleanup_path = target_path.clone();
+            let cleanup = tokio::task::spawn_blocking(move || {
+                remove_tree_dir_no_follow(&cleanup_path)
+            })
+            .await
+            .map_err(|join_error| join_error.to_string())
+            .and_then(|result| result.map_err(|cleanup_error| cleanup_error.to_string()));
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(AppError::Internal(format!(
+                    "folder import failed ({error}); partial import remains at {} because rollback failed: {cleanup_error}",
+                    target_path.display()
+                ))),
+            };
+        }
+
+        // File content is the source of truth. A timestamp write is useful for
+        // lists and events but must not turn a completed import into a reported
+        // failure if only metadata persistence is temporarily unavailable.
+        let previous_updated_at = current.updated_at;
+        current.updated_at = now_ms();
+        if let Err(error) = self.repo.update_base(&current).await {
+            current.updated_at = previous_updated_at;
+            tracing::warn!(
+                kb_id = %current.knowledge_base_id,
+                %error,
+                "folder import completed but knowledge timestamp update failed"
+            );
+        }
+        drop(_base_guard);
+        drop(_tree_guard);
+        let info = self.row_to_info(current).await?;
+        self.emitter.emit_base_updated(&info);
+
+        Ok(FolderImportSummary {
+            target_directory,
+            imported,
+            skipped,
+            total_size,
+            first_file: published_paths.into_iter().next(),
+        })
+    }
+
+    pub async fn create_folder(&self, id: &str, rel_path: &str) -> Result<KbTreeEntry, AppError> {
+        let row = self.require_base(id).await?;
+        require_editable_knowledge_tree(&row)?;
+        let _tree_guard =
+            self.acquire_document_tree_write_lock(&row).await?;
+        let _base_guard = self.acquire_base_lifecycle_lock(&row).await?;
+        let current = self.require_base(id).await?;
+        require_editable_knowledge_tree(&current)?;
+        let root = PathBuf::from(&row.root_path);
+        let rel_path = normalize_tree_rel_path(rel_path)?;
+        if rel_path.is_empty() {
+            return Err(AppError::BadRequest("folder path must not be empty".into()));
+        }
+        let created = tokio::task::spawn_blocking(move || create_tree_folder(&root, &rel_path))
+            .await
+            .map_err(|e| AppError::Internal(format!("folder create task join error: {e}")))??;
+        self.mark_projection_dirty(&row);
+        Ok(created)
+    }
+
+    pub async fn delete_folder(&self, id: &str, rel_path: &str) -> Result<(), AppError> {
+        self.delete_folder_entry(id, rel_path, None, None).await
+    }
+
+    pub async fn delete_folder_entry(
+        &self,
+        id: &str,
+        rel_path: &str,
+        entry_id: Option<&KnowledgeEntryId>,
+        expected_revision: Option<i64>,
+    ) -> Result<(), AppError> {
+        if entry_id.is_some() != expected_revision.is_some() {
+            return Err(AppError::BadRequest(
+                "entry_id and expected_revision must be supplied together for delete".into(),
+            ));
+        }
+        let row = self.require_base(id).await?;
+        if entry_id.is_some() && self.entry_repository().is_none() {
+            return Err(AppError::Conflict(
+                "stable knowledge entry validation is unavailable".into(),
+            ));
+        }
+        require_editable_knowledge_tree(&row)?;
+        self.ensure_projection_reconciled(&row).await?;
+        let _tree_guard =
+            self.acquire_document_tree_write_lock(&row).await?;
+        let _base_guard = self.acquire_base_lifecycle_lock(&row).await?;
+        let current = self.require_base(id).await?;
+        require_editable_knowledge_tree(&current)?;
+        let root = PathBuf::from(&row.root_path);
+        let mut rel_path = normalize_tree_rel_path(rel_path)?;
+        if rel_path.is_empty() {
+            return Err(AppError::BadRequest("folder path must not be empty".into()));
+        }
+        let mut projected_target = None;
+        if let Some(repository) = self.entry_repository() {
+            let knowledge_base_id = KnowledgeBaseId::parse(&current.knowledge_base_id).map_err(
+                |error| {
+                    AppError::Internal(format!(
+                        "stored knowledge base id '{}' is invalid: {error}",
+                        current.knowledge_base_id
+                    ))
+                },
+            )?;
+            let projected = repository
+                .list_entries_for_base(&knowledge_base_id, false)
+                .await?;
+            if let (Some(entry_id), Some(expected_revision)) = (entry_id, expected_revision) {
+                let entry = projected
+                    .iter()
+                    .find(|entry| &entry.knowledge_entry_id == entry_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        AppError::Conflict(
+                            "the folder moved or disappeared before delete".into(),
+                        )
+                    })?;
+                if entry.revision != expected_revision {
+                    return Err(AppError::Conflict(format!(
+                        "knowledge entry revision conflict: expected {expected_revision}, current {}",
+                        entry.revision
+                    )));
+                }
+                if !entry.is_directory() {
+                    return Err(AppError::BadRequest(
+                        "delete-folder identity does not refer to a directory".into(),
+                    ));
+                }
+                rel_path = entry.rel_path.clone();
+                projected_target = Some((repository.clone(), knowledge_base_id.clone(), entry));
+            }
+            let source_by_entry = self.source_metadata_by_entry(&current).await?;
+            let prefix = format!("{rel_path}/");
+            let managed_count = projected
+                .iter()
+                .filter(|entry| {
+                    entry.rel_path.starts_with(&prefix)
+                        && source_by_entry
+                            .get(&entry.knowledge_entry_id)
+                            .is_some_and(|source| {
+                                source.relationship
+                                    == KnowledgeEntrySourceRelationship::Managed
+                            })
+                })
+                .count();
+            if managed_count > 0 {
+                return Err(AppError::Conflict(format!(
+                    "folder contains {managed_count} managed web source document(s); detach or remove those sources before deleting the folder"
+                )));
+            }
+        }
+        tokio::task::spawn_blocking(move || delete_tree_folder(&root, &rel_path))
+            .await
+            .map_err(|e| AppError::Internal(format!("folder delete task join error: {e}")))??;
+        if let Some((repository, knowledge_base_id, entry)) = projected_target {
+            if let Err(error) = repository
+                .soft_delete_entry_subtree(
+                    &knowledge_base_id,
+                    &entry.knowledge_entry_id,
+                    entry.revision,
+                    now_ms(),
+                )
+                .await
+            {
+                tracing::warn!(
+                    kb_id = %current.knowledge_base_id,
+                    entry_id = %entry.knowledge_entry_id,
+                    %error,
+                    "folder delete committed but subtree tombstone CAS failed; reconciliation will repair it"
+                );
+                self.mark_projection_dirty(&row);
+            }
+        } else {
+            self.mark_projection_dirty(&row);
+        }
+        Ok(())
+    }
+
+    /// Atomically move or rename one tree entry without replacing an existing
+    /// portable path alias. Filesystem state is authoritative; metadata and
+    /// events are committed only after the atomic rename succeeds.
+    pub async fn relocate_tree_entry(
+        &self,
+        id: &str,
+        request: RelocateTreeEntryRequest,
+    ) -> Result<RelocateTreeEntryResult, AppError> {
+        validate_relocate_request_id(&request.request_id)?;
+        if self.tree_operation_repository().is_some()
+            && let Err(error) = self.drain_pending_tree_events().await
+        {
+            // Publication failure cannot roll back an already committed tree
+            // mutation. Keep the rows pending and continue this command.
+            tracing::warn!(
+                %error,
+                "knowledge-tree outbox drain failed before relocation"
+            );
+        }
+        let row = self.require_base(id).await?;
+        require_editable_knowledge_tree(&row)?;
+        let _tree_guard =
+            self.acquire_document_tree_write_lock(&row).await?;
+        let _base_guard = self.acquire_base_lifecycle_lock(&row).await?;
+        let mut current = self.require_base(id).await?;
+        if current.root_path != row.root_path {
+            return Err(AppError::Conflict(
+                "knowledge base root changed while relocation was starting; retry".into(),
+            ));
+        }
+        // Consent is mutable metadata protected by the lifecycle lock. The
+        // pre-lock check alone would allow a completed revocation to be
+        // ignored by a relocation already waiting on that lock.
+        require_editable_knowledge_tree(&current)?;
+
+        let root = PathBuf::from(&row.root_path);
+        let requested_source_path = normalize_tree_rel_path(&request.source_path)?;
+        if requested_source_path.is_empty() {
+            return Err(AppError::BadRequest("path must not be empty".into()));
+        }
+        let requested_destination_parent_path =
+            normalize_tree_rel_path(&request.destination_parent_path)?;
+        let new_name = request
+            .new_name
+            .as_deref()
+            .map(validate_tree_entry_name)
+            .transpose()?;
+        let fingerprint = RelocateRequestFingerprint {
+            source_path: requested_source_path.clone(),
+            destination_parent_path: requested_destination_parent_path.clone(),
+            new_name: new_name.clone(),
+            conflict_policy: request.conflict_policy,
+            entry_id: request.entry_id.clone(),
+            destination_parent_id: request.destination_parent_id.clone(),
+            expected_revision: request.expected_revision,
+        };
+        let durable_fingerprint = relocate_request_sha256(&fingerprint)?;
+        let tree_operation_repository = self.tree_operation_repository();
+        let cache_key = format!("{}\0{}", current.knowledge_base_id, request.request_id);
+
+        if request.expected_revision.is_some_and(|revision| revision < 0) {
+            return Err(AppError::BadRequest(
+                "expected_revision must be non-negative".into(),
+            ));
+        }
+
+        if let Some(repository) = tree_operation_repository.as_ref() {
+            let knowledge_base_id = KnowledgeBaseId::parse(&current.knowledge_base_id)
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "stored knowledge base id '{}' is invalid: {error}",
+                        current.knowledge_base_id
+                    ))
+                })?;
+            if let Some(operation) = repository
+                .load_by_request(&knowledge_base_id, &request.request_id)
+                .await?
+            {
+                if operation.fingerprint != durable_fingerprint {
+                    return Err(AppError::Conflict(
+                        "request_id was already used for a different tree relocation"
+                            .into(),
+                    ));
+                }
+                return self
+                    .resume_durable_relocation_locked(
+                        repository.clone(),
+                        current,
+                        operation,
+                        false,
+                        true,
+                    )
+                    .await;
+            }
+        }
+        if let Some(result) = self.cached_relocation(&cache_key, &fingerprint)? {
+            return Ok(result);
+        }
+
+        let mut warnings = Vec::new();
+        let entry_repository = self.entry_repository();
+        let projected_knowledge_base_id = if entry_repository.is_some() {
+            Some(KnowledgeBaseId::parse(&current.knowledge_base_id).map_err(|error| {
+                AppError::Internal(format!(
+                    "stored knowledge base id '{}' is invalid: {error}",
+                    current.knowledge_base_id
+                ))
+            })?)
+        } else {
+            None
+        };
+        let projection_state = if entry_repository.is_some() {
+            match self
+                .reconcile_projection_locked(&current, HashMap::new())
+                .await
+            {
+                Ok(state) => state,
+                Err(error) => {
+                    self.mark_projection_dirty(&current);
+                    if request.entry_id.is_some()
+                        || request.destination_parent_id.is_some()
+                        || request.expected_revision.is_some()
+                    {
+                        return Err(AppError::Conflict(format!(
+                            "the knowledge entry identity/revision could not be validated; retry after projection recovery: {error}"
+                        )));
+                    }
+                    tracing::warn!(
+                        kb_id = %current.knowledge_base_id,
+                        %error,
+                        "tree relocation is continuing with path identity because projection reconciliation failed"
+                    );
+                    warnings.push(
+                        "Stable entry metadata was temporarily unavailable; the filesystem move will be reconciled."
+                            .into(),
+                    );
+                    None
+                }
+            }
+        } else if request.entry_id.is_some()
+            || request.destination_parent_id.is_some()
+            || request.expected_revision.is_some()
+        {
+            return Err(AppError::Conflict(
+                "stable entry identity/revision validation is unavailable".into(),
+            ));
+        } else {
+            None
+        };
+
+        let source_portable_path = portable_writeback_path_identity(&requested_source_path);
+        let projected_source = projection_state.as_ref().and_then(|state| {
+            match request.entry_id.as_ref() {
+                Some(entry_id) => state
+                    .entries
+                    .iter()
+                    .find(|entry| &entry.knowledge_entry_id == entry_id),
+                None => state
+                    .entries
+                    .iter()
+                    .find(|entry| entry.portable_rel_path == source_portable_path),
+            }
+            .cloned()
+        });
+        let source_path = if let Some(expected_entry_id) = request.entry_id.as_ref() {
+            projected_source
+                .as_ref()
+                .map(|entry| entry.rel_path.clone())
+                .ok_or_else(|| {
+                AppError::Conflict(
+                    format!(
+                        "knowledge entry identity no longer resolves in this knowledge base: {expected_entry_id}"
+                    ),
+                )
+            })?
+        } else {
+            requested_source_path.clone()
+        };
+        if let Some(expected_revision) = request.expected_revision {
+            let actual = projected_source.as_ref().ok_or_else(|| {
+                AppError::Conflict(
+                    "the source path no longer resolves to a projected knowledge entry".into(),
+                )
+            })?;
+            if actual.revision != expected_revision {
+                return Err(AppError::Conflict(format!(
+                    "knowledge entry revision conflict: expected {expected_revision}, current {}",
+                    actual.revision
+                )));
+            }
+        }
+        let destination_parent_portable_path = portable_writeback_path_identity(
+            &requested_destination_parent_path,
+        );
+        let projected_destination_parent = projection_state.as_ref().and_then(|state| {
+            match request.destination_parent_id.as_ref() {
+                Some(entry_id) => state
+                    .entries
+                    .iter()
+                    .find(|entry| &entry.knowledge_entry_id == entry_id),
+                None if requested_destination_parent_path.is_empty() => None,
+                None => state.entries.iter().find(|entry| {
+                    entry.portable_rel_path == destination_parent_portable_path
+                }),
+            }
+            .cloned()
+        });
+        if let Some(destination_parent) = projected_destination_parent.as_ref() {
+            if destination_parent.kind != KNOWLEDGE_ENTRY_KIND_DIRECTORY {
+                return Err(AppError::BadRequest(format!(
+                    "relocation destination is not a directory: {}",
+                    destination_parent.rel_path
+                )));
+            }
+        }
+        let destination_parent_path = if let Some(destination_parent_id) =
+            request.destination_parent_id.as_ref()
+        {
+            projected_destination_parent
+                .as_ref()
+                .map(|entry| entry.rel_path.clone())
+                .ok_or_else(|| {
+                    AppError::Conflict(format!(
+                        "destination parent identity no longer resolves in this knowledge base: {destination_parent_id}"
+                    ))
+                })?
+        } else {
+            requested_destination_parent_path.clone()
+        };
+        let projected_destination_parent_id = projected_destination_parent
+            .as_ref()
+            .map(|entry| entry.knowledge_entry_id.clone());
+
+        if let Some(repository) = tree_operation_repository.as_ref() {
+            let plan_root = root.clone();
+            let plan_source = source_path.clone();
+            let plan_destination_parent = destination_parent_path.clone();
+            let plan_new_name = new_name.clone();
+            let (journal_source_path, journal_destination_path, source_fs_identity) =
+                tokio::task::spawn_blocking(move || {
+                    plan_durable_relocation_paths(
+                        &plan_root,
+                        &plan_source,
+                        &plan_destination_parent,
+                        plan_new_name.as_deref(),
+                    )
+                })
+                .await
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "tree relocation planning task failed: {error}"
+                    ))
+                })??;
+
+            // Exact no-ops do not create a durable mutation/outbox row: the
+            // schema intentionally couples every committed operation to a real
+            // tree event. Their request replay is therefore process-local and
+            // is re-evaluated after restart. This is safe only because this
+            // branch has no filesystem effect and advertises no undo token.
+            // Case/normalization-only renames remain distinct and durable.
+            if journal_source_path != journal_destination_path {
+            let knowledge_base_id = projected_knowledge_base_id
+                .clone()
+                .unwrap_or(KnowledgeBaseId::parse(&current.knowledge_base_id).map_err(
+                    |error| {
+                        AppError::Internal(format!(
+                            "stored knowledge base id '{}' is invalid: {error}",
+                            current.knowledge_base_id
+                        ))
+                    },
+                )?);
+            let prepared = repository
+                .prepare_operation(&PrepareKnowledgeTreeOperationParams {
+                    knowledge_base_id,
+                    request_id: request.request_id,
+                    fingerprint: durable_fingerprint,
+                    source_rel_path: journal_source_path,
+                    destination_rel_path: journal_destination_path,
+                    source_fs_identity,
+                    created_at: now_ms(),
+                })
+                .await?;
+            return self
+                .resume_durable_relocation_locked(
+                    repository.clone(),
+                    current,
+                    prepared.operation,
+                    false,
+                    true,
+                )
+                .await;
+            }
+        }
+
+        let root_for_move = root.clone();
+        let source_for_move = source_path.clone();
+        let destination_for_move = destination_parent_path.clone();
+        let operation_id = generate_id();
+        let moved = tokio::task::spawn_blocking(move || {
+            relocate_tree_entry_on_disk(
+                &root_for_move,
+                &source_for_move,
+                &destination_for_move,
+                new_name.as_deref(),
+                None,
+            )
+        })
+            .await
+            .map_err(|e| AppError::Internal(format!("tree relocate task join error: {e}")))??;
+
+        let mut projected_entry_id = projected_source
+            .as_ref()
+            .map(|entry| entry.knowledge_entry_id.clone());
+        let mut projected_entry_revision = projected_source
+            .as_ref()
+            .map(|entry| entry.revision);
+        let mut persisted_tree_revision = projection_state
+            .as_ref()
+            .map(|state| state.tree_revision);
+        let legacy_committed_tree_revision =
+            (!moved.no_op && entry_repository.is_none()).then(|| self.next_tree_revision(&current));
+
+        if !moved.no_op {
+            self.invalidate_search_cache_prefix(&root.join(&moved.old_path));
+            self.invalidate_search_cache_prefix(&root.join(&moved.new_path));
+
+            current.updated_at = legacy_committed_tree_revision
+                .and_then(|revision| i64::try_from(revision).ok())
+                .unwrap_or_else(now_ms);
+            if let Err(error) = self.repo.update_base(&current).await {
+                tracing::warn!(
+                    kb_id = %current.knowledge_base_id,
+                    %error,
+                    "tree relocation completed but knowledge timestamp update failed"
+                );
+                warnings.push(
+                    "The entry was moved, but the knowledge-base timestamp could not be persisted."
+                        .into(),
+                );
+            }
+
+            if let (Some(repository), Some(knowledge_base_id), Some(source_entry)) = (
+                entry_repository.as_ref(),
+                projected_knowledge_base_id.as_ref(),
+                projected_source.as_ref(),
+            ) {
+                let projection_result = if destination_parent_path.is_empty()
+                    || projected_destination_parent_id.is_some()
+                {
+                    repository
+                        .relocate_entry(&RelocateKnowledgeEntryProjectionParams {
+                            knowledge_base_id: knowledge_base_id.clone(),
+                            knowledge_entry_id: source_entry.knowledge_entry_id.clone(),
+                            destination_parent_entry_id: projected_destination_parent_id.clone(),
+                            new_name: moved.entry.name.clone(),
+                            new_rel_path: moved.new_path.clone(),
+                            new_portable_rel_path: portable_writeback_path_identity(
+                                &moved.new_path,
+                            ),
+                            expected_revision: source_entry.revision,
+                            updated_at: now_ms(),
+                        })
+                        .await
+                        .map(Some)
+                } else {
+                    Ok(None)
+                };
+                match projection_result {
+                    Ok(Some(mutation)) => {
+                        projected_entry_id = Some(mutation.entry.knowledge_entry_id);
+                        projected_entry_revision = Some(mutation.entry.revision);
+                        persisted_tree_revision =
+                            Some(non_negative_tree_revision(mutation.tree_revision)?);
+                        self.mark_projection_reconciled(&current);
+                    }
+                    unresolved => {
+                        let projection_error = unresolved.err();
+                        self.mark_projection_dirty(&current);
+                        let mut forced_ids = HashMap::new();
+                        forced_ids.insert(
+                            portable_writeback_path_identity(&moved.new_path),
+                            source_entry.knowledge_entry_id.clone(),
+                        );
+                        match self
+                            .reconcile_projection_locked(&current, forced_ids)
+                            .await
+                        {
+                            Ok(Some(state)) => {
+                                if let Some(entry) = state.entries.iter().find(|entry| {
+                                    entry.portable_rel_path
+                                        == portable_writeback_path_identity(&moved.new_path)
+                                }) {
+                                    projected_entry_id =
+                                        Some(entry.knowledge_entry_id.clone());
+                                    projected_entry_revision = Some(entry.revision);
+                                }
+                                persisted_tree_revision = Some(state.tree_revision);
+                                warnings.push(
+                                    "Stable entry metadata was repaired from the filesystem after the move."
+                                        .into(),
+                                );
+                            }
+                            Ok(None) => {}
+                            Err(reconcile_error) => {
+                                tracing::warn!(
+                                    kb_id = %current.knowledge_base_id,
+                                    error = ?projection_error,
+                                    %reconcile_error,
+                                    "filesystem relocation committed but its entry projection could not be repaired"
+                                );
+                                warnings.push(
+                                    "The entry was moved, but stable entry metadata is pending reconciliation."
+                                        .into(),
+                                );
+                            }
+                        }
+                    }
+                }
+            } else if entry_repository.is_some() {
+                let mut forced_ids = HashMap::new();
+                if let Some(entry_id) = projected_entry_id.clone() {
+                    forced_ids.insert(
+                        portable_writeback_path_identity(&moved.new_path),
+                        entry_id,
+                    );
+                }
+                self.mark_projection_dirty(&current);
+                match self
+                    .reconcile_projection_locked(&current, forced_ids)
+                    .await
+                {
+                    Ok(Some(state)) => {
+                        if let Some(entry) = state.entries.iter().find(|entry| {
+                            entry.portable_rel_path
+                                == portable_writeback_path_identity(&moved.new_path)
+                        }) {
+                            projected_entry_id = Some(entry.knowledge_entry_id.clone());
+                            projected_entry_revision = Some(entry.revision);
+                        }
+                        persisted_tree_revision = Some(state.tree_revision);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            kb_id = %current.knowledge_base_id,
+                            %error,
+                            "filesystem relocation committed but its entry projection could not be created"
+                        );
+                        warnings.push(
+                            "The entry was moved, but stable entry metadata is pending reconciliation."
+                                .into(),
+                        );
+                    }
+                }
+            }
+        }
+
+        let tree_revision = persisted_tree_revision
+            .or(legacy_committed_tree_revision)
+            .unwrap_or_else(|| {
+            if moved.no_op {
+                self.current_tree_revision(&current)
+            } else {
+                self.next_tree_revision(&current)
+            }
+        });
+
+        // Path-only embedders have no durable operation history, so advertising
+        // an undo token would promise a capability the server cannot honor.
+        let undo_token = None;
+        if moved.no_op {
+            warnings.push("The entry is already at the requested destination.".into());
+        }
+        let result = RelocateTreeEntryResult {
+            operation_id: operation_id.clone(),
+            entry_id: projected_entry_id.clone(),
+            old_path: moved.old_path.clone(),
+            new_path: moved.new_path.clone(),
+            kind: if moved.entry.is_dir {
+                KnowledgeEntryKind::Directory
+            } else {
+                KnowledgeEntryKind::File
+            },
+            moved_descendant_count: moved.moved_descendant_count,
+            revision: projected_entry_revision,
+            tree_revision,
+            undo_token,
+            warnings: (!warnings.is_empty()).then_some(warnings),
+        };
+        self.remember_relocation(cache_key, fingerprint, result.clone());
+        drop(_base_guard);
+        drop(_tree_guard);
+
+        if !moved.no_op {
+            let knowledge_base_id = KnowledgeBaseId::parse(&current.knowledge_base_id)
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "stored knowledge base id '{}' is invalid after relocation: {error}",
+                        current.knowledge_base_id
+                    ))
+                })?;
+            self.emitter.emit_tree_changed(&KnowledgeTreeChangedEvent {
+                knowledge_base_id,
+                operation_id,
+                entry_id: projected_entry_id,
+                old_prefix: moved.old_path,
+                new_prefix: moved.new_path,
+                kind: moved.kind,
+                moved_descendant_count: moved.moved_descendant_count,
+                tree_revision,
+                revision: projected_entry_revision,
+            });
+            match self.row_to_info(current).await {
+                Ok(info) => self.emitter.emit_base_updated(&info),
+                Err(error) => tracing::warn!(
+                    kb_id = id,
+                    %error,
+                    "tree relocation completed but base-updated payload could not be built"
+                ),
+            }
+        }
+
+        Ok(result)
+    }
+
+    pub async fn undo_tree_relocation(
+        &self,
+        id: &str,
+        request: UndoKnowledgeEntryRelocationRequest,
+    ) -> Result<RelocateTreeEntryResult, AppError> {
+        validate_relocate_request_id(&request.request_id)?;
+        let operation_id = request
+            .undo_token
+            .strip_prefix("relocate:")
+            .ok_or_else(|| AppError::BadRequest("invalid knowledge relocation undo token".into()))?;
+        let operation_id = KnowledgeTreeOperationId::parse(operation_id).map_err(|error| {
+            AppError::BadRequest(format!("invalid knowledge relocation undo token: {error}"))
+        })?;
+        let repository = self.tree_operation_repository().ok_or_else(|| {
+            AppError::Conflict(
+                "durable knowledge relocation history is unavailable; this move cannot be undone"
+                    .into(),
+            )
+        })?;
+        let operation = repository
+            .load_by_operation(&operation_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound("knowledge relocation operation not found".into()))?;
+        if operation.knowledge_base_id.as_str() != id {
+            return Err(AppError::Forbidden(
+                "knowledge relocation undo token belongs to another knowledge base".into(),
+            ));
+        }
+        if operation.state != KnowledgeTreeOperationState::Committed {
+            return Err(AppError::Conflict(
+                "knowledge relocation has not reached a committed state and cannot be undone yet"
+                    .into(),
+            ));
+        }
+        let receipt: RelocateTreeEntryResult = serde_json::from_str(
+            operation
+                .receipt_json
+                .as_deref()
+                .ok_or_else(|| AppError::Internal("committed relocation has no receipt".into()))?,
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("committed relocation receipt is invalid: {error}"))
+        })?;
+        let destination_parent_path = tree_parent_rel_path(&receipt.old_path).to_owned();
+        let original_name = receipt
+            .old_path
+            .rsplit('/')
+            .next()
+            .ok_or_else(|| AppError::Internal("relocation receipt has an empty old path".into()))?
+            .to_owned();
+
+        self.relocate_tree_entry(
+            id,
+            RelocateTreeEntryRequest {
+                request_id: request.request_id,
+                source_path: receipt.new_path,
+                destination_parent_path,
+                entry_id: receipt.entry_id,
+                destination_parent_id: None,
+                new_name: Some(original_name),
+                expected_revision: receipt.revision,
+                conflict_policy: RelocateConflictPolicy::Reject,
+            },
+        )
+        .await
+    }
+
+    /// Legacy same-parent rename, retained as a compatibility wrapper around
+    /// the single relocation implementation.
+    pub async fn rename_tree_entry(
+        &self,
+        id: &str,
+        rel_path: &str,
+        new_name: &str,
+    ) -> Result<KbTreeEntry, AppError> {
+        let source_path = normalize_tree_rel_path(rel_path)?;
+        let destination_parent_path = source_path
+            .rsplit_once('/')
+            .map(|(parent, _)| parent.to_owned())
+            .unwrap_or_default();
+        let result = self
+            .relocate_tree_entry(
+                id,
+                RelocateTreeEntryRequest {
+                    source_path,
+                    destination_parent_path,
+                    new_name: Some(new_name.to_owned()),
+                    request_id: generate_id(),
+                    conflict_policy: RelocateConflictPolicy::Reject,
+                    entry_id: None,
+                    destination_parent_id: None,
+                    expected_revision: None,
+                },
+            )
+            .await?;
+        let parent_path = result
+            .new_path
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .unwrap_or_default();
+        self.list_tree(id, parent_path)
+            .await?
+            .into_iter()
+            .find(|entry| entry.rel_path == result.new_path)
+            .ok_or_else(|| {
+                AppError::Internal(format!(
+                    "renamed knowledge entry could not be listed at {}",
+                    result.new_path
+                ))
+            })
+    }
+
+    pub async fn read_file(&self, id: &str, rel_path: &str) -> Result<KbFileContent, AppError> {
+        let row = self.require_base(id).await?;
+        if self.entry_repository().is_some()
+            && let Err(error) = self.ensure_projection_reconciled(&row).await
+        {
+            tracing::warn!(
+                kb_id = %row.knowledge_base_id,
+                path = rel_path,
+                %error,
+                "knowledge file read is continuing without stable identity metadata"
+            );
+        }
+        let _tree_guard = self.acquire_document_tree_read_lock(&row).await?;
+        let root = PathBuf::from(&row.root_path);
+        let path = safe_md_path_bounded(
+            root.clone(),
+            rel_path.to_owned(),
+        )
+        .await?;
+        let meta = tokio::time::timeout(
+            KNOWLEDGE_PATH_INSPECTION_TIMEOUT,
+            tokio::fs::metadata(&path),
+        )
+            .await
+            .map_err(|_| AppError::Timeout(format!("file inspection timed out: {rel_path}")))?
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    AppError::NotFound(format!("file not found: {rel_path}"))
+                } else {
+                    AppError::Internal(format!(
+                        "failed to inspect knowledge file {rel_path}: {error}"
+                    ))
+                }
+            })?;
+        if !meta.is_file() {
+            return Err(AppError::BadRequest(format!(
+                "knowledge document is not a regular file: {rel_path}"
+            )));
+        }
+        let content = tokio::time::timeout(
+            KNOWLEDGE_FILE_IO_TIMEOUT,
+            tokio::fs::read_to_string(&path),
+        )
+            .await
+            .map_err(|_| AppError::Timeout(format!("file read timed out: {rel_path}")))?
+            .map_err(|e| AppError::Internal(format!("failed to read file: {e}")))?;
+        let actual_rel_path = tree_relative_path(&root, &path)?;
+        let projected = if let Some(repository) = self.entry_repository() {
+            let knowledge_base_id = KnowledgeBaseId::parse(&row.knowledge_base_id).map_err(
+                |error| {
+                    AppError::Internal(format!(
+                        "stored knowledge base id '{}' is invalid: {error}",
+                        row.knowledge_base_id
+                    ))
+                },
+            )?;
+            match repository
+                .get_entry_by_path(
+                    &knowledge_base_id,
+                    &portable_writeback_path_identity(&actual_rel_path),
+                )
+                .await
+            {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::warn!(
+                        kb_id = %row.knowledge_base_id,
+                        path = %actual_rel_path,
+                        %error,
+                        "knowledge file read could not attach stable identity metadata"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let source_by_entry = self.source_metadata_by_entry(&row).await?;
+        let source = projected
+            .as_ref()
+            .and_then(|entry| source_by_entry.get(&entry.knowledge_entry_id))
+            .cloned();
+        let tree_access = knowledge_tree_access(&row)?;
+        let capabilities = projected.as_ref().map_or_else(
+            KnowledgeEntryCapabilities::default,
+            |_| {
+                resolve_entry_capabilities(
+                    tree_access,
+                    false,
+                    source.as_ref(),
+                    false,
+                )
+            },
+        );
+        Ok(KbFileContent {
+            rel_path: actual_rel_path,
+            content,
+            size: meta.len(),
+            modified_at: modified_ms(&meta),
+            entry_id: projected
+                .as_ref()
+                .map(|entry| entry.knowledge_entry_id.clone()),
+            revision: projected.as_ref().map(|entry| entry.revision),
+            origin: projected.as_ref().map(|entry| entry.origin.clone()),
+            capabilities,
+            source,
+        })
+    }
+
+    /// Create or overwrite a markdown file (atomic temp + rename).
+    pub async fn write_file(&self, id: &str, rel_path: &str, content: &str) -> Result<(), AppError> {
+        let kb_id = KnowledgeBaseId::parse(id)
+            .map_err(|error| AppError::BadRequest(format!("invalid knowledge base id: {error}")))?;
+        let row = self.require_base(id).await?;
+        let _tree_guard = self.acquire_document_tree_read_lock(&row).await?;
+        let root = PathBuf::from(&row.root_path);
+        let resolved = resolve_portable_md_path(root.clone(), rel_path.to_owned()).await?;
+        let lock_path = portable_turn_writeback_lock_path(
+            &deconfuse_rel_path(&resolved.rel_path),
+        );
+        let _target_guard = self
+            .acquire_turn_writeback_target_lock(&kb_id, &lock_path)
+            .await?;
+        // Re-resolve after acquiring the portable target lock so a racing
+        // create cannot slip in between resolution and no-clobber publication.
+        let resolved = resolve_portable_md_path(root.clone(), resolved.rel_path).await?;
+        self.write_file_under_target_lock(
+            id,
+            &resolved.rel_path,
+            Some(&resolved.rel_path),
+            content,
+        )
+            .await
+    }
+
+    /// Update an existing editor document using exact-content compare-and-swap.
+    /// A moved or deleted path is never recreated, and an external edit wins
+    /// with a conflict rather than being silently overwritten.
+    pub async fn update_file_if_unchanged(
+        &self,
+        id: &str,
+        rel_path: &str,
+        expected_content: &str,
+        content: &str,
+    ) -> Result<(), AppError> {
+        self.update_file_by_identity_if_unchanged(
+            id,
+            rel_path,
+            None,
+            None,
+            expected_content,
+            content,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Stable-identity editor update. When identity/version are supplied they
+    /// are authoritative over the stale path locator, then exact content CAS
+    /// protects against concurrent body edits. The two version fields must be
+    /// supplied together so a client cannot accidentally opt into half of the
+    /// identity contract.
+    pub async fn update_file_by_identity_if_unchanged(
+        &self,
+        id: &str,
+        rel_path: &str,
+        expected_entry_id: Option<&KnowledgeEntryId>,
+        expected_revision: Option<i64>,
+        expected_content: &str,
+        content: &str,
+    ) -> Result<KbFileUpdateResult, AppError> {
+        match (expected_entry_id, expected_revision) {
+            (Some(_), Some(revision)) if revision < 0 => {
+                return Err(AppError::BadRequest(
+                    "expected_revision must be non-negative".into(),
+                ));
+            }
+            (Some(_), Some(_)) | (None, None) => {}
+            _ => {
+                return Err(AppError::BadRequest(
+                    "entry_id and expected_revision must be supplied together for an editor update"
+                        .into(),
+                ));
+            }
+        }
+
+        let kb_id = KnowledgeBaseId::parse(id)
+            .map_err(|error| AppError::BadRequest(format!("invalid knowledge base id: {error}")))?;
+        let row = self.require_base(id).await?;
+        if expected_entry_id.is_some() {
+            if self.entry_repository().is_none() {
+                return Err(AppError::Conflict(
+                    "stable knowledge entry validation is unavailable".into(),
+                ));
+            }
+            self.ensure_projection_reconciled(&row).await?;
+        }
+        let _tree_guard = self.acquire_document_tree_read_lock(&row).await?;
+        let root = PathBuf::from(&row.root_path);
+        let (storage_rel_path, stable_entry_id, stable_fs_identity) =
+            if let Some(entry_id) = expected_entry_id {
+                let repository = self.entry_repository().ok_or_else(|| {
+                    AppError::Conflict("stable knowledge entry validation is unavailable".into())
+                })?;
+                let entry = repository
+                    .get_entry(&kb_id, entry_id)
+                    .await?
+                    .filter(|entry| !entry.is_deleted())
+                    .ok_or_else(|| {
+                        AppError::Conflict(format!(
+                            "knowledge entry identity no longer resolves in this knowledge base: {entry_id}"
+                        ))
+                    })?;
+                if entry.is_directory() || entry.kind != KNOWLEDGE_ENTRY_KIND_FILE {
+                    return Err(AppError::BadRequest(
+                        "knowledge editor identity does not refer to a file".into(),
+                    ));
+                }
+                let expected_revision = expected_revision.expect("paired above");
+                if entry.revision != expected_revision {
+                    return Err(AppError::Conflict(format!(
+                        "knowledge entry revision conflict: expected {expected_revision}, current {}",
+                        entry.revision
+                    )));
+                }
+                (
+                    entry.rel_path,
+                    Some(entry.knowledge_entry_id),
+                    entry.fs_identity,
+                )
+            } else {
+                (rel_path.to_owned(), None, None)
+            };
+        let resolved = resolve_portable_md_path(root.clone(), storage_rel_path).await?;
+        if !resolved.exists {
+            return Err(AppError::NotFound(format!(
+                "knowledge document moved or no longer exists: {rel_path}"
+            )));
+        }
+        let lock_path = portable_turn_writeback_lock_path(&deconfuse_rel_path(&resolved.rel_path));
+        let _target_guard = self
+            .acquire_turn_writeback_target_lock(&kb_id, &lock_path)
+            .await?;
+        let resolved = resolve_portable_md_path(root.clone(), resolved.rel_path).await?;
+        if !resolved.exists {
+            return Err(AppError::NotFound(format!(
+                "knowledge document moved or no longer exists: {rel_path}"
+            )));
+        }
+        if let Some(expected_identity) = stable_fs_identity.as_deref() {
+            let resolved_path = root.join(&resolved.rel_path);
+            let metadata = tokio::fs::symlink_metadata(&resolved_path)
+                .await
+                .map_err(|error| {
+                    AppError::Conflict(format!(
+                        "knowledge document identity changed before save: {error}"
+                    ))
+                })?;
+            if metadata_is_link_or_reparse(&resolved_path, &metadata)
+                || filesystem_entry_identity(&resolved_path, &metadata).as_deref()
+                    != Some(expected_identity)
+            {
+                return Err(AppError::Conflict(
+                    "knowledge document was replaced by another filesystem entry before save"
+                        .into(),
+                ));
+            }
+        }
+        self.write_file_if_unchanged(
+            id,
+            &resolved.rel_path,
+            &resolved.rel_path,
+            expected_content,
+            content,
+        )
+        .await?;
+        Ok(KbFileUpdateResult {
+            rel_path: resolved.rel_path,
+            entry_id: stable_entry_id,
+        })
+    }
+
+    /// Create a Markdown document without replacing an existing portable path
+    /// alias. The legacy write endpoint remains overwrite-capable for editor
+    /// saves; explicit "new document" flows use this no-clobber contract.
+    pub async fn create_document(
+        &self,
+        id: &str,
+        rel_path: &str,
+        content: &str,
+    ) -> Result<String, AppError> {
+        let kb_id = KnowledgeBaseId::parse(id)
+            .map_err(|error| AppError::BadRequest(format!("invalid knowledge base id: {error}")))?;
+        let row = self.require_base(id).await?;
+        let _tree_guard = self.acquire_document_tree_read_lock(&row).await?;
+        let root = PathBuf::from(&row.root_path);
+        let resolved = resolve_portable_md_path(root.clone(), rel_path.to_owned()).await?;
+        let lock_path = portable_turn_writeback_lock_path(&deconfuse_rel_path(&resolved.rel_path));
+        let _target_guard = self
+            .acquire_turn_writeback_target_lock(&kb_id, &lock_path)
+            .await?;
+        let resolved = resolve_portable_md_path(root, resolved.rel_path).await?;
+        if resolved.exists {
+            return Err(AppError::Conflict(format!(
+                "knowledge document already exists: {}",
+                resolved.rel_path
+            )));
+        }
+        self.write_file_if_absent(
+            id,
+            &resolved.rel_path,
+            &resolved.rel_path,
+            content,
+        )
+        .await?;
+        drop(_target_guard);
+        drop(_tree_guard);
+
+        // Keep cards/detail headers fresh without making the already-created
+        // document disappear behind a secondary metadata failure.
+        if let Err(error) = self.update_base(id, None, None, None).await {
+            tracing::warn!(kb_id = id, %error, "document created but knowledge timestamp update failed");
+        }
+        Ok(resolved.rel_path)
+    }
+
+    /// Create a markdown file only when no portable path alias exists.
+    ///
+    /// The portable target lock deliberately spans both the existence check
+    /// and no-clobber publication. This is used by background producers such
+    /// as README autogen so they cannot overwrite a write-back that created
+    /// the same path between a preliminary directory scan and publication.
+    async fn write_file_if_portably_absent(
+        &self,
+        id: &str,
+        rel_path: &str,
+        content: &str,
+    ) -> Result<bool, AppError> {
+        let kb_id = KnowledgeBaseId::parse(id)
+            .map_err(|error| AppError::BadRequest(format!("invalid knowledge base id: {error}")))?;
+        let row = self.require_base(id).await?;
+        let _tree_guard = self.acquire_document_tree_read_lock(&row).await?;
+        let root = PathBuf::from(&row.root_path);
+        let resolved = resolve_portable_md_path(root.clone(), rel_path.to_owned()).await?;
+        let lock_path = portable_turn_writeback_lock_path(
+            &deconfuse_rel_path(&resolved.rel_path),
+        );
+        let _target_guard = self
+            .acquire_turn_writeback_target_lock(&kb_id, &lock_path)
+            .await?;
+        let resolved = resolve_portable_md_path(root.clone(), resolved.rel_path).await?;
+        if resolved.exists {
+            return Ok(false);
+        }
+
+        match self
+            .write_file_if_absent(
+                id,
+                &resolved.rel_path,
+                &resolved.rel_path,
+                content,
+            )
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(error @ AppError::Conflict(_)) => {
+                // A process outside this service may still create the exact
+                // destination concurrently. Preserve it just like an
+                // in-process writer; do not turn a benign README race into a
+                // failed background task.
+                let current =
+                    resolve_portable_md_path(root, resolved.rel_path).await?;
+                if current.exists {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn write_file_under_target_lock(
+        &self,
+        id: &str,
+        storage_rel_path: &str,
+        logical_rel_path: Option<&str>,
+        content: &str,
+    ) -> Result<(), AppError> {
+        let row = self.require_base(id).await?;
+        let _base_guard = self.acquire_base_lifecycle_lock(&row).await?;
+        let current = self.require_base(id).await?;
+        if current.root_path != row.root_path {
+            return Err(AppError::Conflict(
+                "knowledge base root changed while write-back was starting; retry".into(),
+            ));
+        }
+        require_editable_knowledge_tree(&current)?;
+        if let Some(logical_rel_path) = logical_rel_path {
+            self.validate_content_write_target(&current, logical_rel_path)
+                .await?;
+        }
+        let path = safe_md_path_bounded(
+            PathBuf::from(&row.root_path),
+            storage_rel_path.to_owned(),
+        )
+        .await?;
+        // Do not timeout-and-drop the mutating future: Tokio filesystem calls
+        // may already be running on the blocking pool, and a late atomic rename
+        // could otherwise overwrite a user's manual retry after its guard was
+        // released. The target/message guards remain owned until publication
+        // has definitively completed or failed.
+        write_text_atomic(&path, content).await?;
+        self.invalidate_search_cache_path(&path);
+        // Atomic replacement commonly changes inode/file-index. Refresh that
+        // identity before a later external rename needs it to preserve the
+        // stable knowledge-entry ID.
+        self.mark_projection_dirty(&current);
+        Ok(())
+    }
+
+    async fn write_file_if_unchanged(
+        &self,
+        id: &str,
+        storage_rel_path: &str,
+        logical_rel_path: &str,
+        expected: &str,
+        content: &str,
+    ) -> Result<(), AppError> {
+        let row = self.require_base(id).await?;
+        let _base_guard = self.acquire_base_lifecycle_lock(&row).await?;
+        let current = self.require_base(id).await?;
+        if current.root_path != row.root_path {
+            return Err(AppError::Conflict(
+                "knowledge base root changed while write-back was starting; retry".into(),
+            ));
+        }
+        require_editable_knowledge_tree(&current)?;
+        self.validate_content_write_target(&current, logical_rel_path)
+            .await?;
+        let path = safe_md_path_bounded(
+            PathBuf::from(&row.root_path),
+            storage_rel_path.to_owned(),
+        )
+        .await?;
+        write_text_atomic_if_unchanged(&path, expected, content).await?;
+        self.invalidate_search_cache_path(&path);
+        self.mark_projection_dirty(&current);
+        Ok(())
+    }
+
+    async fn write_file_if_absent(
+        &self,
+        id: &str,
+        storage_rel_path: &str,
+        logical_rel_path: &str,
+        content: &str,
+    ) -> Result<(), AppError> {
+        let row = self.require_base(id).await?;
+        let _base_guard = self.acquire_base_lifecycle_lock(&row).await?;
+        let current = self.require_base(id).await?;
+        if current.root_path != row.root_path {
+            return Err(AppError::Conflict(
+                "knowledge base root changed while write-back was starting; retry".into(),
+            ));
+        }
+        require_editable_knowledge_tree(&current)?;
+        self.validate_content_write_target(&current, logical_rel_path)
+            .await?;
+        let path = safe_md_path_bounded(
+            PathBuf::from(&row.root_path),
+            storage_rel_path.to_owned(),
+        )
+        .await?;
+        write_text_atomic_if_absent(&path, content).await?;
+        self.invalidate_search_cache_path(&path);
+        self.mark_projection_dirty(&current);
+        Ok(())
+    }
+
+    fn invalidate_search_cache_path(&self, path: &Path) {
+        let mut guard = self.search_cache.write().unwrap_or_else(|e| e.into_inner());
+        let target_identity = portable_absolute_path_identity(path);
+        let mut freed = 0usize;
+        guard.entries.retain(|cached_path, cached| {
+            if portable_absolute_path_identity(cached_path) == target_identity {
+                freed = freed.saturating_add(cached.bytes);
+                false
+            } else {
+                true
+            }
+        });
+        guard.total_bytes = guard.total_bytes.saturating_sub(freed);
+    }
+
+    fn invalidate_search_cache_prefix(&self, path: &Path) {
+        let mut guard = self.search_cache.write().unwrap_or_else(|e| e.into_inner());
+        let target_identity = portable_absolute_path_identity(path);
+        let mut freed = 0usize;
+        guard.entries.retain(|cached_path, cached| {
+            let cached_identity = portable_absolute_path_identity(cached_path);
+            let is_within = cached_identity == target_identity
+                || cached_identity
+                    .strip_prefix(&target_identity)
+                    .is_some_and(|suffix| suffix.starts_with('/'));
+            if is_within {
+                freed = freed.saturating_add(cached.bytes);
+                false
+            } else {
+                true
+            }
+        });
+        guard.total_bytes = guard.total_bytes.saturating_sub(freed);
+    }
+
+    fn cached_relocation(
+        &self,
+        key: &str,
+        fingerprint: &RelocateRequestFingerprint,
+    ) -> Result<Option<RelocateTreeEntryResult>, AppError> {
+        let cache = self
+            .relocate_idempotency
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(cached) = cache.entries.get(key) else {
+            return Ok(None);
+        };
+        if &cached.fingerprint != fingerprint {
+            return Err(AppError::Conflict(
+                "request_id was already used for a different tree relocation".into(),
+            ));
+        }
+        Ok(Some(cached.result.clone()))
+    }
+
+    fn remember_relocation(
+        &self,
+        key: String,
+        fingerprint: RelocateRequestFingerprint,
+        result: RelocateTreeEntryResult,
+    ) {
+        let mut cache = self
+            .relocate_idempotency
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache.entries.contains_key(&key) {
+            return;
+        }
+        while cache.entries.len() >= MAX_RELOCATE_IDEMPOTENCY_ENTRIES {
+            let Some(oldest) = cache.insertion_order.pop_front() else {
+                cache.entries.clear();
+                break;
+            };
+            cache.entries.remove(&oldest);
+        }
+        cache.insertion_order.push_back(key.clone());
+        cache.entries.insert(
+            key,
+            CachedRelocation {
+                fingerprint,
+                result,
+            },
+        );
+    }
+
+    fn current_tree_revision(&self, row: &KnowledgeBaseRow) -> u64 {
+        let persisted = u64::try_from(row.updated_at).unwrap_or_default();
+        let mut revisions = self
+            .tree_revisions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *revisions
+            .entry(row.knowledge_base_id.clone())
+            .or_insert(persisted)
+    }
+
+    fn next_tree_revision(&self, row: &KnowledgeBaseRow) -> u64 {
+        let persisted = u64::try_from(row.updated_at).unwrap_or_default();
+        let wall_clock = u64::try_from(now_ms()).unwrap_or_default();
+        let mut revisions = self
+            .tree_revisions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let revision = revisions
+            .entry(row.knowledge_base_id.clone())
+            .or_insert(persisted);
+        *revision = wall_clock.max(persisted).max(revision.saturating_add(1));
+        *revision
+    }
+
+    /// Bindings currently mounting this base (enabled AND disabled — the UI
+    /// greys the disabled ones). Powers the "who is using this base?" view.
+    pub async fn list_consumers(&self, id: &str) -> Result<Vec<ConsumerInfo>, AppError> {
+        self.require_base(id).await?;
+        let rows = self.repo.list_bindings_using_kb(id).await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| ConsumerInfo { target_kind: r.target_kind.clone(), target_id: r.target_id(), enabled: r.enabled })
+            .collect())
+    }
+
+    /// Resolve a model-supplied write target to a canonical document + op.
+    /// `bound_kb_ids` scopes what the session may write to — a handle or path
+    /// pointing outside it is `Forbidden`. Path resolution only inspects the
+/// requested ancestor chain; it never walks the entire vault, so an
+/// unrelated slow or unreadable subtree cannot make a write-back fail.
+    pub async fn resolve_write_target(
+        &self,
+        bound_kb_ids: &[KnowledgeBaseId],
+        spec: &WriteTargetSpec,
+    ) -> Result<WriteResolution, AppError> {
+        match spec {
+            WriteTargetSpec::Handle(handle) => {
+                let (kb_id, rel_path) = decode_doc_handle(handle)
+                    .ok_or_else(|| AppError::BadRequest(format!("invalid document handle: {handle}")))?;
+                if !bound_kb_ids.iter().any(|b| b == &kb_id) {
+                    return Err(AppError::Forbidden("handle points to a base not mounted in this session".into()));
+                }
+                validate_canonical_write_target(&rel_path)?;
+                let row = self.require_base(kb_id.as_str()).await?;
+                self.validate_content_write_target(&row, &rel_path).await?;
+                let abs = safe_md_path_bounded(PathBuf::from(&row.root_path), rel_path.clone())
+                    .await?;
+                let exists = tokio::time::timeout(
+                    KNOWLEDGE_PATH_INSPECTION_TIMEOUT,
+                    tokio::fs::try_exists(&abs),
+                )
+                .await
+                .map_err(|_| {
+                    AppError::Timeout(format!(
+                        "knowledge document inspection timed out: {rel_path}"
+                    ))
+                })?
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "failed to inspect knowledge document {}: {error}",
+                        abs.display()
+                    ))
+                })?;
+                if !exists {
+                    return Err(AppError::NotFound(format!("document for handle no longer exists: {rel_path}")));
+                }
+                Ok(WriteResolution { kb_id, canonical_rel_path: rel_path, op: WriteOp::Update })
+            }
+            WriteTargetSpec::Path { kb_id, rel_path } => {
+                if !bound_kb_ids.iter().any(|b| b == kb_id) {
+                    return Err(AppError::Forbidden("target base is not mounted in this session".into()));
+                }
+                let canonical = deconfuse_rel_path(rel_path);
+                validate_canonical_write_target(&canonical)?;
+                let row = self.require_base(kb_id.as_str()).await?;
+                self.validate_content_write_target(&row, &canonical).await?;
+                let root = PathBuf::from(&row.root_path);
+                // Validate traversal/portable components up front, including
+                // missing parents that the eventual create may need.
+                safe_md_path_bounded(
+                    root.clone(),
+                    canonical.clone(),
+                )
+                .await?;
+                let resolved_path = resolve_portable_md_path(
+                    PathBuf::from(&row.root_path),
+                    canonical,
+                )
+                .await?;
+                if resolved_path.exists {
+                    return Ok(WriteResolution {
+                        kb_id: kb_id.clone(),
+                        canonical_rel_path: resolved_path.rel_path,
+                        op: WriteOp::Update,
+                    });
+                }
+                Ok(WriteResolution {
+                    kb_id: kb_id.clone(),
+                    canonical_rel_path: resolved_path.rel_path,
+                    op: WriteOp::Create,
+                })
+            }
+        }
+    }
+
+    /// The single canonical agent write path. Resolves the target (fixing
+    /// mount-path confusion / locating the existing doc), enforces the policy
+    /// (disabled refused, create gated), applies placement (direct = base body;
+    /// staged = `_inbox/{scope}/{rel_path}` mirroring the original, which is left
+    /// untouched), and writes atomically. All agent surfaces funnel here.
+    pub async fn write_document(&self, req: WriteRequest) -> Result<WriteOutcome, AppError> {
+        validate_write_request(&req)?;
+        let target_kb_id = match &req.spec {
+            WriteTargetSpec::Path { kb_id, .. } => kb_id.clone(),
+            WriteTargetSpec::Handle(handle) => decode_doc_handle(handle)
+                .map(|(kb_id, _)| kb_id)
+                .ok_or_else(|| {
+                    AppError::BadRequest(format!(
+                        "invalid document handle: {handle}"
+                    ))
+                })?,
+        };
+        let row = self.require_base(target_kb_id.as_str()).await?;
+        let _tree_guard = self.acquire_document_tree_read_lock(&row).await?;
+        let res = self.resolve_write_target(&req.bound_kb_ids, &req.spec).await?;
+        let lock_path = portable_turn_writeback_lock_path(&res.canonical_rel_path);
+        let _guard = self
+            .acquire_turn_writeback_target_lock(&res.kb_id, &lock_path)
+            .await?;
+        self.write_resolved_document_under_target_lock(req, res).await
+    }
+
+    async fn write_resolved_document_under_target_lock(
+        &self,
+        req: WriteRequest,
+        res: WriteResolution,
+    ) -> Result<WriteOutcome, AppError> {
+        validate_write_request(&req)?;
+        validate_canonical_write_target(&res.canonical_rel_path)?;
+        let row = self.require_base(res.kb_id.as_str()).await?;
+        let _base_guard = self.acquire_base_lifecycle_lock(&row).await?;
+        let current = self.require_base(res.kb_id.as_str()).await?;
+        if current.root_path != row.root_path {
+            return Err(AppError::Conflict(
+                "knowledge base root changed while write-back was starting; retry"
+                    .into(),
+            ));
+        }
+        self.validate_content_write_target(&current, &res.canonical_rel_path)
+            .await?;
+        drop(_base_guard);
+        if res.op == WriteOp::Create && !req.policy.allow_create {
+            return Err(AppError::Forbidden("creating new knowledge documents is not allowed for this session".into()));
+        }
+
+        let final_rel_path = res.canonical_rel_path.clone();
+        if res.op == WriteOp::Create {
+            self.write_file_if_absent(
+                res.kb_id.as_str(),
+                &final_rel_path,
+                &res.canonical_rel_path,
+                &req.content,
+            )
+            .await?;
+        } else {
+            // The same safety path the turn-final finalizer uses: read the
+            // document, append only genuinely new material, then publish under
+            // compare-and-swap. Never an unconditional overwrite — the model
+            // cannot see the whole document, so a full rewrite can silently
+            // destroy content the user curated by hand.
+            let existing = self.read_file(res.kb_id.as_str(), &final_rel_path).await?.content;
+            let merged = merge_direct_turn_writeback(&existing, &req.content);
+            if markdown_identity(&existing) == markdown_identity(&merged) {
+                // The material is already in the document: idempotent no-op,
+                // not a failure. Repeated turns and manual retries land here.
+                return Ok(WriteOutcome { kb_id: res.kb_id, final_rel_path, op: res.op });
+            }
+            self.write_file_if_unchanged(
+                res.kb_id.as_str(),
+                &final_rel_path,
+                &res.canonical_rel_path,
+                &existing,
+                &merged,
+            )
+            .await?;
+        }
+        Ok(WriteOutcome { kb_id: res.kb_id, final_rel_path, op: res.op })
+    }
+
+    pub async fn finalize_turn_writeback(&self, req: TurnWritebackRequest) -> TurnWritebackReport {
+        self.finalize_turn_writeback_with_progress(req, |_| async {}).await
+    }
+
+    /// Same as [`Self::finalize_turn_writeback`], but reports coarse visible
+    /// progress to the caller without turning write-back into a durable queue.
+    pub async fn finalize_turn_writeback_with_progress<F, Fut>(
+        &self,
+        req: TurnWritebackRequest,
+        mut progress: F,
+    ) -> TurnWritebackReport
+    where
+        F: FnMut(TurnWritebackPhase) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        if req.mounts.is_empty() {
+            return TurnWritebackReport::status(TurnWritebackStatus::Disabled);
+        }
+        if turn_writeback_is_cancelled(&req) {
+            return TurnWritebackReport::failed(
+                "knowledge write-back was cancelled because the conversation changed",
+            );
+        }
+
+        let policy = resolve_write_policy(req.surface, &req.binding);
+        if matches!(policy.mode, WriteMode::Disabled) {
+            return TurnWritebackReport::status(TurnWritebackStatus::Disabled);
+        }
+
+        if req.user_text.trim().is_empty() && req.assistant_text.trim().is_empty() {
+            return TurnWritebackReport::status(TurnWritebackStatus::NoCandidate);
+        }
+
+        let Some(completer) = self.completer() else {
+            return TurnWritebackReport::status(TurnWritebackStatus::NoCompleter);
+        };
+        progress(TurnWritebackPhase::Extracting).await;
+
+        let redacted_user = nomi_redact::redact_secrets_owned(req.user_text.clone());
+        let redacted_assistant =
+            nomi_redact::redact_secrets_owned(req.assistant_text.clone());
+        let eagerness = crate::context::WritebackEagerness::parse(Some(req.binding.writeback_eagerness.as_str()));
+        let prompt = crate::turn_writeback::build_turn_writeback_prompt(
+            &req.mounts,
+            eagerness,
+            &redacted_user,
+            &redacted_assistant,
+        );
+
+        let completion = complete_turn_writeback_llm(
+            &completer,
+            req.model.as_ref(),
+            crate::turn_writeback::TURN_WRITEBACK_SYSTEM,
+            &prompt,
+            "extract",
+        );
+        let completion_result = if let Some(cancellation) = req.cancellation.as_ref() {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    Err("knowledge write-back was cancelled because the conversation changed".to_owned())
+                }
+                result = completion => result,
+            }
+        } else {
+            completion.await
+        };
+        let raw = match completion_result {
+            Ok(raw) => raw,
+            Err(e) => {
+                tracing::debug!(error = %e, "turn writeback provider call failed");
+                return TurnWritebackReport::failed(e);
+            }
+        };
+        if turn_writeback_is_cancelled(&req) {
+            return TurnWritebackReport::failed(
+                "knowledge write-back was cancelled because the conversation changed",
+            );
+        }
+        let out = match crate::turn_writeback::parse_turn_writeback_output(&raw) {
+            Ok(out) => out,
+            Err(e) => {
+                tracing::debug!(error = %e, "turn writeback output unparseable");
+                return TurnWritebackReport::failed(e);
+            }
+        };
+
+        let candidate_count = out.candidates.len();
+        if candidate_count == 0 {
+            return TurnWritebackReport::status(TurnWritebackStatus::NoCandidate);
+        }
+        if candidate_count > TURN_WRITEBACK_MAX_CANDIDATES {
+            let mut report = TurnWritebackReport::failed(format!(
+                "turn writeback produced {candidate_count} candidates; maximum is {TURN_WRITEBACK_MAX_CANDIDATES}"
+            ));
+            report.candidates = candidate_count;
+            return report;
+        }
+        progress(TurnWritebackPhase::Writing).await;
+
+        let mounted_ids: HashSet<KnowledgeBaseId> =
+            req.mounts.iter().map(|m| m.knowledge_base_id.clone()).collect();
+        let bound_kb_ids: Vec<KnowledgeBaseId> =
+            req.mounts.iter().map(|m| m.knowledge_base_id.clone()).collect();
+        let excluded_targets = req.excluded_targets.as_ref().map(|targets| {
+            targets
+                .iter()
+                .map(|(kb_id, rel_path)| {
+                    (
+                        kb_id.clone(),
+                        portable_turn_writeback_lock_path(rel_path),
+                    )
+                })
+                .collect::<HashSet<_>>()
+        });
+        let mut seen = HashSet::new();
+        let mut written = Vec::new();
+        let mut failures = Vec::new();
+        let mut accepted_chars = 0usize;
+        for candidate in out.candidates {
+            if turn_writeback_is_cancelled(&req) {
+                failures.push(TurnWritebackFailure {
+                    kb_id: None,
+                    rel_path: None,
+                    error:
+                        "knowledge write-back was cancelled because the conversation changed"
+                            .into(),
+                });
+                break;
+            }
+            let kb_id = candidate.kb_id;
+            // Canonicalize the mount-prefixed spelling before every policy
+            // check. Otherwise `.nomi/knowledge/<mount>/_inbox/x.md` can hide
+            // an inbox target until after the rejection boundary.
+            let rel_path = deconfuse_rel_path(candidate.rel_path.trim());
+            let content = candidate.content.trim();
+
+            if rel_path.is_empty() || content.is_empty() {
+                failures.push(TurnWritebackFailure {
+                    kb_id: Some(kb_id),
+                    rel_path: if rel_path.is_empty() { None } else { Some(rel_path) },
+                    error: "candidate must include kb_id, rel_path and content".into(),
+                });
+                continue;
+            }
+            let content_chars = content.chars().count();
+            if content_chars > TURN_WRITEBACK_MAX_CANDIDATE_CHARS
+                || accepted_chars.saturating_add(content_chars) > TURN_WRITEBACK_MAX_TOTAL_CHARS
+            {
+                failures.push(TurnWritebackFailure {
+                    kb_id: Some(kb_id),
+                    rel_path: Some(rel_path),
+                    error: "candidate content exceeds the bounded write-back size".into(),
+                });
+                continue;
+            }
+            if !mounted_ids.contains(&kb_id) {
+                failures.push(TurnWritebackFailure {
+                    kb_id: Some(kb_id),
+                    rel_path: Some(rel_path),
+                    error: "candidate kb_id is not mounted in this session".into(),
+                });
+                continue;
+            }
+            accepted_chars += content_chars;
+
+            let row = match self.require_base(kb_id.as_str()).await {
+                Ok(row) => row,
+                Err(error) => {
+                    failures.push(TurnWritebackFailure {
+                        kb_id: Some(kb_id),
+                        rel_path: Some(rel_path),
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let _tree_guard = match self.acquire_document_tree_read_lock(&row).await {
+                Ok(guard) => guard,
+                Err(error) => {
+                    failures.push(TurnWritebackFailure {
+                        kb_id: Some(kb_id),
+                        rel_path: Some(rel_path),
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let mut content = nomi_redact::redact_secrets_owned(content.to_owned());
+            let spec = WriteTargetSpec::Path { kb_id: kb_id.clone(), rel_path: rel_path.clone() };
+            let resolution = match self.resolve_write_target(&bound_kb_ids, &spec).await {
+                Ok(resolution) => resolution,
+                Err(error) => {
+                    failures.push(TurnWritebackFailure {
+                        kb_id: Some(kb_id),
+                        rel_path: Some(rel_path),
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let portable_lock_path =
+                portable_turn_writeback_lock_path(&resolution.canonical_rel_path);
+            if excluded_targets
+                .as_ref()
+                .is_some_and(|targets| {
+                    targets.contains(&(kb_id.clone(), portable_lock_path.clone()))
+                })
+            {
+                continue;
+            }
+            if !seen.insert((kb_id.clone(), portable_lock_path.clone())) {
+                continue;
+            }
+            let _candidate_guard = match self
+                .acquire_turn_writeback_target_lock(&kb_id, &portable_lock_path)
+                .await
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    failures.push(TurnWritebackFailure {
+                        kb_id: Some(kb_id),
+                        rel_path: Some(rel_path),
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            // Direct is the only landing spot left; `Disabled` already returned
+            // early above, so a candidate can never fall past this guard.
+            if matches!(policy.mode, WriteMode::Direct) {
+                let mut expected_existing = None;
+                if resolution.op == WriteOp::Update {
+                    let existing = match self.read_file(kb_id.as_str(), &resolution.canonical_rel_path).await {
+                        Ok(file) => file.content,
+                        Err(e) => {
+                            failures.push(TurnWritebackFailure {
+                                kb_id: Some(kb_id),
+                                rel_path: Some(resolution.canonical_rel_path),
+                                error: e.to_string(),
+                            });
+                            continue;
+                        }
+                    };
+                    if markdown_identity(&existing) == markdown_identity(&content) {
+                        continue;
+                    }
+                    content = merge_direct_turn_writeback(&existing, &content);
+                    if markdown_identity(&existing) == markdown_identity(&content) {
+                        continue;
+                    }
+                    expected_existing = Some(existing);
+                }
+
+                let final_rel_path = resolution.canonical_rel_path.clone();
+                if turn_writeback_is_cancelled(&req) {
+                    failures.push(TurnWritebackFailure {
+                        kb_id: Some(kb_id),
+                        rel_path: Some(final_rel_path),
+                        error:
+                            "knowledge write-back was cancelled because the conversation changed"
+                                .into(),
+                    });
+                    break;
+                }
+                let write_result = if let Some(expected) = expected_existing.as_deref() {
+                    self.write_file_if_unchanged(
+                        kb_id.as_str(),
+                        &final_rel_path,
+                        &final_rel_path,
+                        expected,
+                        &content,
+                    )
+                    .await
+                } else {
+                    self.write_file_if_absent(
+                        kb_id.as_str(),
+                        &final_rel_path,
+                        &final_rel_path,
+                        &content,
+                    )
+                    .await
+                };
+                match write_result {
+                    Ok(()) => {
+                        written.push(WriteOutcome {
+                            kb_id,
+                            final_rel_path,
+                            op: resolution.op,
+                        });
+                    }
+                    Err(e) => failures.push(TurnWritebackFailure {
+                        kb_id: Some(kb_id),
+                        rel_path: Some(final_rel_path),
+                        error: e.to_string(),
+                    }),
+                }
+                continue;
+            }
+
+        }
+
+        let status = match (written.is_empty(), failures.is_empty()) {
+            (false, true) => TurnWritebackStatus::Written,
+            (false, false) => TurnWritebackStatus::Partial,
+            (true, true) => TurnWritebackStatus::NoCandidate,
+            (true, false) => TurnWritebackStatus::Failed,
+        };
+
+        TurnWritebackReport { status, candidates: candidate_count, written, failures }
+    }
+
+    async fn acquire_turn_writeback_target_lock(
+        &self,
+        kb_id: &KnowledgeBaseId,
+        rel_path: &str,
+    ) -> Result<OwnedMutexGuard<()>, AppError> {
+        let row = self.require_base(kb_id.as_str()).await?;
+        let root_identity = self.canonical_root_lock_key(&row).await?;
+        let rel_identity = portable_turn_writeback_lock_path(rel_path);
+        let key = if rel_identity.is_empty() {
+            root_identity
+        } else {
+            format!("{root_identity}/{rel_identity}")
+        };
+        let lock = {
+            let mut locks = self
+                .turn_writeback_locks
+                .lock()
+                .expect("turn writeback lock map poisoned");
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(AsyncMutex::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        Ok(lock.lock_owned().await)
+    }
+
+    async fn acquire_base_lifecycle_lock(
+        &self,
+        row: &KnowledgeBaseRow,
+    ) -> Result<Vec<OwnedRwLockReadGuard<()>>, AppError> {
+        let key = self.canonical_root_lock_key(row).await?;
+        let locks = root_group_locks(&self.base_lifecycle_locks, key);
+        let mut guards = Vec::with_capacity(locks.len());
+        for lock in locks {
+            guards.push(lock.read_owned().await);
+        }
+        Ok(guards)
+    }
+
+    async fn acquire_base_lifecycle_write_lock(
+        &self,
+        row: &KnowledgeBaseRow,
+    ) -> Result<Vec<OwnedRwLockWriteGuard<()>>, AppError> {
+        let key = self.canonical_root_lock_key(row).await?;
+        let locks = root_group_locks(&self.base_lifecycle_locks, key);
+        let mut guards = Vec::with_capacity(locks.len());
+        for lock in locks {
+            guards.push(lock.write_owned().await);
+        }
+        Ok(guards)
+    }
+
+    async fn acquire_document_tree_read_lock(
+        &self,
+        row: &KnowledgeBaseRow,
+    ) -> Result<Vec<OwnedRwLockReadGuard<()>>, AppError> {
+        let key = self.canonical_root_lock_key(row).await?;
+        let locks = root_group_locks(&self.document_tree_locks, key);
+        let mut guards = Vec::with_capacity(locks.len());
+        for lock in locks {
+            guards.push(lock.read_owned().await);
+        }
+        Ok(guards)
+    }
+
+    async fn acquire_document_tree_write_lock(
+        &self,
+        row: &KnowledgeBaseRow,
+    ) -> Result<Vec<OwnedRwLockWriteGuard<()>>, AppError> {
+        let key = self.canonical_root_lock_key(row).await?;
+        let locks = root_group_locks(&self.document_tree_locks, key);
+        let mut guards = Vec::with_capacity(locks.len());
+        for lock in locks {
+            guards.push(lock.write_owned().await);
+        }
+        Ok(guards)
+    }
+
+    async fn canonical_root_lock_key(
+        &self,
+        row: &KnowledgeBaseRow,
+    ) -> Result<String, AppError> {
+        let cache_key = format!(
+            "{}\0{}",
+            row.knowledge_base_id, row.root_path
+        );
+        if let Some(identity) = self
+            .root_lock_identity_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&cache_key)
+            .cloned()
+        {
+            return Ok(identity);
+        }
+        // Validate the first lock-key resolution. Later mutations still
+        // perform a no-follow root/path validation at their publication
+        // boundary; re-walking every root ancestor for each tree, target and
+        // lifecycle lock acquisition made one NAS candidate pay the same
+        // latency many times.
+        validate_knowledge_root_bounded(PathBuf::from(&row.root_path)).await?;
+        // Registration persists a canonical physical path, so after the
+        // no-link chain validation above the lexical path is the lock
+        // identity. Avoid a second potentially slow NAS canonicalization.
+        let identity =
+            portable_absolute_path_identity(Path::new(&row.root_path));
+        self.root_lock_identity_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(cache_key, identity.clone());
+        Ok(identity)
+    }
+
+    pub async fn delete_file(&self, id: &str, rel_path: &str) -> Result<(), AppError> {
+        self.delete_file_entry(id, rel_path, None, None).await
+    }
+
+    pub async fn delete_file_entry(
+        &self,
+        id: &str,
+        rel_path: &str,
+        entry_id: Option<&KnowledgeEntryId>,
+        expected_revision: Option<i64>,
+    ) -> Result<(), AppError> {
+        if entry_id.is_some() != expected_revision.is_some() {
+            return Err(AppError::BadRequest(
+                "entry_id and expected_revision must be supplied together for delete".into(),
+            ));
+        }
+        let row = self.require_base(id).await?;
+        if entry_id.is_some() && self.entry_repository().is_none() {
+            return Err(AppError::Conflict(
+                "stable knowledge entry validation is unavailable".into(),
+            ));
+        }
+        if entry_id.is_some() {
+            self.ensure_projection_reconciled(&row).await?;
+        }
+        let _tree_guard =
+            self.acquire_document_tree_write_lock(&row).await?;
+        let _base_guard = self.acquire_base_lifecycle_lock(&row).await?;
+        let current = self.require_base(id).await?;
+        require_editable_knowledge_tree(&current)?;
+        let mut rel_path = normalize_tree_rel_path(rel_path)?;
+        let mut projected = None;
+        if let (Some(entry_id), Some(expected_revision), Some(repository)) =
+            (entry_id, expected_revision, self.entry_repository())
+        {
+            let knowledge_base_id = KnowledgeBaseId::parse(&current.knowledge_base_id).map_err(
+                |error| {
+                    AppError::Internal(format!(
+                        "stored knowledge base id '{}' is invalid: {error}",
+                        current.knowledge_base_id
+                    ))
+                },
+            )?;
+            let entry = repository
+                .get_entry(&knowledge_base_id, entry_id)
+                .await?
+                .filter(|entry| !entry.is_deleted())
+                .ok_or_else(|| {
+                    AppError::Conflict(
+                        "the document moved or disappeared before delete".into(),
+                    )
+                })?;
+            if entry.revision != expected_revision {
+                return Err(AppError::Conflict(format!(
+                    "knowledge entry revision conflict: expected {expected_revision}, current {}",
+                    entry.revision
+                )));
+            }
+            if entry.kind != KNOWLEDGE_ENTRY_KIND_FILE {
+                return Err(AppError::BadRequest(
+                    "delete-file identity does not refer to a file".into(),
+                ));
+            }
+            rel_path = entry.rel_path.clone();
+            projected = Some((repository, knowledge_base_id, entry));
+        }
+        self.validate_content_write_target(&current, &rel_path).await?;
+        let path = safe_md_path_bounded(
+            PathBuf::from(&row.root_path),
+            rel_path.clone(),
+        )
+        .await?;
+        tokio::fs::remove_file(&path)
+            .await
+            .map_err(|_| AppError::NotFound(format!("file not found: {rel_path}")))?;
+        self.invalidate_search_cache_path(&path);
+        if let Some((repository, knowledge_base_id, entry)) = projected {
+            if let Err(error) = repository
+                .soft_delete_entry_subtree(
+                    &knowledge_base_id,
+                    &entry.knowledge_entry_id,
+                    entry.revision,
+                    now_ms(),
+                )
+                .await
+            {
+                tracing::warn!(
+                    kb_id = %current.knowledge_base_id,
+                    entry_id = %entry.knowledge_entry_id,
+                    %error,
+                    "file delete committed but entry tombstone CAS failed; reconciliation will repair it"
+                );
+                self.mark_projection_dirty(&current);
+            }
+        } else {
+            self.mark_projection_dirty(&current);
+        }
+        Ok(())
+    }
+
+    // ── AI autogen & URL sources ────────────────────────────────────
+
+    /// Generate (LLM) and persist a registry description + root `README.md`
+    /// for the base. With `overwrite_readme = false` an existing README is
+    /// left untouched (the description is still refreshed). `model_override`
+    /// pins an explicit `(provider_id, model)` for the LLM call (the
+    /// knowledge UI's per-run model picker); `None` uses the completer's
+    /// default model. Completion is announced via the regular
+    /// `knowledge.base-updated` event.
+    pub async fn generate_overview(
+        &self,
+        kb_id: &str,
+        overwrite_readme: bool,
+        model_override: Option<(String, String)>,
+    ) -> Result<AutogenOutcome, AppError> {
+        self.generate_overview_opts(kb_id, overwrite_readme, false, model_override).await
+    }
+
+    /// [`Self::generate_overview`] with one extra knob:
+    /// `preserve_existing_description` keeps a non-empty registry
+    /// description as-is (used by the post-import hook, which must only
+    /// backfill missing descriptions). `model_override` is threaded through
+    /// to the LLM call exactly as in [`Self::generate_overview`].
+    pub async fn generate_overview_opts(
+        &self,
+        kb_id: &str,
+        overwrite_readme: bool,
+        preserve_existing_description: bool,
+        model_override: Option<(String, String)>,
+    ) -> Result<AutogenOutcome, AppError> {
+        let completer = self.require_completer()?;
+        let row = self.require_base(kb_id).await?;
+        require_editable_knowledge_tree(&row)?;
+        let root = PathBuf::from(&row.root_path);
+        let samples = autogen::sample_base_files(&root).await;
+        if samples.is_empty() {
+            return Err(AppError::BadRequest(
+                "knowledge base has no markdown documents to summarize".into(),
+            ));
+        }
+
+        let user = autogen::build_overview_prompt(&row.name, &row.description, &samples);
+        // One retry on parse failure (the model occasionally wraps in prose);
+        // provider failures propagate immediately.
+        let mut parsed = None;
+        let mut last_err = String::new();
+        for attempt in 0..2 {
+            let raw =
+                complete_overview(completer.as_ref(), &user, model_override.as_ref()).await?;
+            match autogen::parse_overview_output(&raw) {
+                Ok(output) => {
+                    parsed = Some(output);
+                    break;
+                }
+                Err(e) => {
+                    last_err = e;
+                    tracing::debug!(attempt, kb_id, error = %last_err, "knowledge overview output unparseable");
+                }
+            }
+        }
+        let Some(output) = parsed else {
+            return Err(AppError::BadGateway(format!(
+                "knowledge autogen output unparseable: {last_err}"
+            )));
+        };
+
+        let description = autogen::clamp_description(&output.description);
+        let readme = output.readme_markdown.trim();
+
+        let mut readme_written = false;
+        if !readme.is_empty() {
+            let content = format!("{readme}\n");
+            readme_written = if overwrite_readme {
+                // `write_file` resolves case/Unicode aliases under the same
+                // portable target lock, so an existing `readme.md` is
+                // overwritten in place rather than shadowed by `README.md`.
+                self.write_file(kb_id, "README.md", &content).await?;
+                true
+            } else {
+                // The absence check and publication are one locked,
+                // no-clobber operation. A concurrent write-back therefore
+                // always wins and is preserved.
+                self.write_file_if_portably_absent(
+                    kb_id,
+                    "README.md",
+                    &content,
+                )
+                .await?
+            };
+        }
+
+        let keep_description =
+            description.is_empty() || (preserve_existing_description && !row.description.trim().is_empty());
+        let description_arg = (!keep_description).then_some(description.as_str());
+        // `update_base` re-emits `knowledge.base-updated` (also bumps
+        // updated_at when only the README changed).
+        let base = self.update_base(kb_id, None, description_arg, None).await?;
+        Ok(AutogenOutcome {
+            description: base.description.clone(),
+            description_updated: description_arg.is_some(),
+            readme_written,
+            base,
+        })
+    }
+
+    /// Stateless companion of [`Self::generate_overview_opts`] for the
+    /// create-base form: sample an arbitrary on-disk directory and generate a
+    /// registry description only — no README, nothing persisted, no events
+    /// (the base may not exist yet). `name` may be blank. `model_override`
+    /// pins an explicit `(provider_id, model)` for the call; `None` uses the
+    /// completer's default. Validation mirrors `register_base`'s external
+    /// root_path rules (absolute + existing dir).
+    pub async fn generate_description_for_path(
+        &self,
+        name: &str,
+        root_path: &str,
+        model_override: Option<(String, String)>,
+    ) -> Result<String, AppError> {
+        let completer = self.require_completer()?;
+        let root_path = root_path.trim();
+        if root_path.is_empty() {
+            return Err(AppError::BadRequest("root_path must not be empty".into()));
+        }
+        let root = PathBuf::from(root_path);
+        if !root.is_absolute() {
+            return Err(AppError::BadRequest("root_path must be absolute".into()));
+        }
+        if !root.is_dir() {
+            return Err(AppError::BadRequest(format!("directory does not exist: {root_path}")));
+        }
+        let samples = autogen::sample_base_files(&root).await;
+        if samples.is_empty() {
+            return Err(AppError::BadRequest(
+                "directory has no markdown documents to summarize".into(),
+            ));
+        }
+        let user = autogen::build_description_prompt(name, &samples);
+        complete_description(
+            completer.as_ref(),
+            autogen::DESCRIPTION_SYSTEM,
+            &user,
+            model_override.as_ref(),
+        )
+        .await
+    }
+
+    /// Stateless: rewrite a user-typed draft into a polished registry
+    /// description. Nothing is persisted — the caller decides what to do
+    /// with the result. `name` may be blank. `model_override` pins an
+    /// explicit `(provider_id, model)`; `None` uses the completer's default.
+    pub async fn polish_description(
+        &self,
+        name: &str,
+        draft: &str,
+        model_override: Option<(String, String)>,
+    ) -> Result<String, AppError> {
+        let completer = self.require_completer()?;
+        let draft = draft.trim();
+        if draft.is_empty() {
+            return Err(AppError::BadRequest("draft must not be empty".into()));
+        }
+        let user = autogen::build_polish_prompt(name, draft);
+        complete_description(
+            completer.as_ref(),
+            autogen::POLISH_SYSTEM,
+            &user,
+            model_override.as_ref(),
+        )
+        .await
+    }
+
+    /// Re-fetch every actively managed URL-source entry at its current stable
+    /// entry location and stamp `extra.source.last_fetched_at` when at
+    /// least one entry was fetched. Works for both snapshot- and live-mode
+    /// sources (a live base gains/refreshes its point-in-time snapshots
+    /// without changing its realtime contract).
+    pub async fn refresh_source(&self, kb_id: &str) -> Result<RefreshSourceSummary, AppError> {
+        let mut row = self.require_base(kb_id).await?;
+        require_editable_knowledge_tree(&row)?;
+        let mut source = source_from_extra(&row.extra)
+            .map_err(|error| knowledge_row_json_error(&row.knowledge_base_id, error))?
+            .ok_or_else(|| AppError::BadRequest("knowledge base has no URL source to refresh".into()))?;
+        if source.entries.is_empty() {
+            return Err(AppError::BadRequest("URL source has no entries".into()));
+        }
+
+        if self.source_repository().is_some() && self.entry_repository().is_some() {
+            self.ensure_projection_reconciled(&row).await?;
+            self.recover_pending_source_publications(&row).await?;
+            let normalized = self
+                .ensure_normalized_source(&row)
+                .await?
+                .ok_or_else(|| {
+                    AppError::Internal(
+                        "knowledge source normalization did not produce an aggregate".into(),
+                    )
+                })?;
+            if !normalized
+                .items
+                .iter()
+                .any(|item| item.state == KnowledgeSourceState::Active)
+            {
+                return Err(AppError::BadRequest(
+                    "knowledge source has no actively managed entries to refresh".into(),
+                ));
+            }
+            let (files, mut errors) = self
+                .prepare_managed_source_items(&normalized.items)
+                .await?;
+            let publication = self
+                .publish_managed_source_items(&mut row, &normalized.source, files)
+                .await;
+            errors.extend(publication.errors);
+            if let Some(error) = publication.fatal_error {
+                return Err(error);
+            }
+            self.refresh_legacy_source_cache(&mut row, &mut source)
+                .await?;
+            let info = self.row_to_info(row).await?;
+            self.emitter.emit_base_updated(&info);
+            return Ok(RefreshSourceSummary {
+                fetched: publication.fetched,
+                failed: errors.len(),
+                errors,
+                last_fetched_at: source.last_fetched_at,
+            });
+        }
+
+        let (files, mut errors) =
+            self.prepare_source_snapshots(&mut source.entries).await;
+        let publication = self
+            .publish_prepared_url_source(
+                &mut row,
+                &mut source,
+                files,
+                true,
+            )
+            .await;
+        errors.extend(publication.errors);
+        if let Some(error) = publication.fatal_error {
+            return Err(error);
+        }
+        let fetched = publication.fetched;
+        let last_fetched_at = source.last_fetched_at;
+        let info = self.row_to_info(row).await?;
+        self.emitter.emit_base_updated(&info);
+        Ok(RefreshSourceSummary {
+            fetched,
+            failed: errors.len(),
+            errors,
+            last_fetched_at,
+        })
+    }
+
+    pub async fn refresh_entry_source(
+        &self,
+        kb_id: &str,
+        entry_id: &KnowledgeEntryId,
+        expected_revision: i64,
+    ) -> Result<KnowledgeEntrySourceActionResult, AppError> {
+        let mut row = self.require_base(kb_id).await?;
+        require_editable_knowledge_tree(&row)?;
+        self.ensure_projection_reconciled(&row).await?;
+        self.recover_pending_source_publications(&row).await?;
+        let resolved = self
+            .resolve_source_entry(&row, entry_id, expected_revision)
+            .await?;
+        if resolved.provenance.relationship != KnowledgeEntryProvenanceRelationship::Managed
+            || resolved.item.state != KnowledgeSourceState::Active
+        {
+            return Err(AppError::Conflict(
+                "only an actively managed web document can be refreshed".into(),
+            ));
+        }
+        let (files, mut errors) = self
+            .prepare_managed_source_items(std::slice::from_ref(&resolved.item))
+            .await?;
+        let publication = self
+            .publish_managed_source_items(&mut row, &resolved.source, files)
+            .await;
+        errors.extend(publication.errors);
+        if let Some(error) = publication.fatal_error {
+            return Err(error);
+        }
+        let mut source = source_from_extra(&row.extra)
+            .map_err(|error| knowledge_row_json_error(&row.knowledge_base_id, error))?
+            .ok_or_else(|| AppError::Internal("legacy source cache is missing".into()))?;
+        self.refresh_legacy_source_cache(&mut row, &mut source)
+            .await?;
+        let info = self.row_to_info(row.clone()).await?;
+        self.emitter.emit_base_updated(&info);
+        let entry = self.list_entry_by_id(kb_id, entry_id).await?;
+        let summary = RefreshSourceSummary {
+            fetched: publication.fetched,
+            failed: errors.len(),
+            errors,
+            last_fetched_at: source.last_fetched_at,
+        };
+        Ok(KnowledgeEntrySourceActionResult {
+            entry: Some(entry),
+            removed: false,
+            source_fetch: Some(summary),
+        })
+    }
+
+    pub async fn detach_entry_source(
+        &self,
+        kb_id: &str,
+        entry_id: &KnowledgeEntryId,
+        expected_revision: i64,
+    ) -> Result<KnowledgeEntrySourceActionResult, AppError> {
+        let row = self.require_base(kb_id).await?;
+        require_editable_knowledge_tree(&row)?;
+        self.ensure_projection_reconciled(&row).await?;
+        let _tree_guard = self.acquire_document_tree_write_lock(&row).await?;
+        let _base_guard = self.acquire_base_lifecycle_write_lock(&row).await?;
+        let mut current = self.require_base(kb_id).await?;
+        require_editable_knowledge_tree(&current)?;
+        let resolved = self
+            .resolve_source_entry(&current, entry_id, expected_revision)
+            .await?;
+        if resolved.provenance.relationship != KnowledgeEntryProvenanceRelationship::Managed {
+            return Err(AppError::Conflict(
+                "this web document is already detached from source management".into(),
+            ));
+        }
+        let root = PathBuf::from(&current.root_path);
+        let path = safe_md_path_bounded(root, resolved.entry.rel_path.clone()).await?;
+        let original = tokio::fs::read_to_string(&path).await.map_err(|error| {
+            AppError::Conflict(format!(
+                "failed to read managed document before detaching: {error}"
+            ))
+        })?;
+        let detached = rewrite_snapshot_relationship(
+            &original,
+            &resolved.item.knowledge_source_item_id,
+            "detached",
+        )?;
+        write_text_atomic_if_unchanged(&path, &original, &detached).await?;
+        let source_repository = self.source_repository().ok_or_else(|| {
+            AppError::Conflict("knowledge source identity validation is unavailable".into())
+        })?;
+        if let Err(error) = source_repository
+            .detach_managed_entry(
+                entry_id,
+                resolved.provenance.revision,
+                now_ms(),
+            )
+            .await
+        {
+            if let Err(restore_error) =
+                write_text_atomic_if_unchanged(&path, &detached, &original).await
+            {
+                return Err(AppError::Internal(format!(
+                    "source detach metadata failed ({error}); the document header could not be restored ({restore_error})"
+                )));
+            }
+            return Err(error.into());
+        }
+        self.invalidate_search_cache_path(&path);
+        self.mark_projection_dirty(&current);
+        let mut forced_ids = HashMap::new();
+        forced_ids.insert(
+            portable_writeback_path_identity(&resolved.entry.rel_path),
+            entry_id.clone(),
+        );
+        if let Err(error) = self
+            .reconcile_projection_locked(&current, forced_ids)
+            .await
+        {
+            tracing::warn!(
+                kb_id,
+                %entry_id,
+                %error,
+                "source detached but entry projection refresh is pending"
+            );
+        }
+        current.updated_at = now_ms();
+        if let Err(error) = self.repo.update_base(&current).await {
+            tracing::warn!(kb_id, %error, "source detached but base timestamp update failed");
+        }
+        drop(_base_guard);
+        drop(_tree_guard);
+        let mut source = source_from_extra(&current.extra)
+            .map_err(|error| knowledge_row_json_error(&current.knowledge_base_id, error))?
+            .ok_or_else(|| AppError::Internal("legacy source cache is missing".into()))?;
+        self.refresh_legacy_source_cache(&mut current, &mut source)
+            .await?;
+        let info = self.row_to_info(current.clone()).await?;
+        self.emitter.emit_base_updated(&info);
+        let entry = self.list_entry_by_id(kb_id, entry_id).await?;
+        self.emitter.emit_entry_content_updated(
+            &KnowledgeEntryContentUpdatedEvent {
+                knowledge_base_id: KnowledgeBaseId::parse(kb_id).map_err(|error| {
+                    AppError::Internal(format!("invalid knowledge base id after detach: {error}"))
+                })?,
+                entry_id: entry_id.clone(),
+                rel_path: entry.rel_path.clone(),
+                revision: entry.revision,
+            },
+        );
+        Ok(KnowledgeEntrySourceActionResult {
+            entry: Some(entry),
+            removed: false,
+            source_fetch: None,
+        })
+    }
+
+    pub async fn copy_entry_as_editable(
+        &self,
+        kb_id: &str,
+        entry_id: &KnowledgeEntryId,
+        expected_revision: i64,
+        destination_parent_path: &str,
+        destination_parent_id: Option<KnowledgeEntryId>,
+        new_name: Option<&str>,
+    ) -> Result<KnowledgeEntrySourceActionResult, AppError> {
+        let row = self.require_base(kb_id).await?;
+        require_editable_knowledge_tree(&row)?;
+        self.ensure_projection_reconciled(&row).await?;
+        let _tree_guard = self.acquire_document_tree_write_lock(&row).await?;
+        let _base_guard = self.acquire_base_lifecycle_write_lock(&row).await?;
+        let mut current = self.require_base(kb_id).await?;
+        require_editable_knowledge_tree(&current)?;
+        let resolved = self
+            .resolve_source_entry(&current, entry_id, expected_revision)
+            .await?;
+        let knowledge_base_id = KnowledgeBaseId::parse(&current.knowledge_base_id).map_err(
+            |error| {
+                AppError::Internal(format!(
+                    "stored knowledge base id '{}' is invalid: {error}",
+                    current.knowledge_base_id
+                ))
+            },
+        )?;
+        let entry_repository = self.entry_repository().ok_or_else(|| {
+            AppError::Conflict("stable knowledge entry validation is unavailable".into())
+        })?;
+        let requested_parent = normalize_tree_rel_path(destination_parent_path)?;
+        let parent_path = match destination_parent_id {
+            Some(parent_id) => {
+                let parent = entry_repository
+                    .get_entry(&knowledge_base_id, &parent_id)
+                    .await?
+                    .filter(|entry| !entry.is_deleted())
+                    .ok_or_else(|| {
+                        AppError::Conflict("copy destination moved or disappeared".into())
+                    })?;
+                if !parent.is_directory() {
+                    return Err(AppError::BadRequest(
+                        "copy destination must be a directory".into(),
+                    ));
+                }
+                parent.rel_path
+            }
+            None if requested_parent.is_empty() => {
+                tree_parent_rel_path(&resolved.entry.rel_path).to_owned()
+            }
+            None => {
+                let parent = entry_repository
+                    .get_entry_by_path(
+                        &knowledge_base_id,
+                        &portable_writeback_path_identity(&requested_parent),
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::NotFound(format!(
+                            "copy destination not found: {requested_parent}"
+                        ))
+                    })?;
+                if !parent.is_directory() {
+                    return Err(AppError::BadRequest(
+                        "copy destination must be a directory".into(),
+                    ));
+                }
+                parent.rel_path
+            }
+        };
+        let original_name = resolved.entry.name.as_str();
+        let default_name = format!(
+            "{} copy.md",
+            original_name.strip_suffix(".md").unwrap_or(original_name)
+        );
+        let preferred_name = new_name.unwrap_or(&default_name);
+        let root = PathBuf::from(&current.root_path);
+        let allocation_root = root.clone();
+        let allocation_parent = parent_path.clone();
+        let allocation_name = preferred_name.to_owned();
+        let target_rel_path = tokio::task::spawn_blocking(move || {
+            allocate_copy_rel_path(
+                &allocation_root,
+                &allocation_parent,
+                &allocation_name,
+            )
+        })
+        .await
+        .map_err(|error| {
+            AppError::Internal(format!("editable-copy allocation task failed: {error}"))
+        })??;
+        let source_path = safe_md_path_bounded(root.clone(), resolved.entry.rel_path.clone()).await?;
+        let original = tokio::fs::read_to_string(&source_path).await.map_err(|error| {
+            AppError::Conflict(format!(
+                "failed to read source document before copying: {error}"
+            ))
+        })?;
+        let copy_content = rewrite_snapshot_relationship(
+            &original,
+            &resolved.item.knowledge_source_item_id,
+            "copy",
+        )?;
+        let target_path = safe_md_path_bounded(root.clone(), target_rel_path.clone()).await?;
+        write_text_atomic_if_absent(&target_path, &copy_content).await?;
+        self.invalidate_search_cache_path(&target_path);
+        self.mark_projection_dirty(&current);
+        let projection = self
+            .reconcile_projection_locked(&current, HashMap::new())
+            .await?
+            .ok_or_else(|| {
+                AppError::Internal(
+                    "knowledge entry identity projection is unavailable after copy".into(),
+                )
+            })?;
+        let portable_target = portable_writeback_path_identity(&target_rel_path);
+        let copied_entry = projection
+            .entries
+            .iter()
+            .find(|entry| entry.portable_rel_path == portable_target)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::Internal("editable copy has no stable entry identity".into())
+            })?;
+        let source_repository = self.source_repository().ok_or_else(|| {
+            AppError::Conflict("knowledge source identity validation is unavailable".into())
+        })?;
+        if let Err(error) = source_repository
+            .record_entry_copy(&RecordKnowledgeEntryCopyParams {
+                knowledge_entry_id: copied_entry.knowledge_entry_id.clone(),
+                knowledge_source_item_id: resolved.item.knowledge_source_item_id,
+                derived_from_entry_id: entry_id.clone(),
+                created_at: now_ms(),
+            })
+            .await
+        {
+            if let Err(remove_error) = tokio::fs::remove_file(&target_path).await {
+                return Err(AppError::Internal(format!(
+                    "copy provenance persistence failed ({error}); copied file rollback failed ({remove_error})"
+                )));
+            }
+            self.mark_projection_dirty(&current);
+            let _ = self
+                .reconcile_projection_locked(&current, HashMap::new())
+                .await;
+            return Err(error.into());
+        }
+        current.updated_at = now_ms();
+        if let Err(error) = self.repo.update_base(&current).await {
+            tracing::warn!(kb_id, %error, "editable copy created but base timestamp update failed");
+        }
+        let copied_entry_id = copied_entry.knowledge_entry_id;
+        drop(_base_guard);
+        drop(_tree_guard);
+        let info = self.row_to_info(current).await?;
+        self.emitter.emit_base_updated(&info);
+        let entry = self.list_entry_by_id(kb_id, &copied_entry_id).await?;
+        Ok(KnowledgeEntrySourceActionResult {
+            entry: Some(entry),
+            removed: false,
+            source_fetch: None,
+        })
+    }
+
+    pub async fn remove_entry_source(
+        &self,
+        kb_id: &str,
+        entry_id: &KnowledgeEntryId,
+        expected_revision: i64,
+    ) -> Result<KnowledgeEntrySourceActionResult, AppError> {
+        let row = self.require_base(kb_id).await?;
+        require_editable_knowledge_tree(&row)?;
+        self.ensure_projection_reconciled(&row).await?;
+        let _tree_guard = self.acquire_document_tree_write_lock(&row).await?;
+        let _base_guard = self.acquire_base_lifecycle_write_lock(&row).await?;
+        let mut current = self.require_base(kb_id).await?;
+        require_editable_knowledge_tree(&current)?;
+        let resolved = self
+            .resolve_source_entry(&current, entry_id, expected_revision)
+            .await?;
+        if resolved.provenance.relationship != KnowledgeEntryProvenanceRelationship::Managed {
+            return Err(AppError::Conflict(
+                "only an actively managed document can be removed with its web source".into(),
+            ));
+        }
+        if resolved.item.sync_status == KnowledgeSourceItemSyncStatus::Syncing {
+            return Err(AppError::Conflict(
+                "the web source is currently refreshing; wait for it to finish before removing it"
+                    .into(),
+            ));
+        }
+        let root = PathBuf::from(&current.root_path);
+        let source_path = safe_md_path_bounded(root.clone(), resolved.entry.rel_path.clone()).await?;
+        let allocation_root = root.clone();
+        let original_name = resolved.entry.name.clone();
+        let source_item_id = resolved.item.knowledge_source_item_id.clone();
+        let trash_path = tokio::task::spawn_blocking(move || {
+            allocate_source_trash_path(&allocation_root, &source_item_id, &original_name)
+        })
+        .await
+        .map_err(|error| {
+            AppError::Internal(format!("source trash allocation task failed: {error}"))
+        })??;
+        let rename_source = source_path.clone();
+        let rename_trash = trash_path.clone();
+        tokio::task::spawn_blocking(move || {
+            rename_path_no_replace(&rename_source, &rename_trash).map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to move managed document into recoverable trash: {error}"
+                ))
+            })
+        })
+        .await
+        .map_err(|error| AppError::Internal(format!("source trash task failed: {error}")))??;
+
+        let source_repository = self.source_repository().ok_or_else(|| {
+            AppError::Conflict("knowledge source identity validation is unavailable".into())
+        })?;
+        if let Err(error) = source_repository
+            .remove_managed_source_item(
+                entry_id,
+                resolved.provenance.revision,
+                resolved.item.revision,
+                now_ms(),
+            )
+            .await
+        {
+            let restore_source = source_path.clone();
+            let restore_trash = trash_path.clone();
+            let restore = tokio::task::spawn_blocking(move || {
+                rename_path_no_replace(&restore_trash, &restore_source)
+            })
+            .await;
+            match restore {
+                Ok(Ok(())) => return Err(error.into()),
+                Ok(Err(restore_error)) => {
+                    return Err(AppError::Internal(format!(
+                        "source removal metadata failed ({error}); trashed document could not be restored ({restore_error})"
+                    )));
+                }
+                Err(restore_error) => {
+                    return Err(AppError::Internal(format!(
+                        "source removal metadata failed ({error}); restore task failed ({restore_error})"
+                    )));
+                }
+            }
+        }
+        let remaining_items = source_repository
+            .list_source_items(&resolved.source.knowledge_source_id, false)
+            .await?;
+        let source_removed = remaining_items.is_empty();
+        if source_removed {
+            if let Err(error) = source_repository
+                .update_source(&UpdateKnowledgeSourceParams {
+                    knowledge_source_id: resolved.source.knowledge_source_id.clone(),
+                    expected_revision: resolved.source.revision,
+                    mode: resolved.source.mode,
+                    state: KnowledgeSourceState::Removed,
+                    default_parent_entry_id: None,
+                    removed_at: Some(now_ms()),
+                    updated_at: now_ms(),
+                })
+                .await
+            {
+                tracing::warn!(
+                    source_id = %resolved.source.knowledge_source_id,
+                    %error,
+                    "last source item was removed but aggregate tombstoning is pending"
+                );
+            }
+            let mut extra: serde_json::Value = serde_json::from_str(&current.extra).map_err(
+                |error| {
+                    AppError::Internal(format!(
+                        "knowledge base {} has invalid extra JSON: {error}",
+                        current.knowledge_base_id
+                    ))
+                },
+            )?;
+            if let Some(object) = extra.as_object_mut() {
+                object.remove("source");
+            }
+            current.extra = extra.to_string();
+        }
+        self.invalidate_search_cache_path(&source_path);
+        self.mark_projection_dirty(&current);
+        if let Err(error) = self
+            .reconcile_projection_locked(&current, HashMap::new())
+            .await
+        {
+            tracing::warn!(
+                kb_id,
+                %entry_id,
+                %error,
+                "source document removed but entry projection cleanup is pending"
+            );
+        }
+        current.updated_at = now_ms();
+        if let Err(error) = self.repo.update_base(&current).await {
+            tracing::warn!(kb_id, %error, "source removed but base timestamp update failed");
+        }
+        drop(_base_guard);
+        drop(_tree_guard);
+        if !source_removed {
+            let mut source = source_from_extra(&current.extra)
+                .map_err(|error| knowledge_row_json_error(&current.knowledge_base_id, error))?
+                .ok_or_else(|| AppError::Internal("legacy source cache is missing".into()))?;
+            self.refresh_legacy_source_cache(&mut current, &mut source)
+                .await?;
+        }
+        let info = self.row_to_info(current).await?;
+        self.emitter.emit_base_updated(&info);
+        Ok(KnowledgeEntrySourceActionResult {
+            entry: None,
+            removed: true,
+            source_fetch: None,
+        })
+    }
+
+    /// Append URL entries to an existing base and snapshot only the newly
+    /// accepted entries. The source mutation and file publication share the
+    /// same optimistic source-state boundary as a regular refresh, so a
+    /// concurrent source edit wins with a retryable conflict instead of being
+    /// overwritten by stale UI state.
+    pub async fn append_url_entries(
+        &self,
+        kb_id: &str,
+        entries: Vec<KnowledgeSourceEntry>,
+    ) -> Result<AppendUrlSourceSummary, AppError> {
+        self.append_url_entries_into(kb_id, entries, "", None)
+            .await
+    }
+
+    pub async fn append_url_entries_into(
+        &self,
+        kb_id: &str,
+        entries: Vec<KnowledgeSourceEntry>,
+        destination_parent_path: &str,
+        destination_parent_id: Option<KnowledgeEntryId>,
+    ) -> Result<AppendUrlSourceSummary, AppError> {
+        if entries.is_empty() {
+            return Err(AppError::BadRequest(
+                "at least one URL entry is required".into(),
+            ));
+        }
+        if entries.len() > MAX_SOURCE_ENTRIES {
+            return Err(AppError::BadRequest(format!(
+                "URL entry batch exceeds the limit of {MAX_SOURCE_ENTRIES}"
+            )));
+        }
+
+        let mut row = self.require_base(kb_id).await?;
+        require_editable_knowledge_tree(&row)?;
+        let stored_source = source_from_extra(&row.extra)
+            .map_err(|error| knowledge_row_json_error(&row.knowledge_base_id, error))?;
+        let mut source = match stored_source {
+            Some(source) => {
+                validate_source(&source)?;
+                source
+            }
+            None => KnowledgeSource {
+                source_id: None,
+                kind: "url".into(),
+                mode: KnowledgeSourceMode::Snapshot,
+                revision: 0,
+                default_parent_entry_id: None,
+                entries: Vec::new(),
+                last_fetched_at: None,
+            },
+        };
+
+        let destination_parent_path = normalize_tree_rel_path(destination_parent_path)?;
+        let resolved_destination_parent_id = if destination_parent_path.is_empty()
+            && destination_parent_id.is_none()
+        {
+            None
+        } else {
+            self.ensure_projection_reconciled(&row).await?;
+            let repository = self.entry_repository().ok_or_else(|| {
+                AppError::Conflict(
+                    "stable knowledge entry validation is unavailable for the selected web-capture destination"
+                        .into(),
+                )
+            })?;
+            let knowledge_base_id = KnowledgeBaseId::parse(&row.knowledge_base_id).map_err(
+                |error| {
+                    AppError::Internal(format!(
+                        "stored knowledge base id '{}' is invalid: {error}",
+                        row.knowledge_base_id
+                    ))
+                },
+            )?;
+            let entry = match destination_parent_id {
+                Some(entry_id) => repository
+                    .get_entry(&knowledge_base_id, &entry_id)
+                    .await?
+                    .filter(|entry| !entry.is_deleted())
+                    .ok_or_else(|| {
+                        AppError::Conflict(
+                            "the selected web-capture destination moved or disappeared".into(),
+                        )
+                    })?,
+                None => repository
+                    .get_entry_by_path(
+                        &knowledge_base_id,
+                        &portable_writeback_path_identity(&destination_parent_path),
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::NotFound(format!(
+                            "web-capture destination not found: {destination_parent_path}"
+                        ))
+                    })?,
+            };
+            if !entry.is_directory() {
+                return Err(AppError::BadRequest(
+                    "web-capture destination must be a directory".into(),
+                ));
+            }
+            Some(entry.knowledge_entry_id)
+        };
+        // `append_url_entries_into` always carries a placement decision. An
+        // empty destination explicitly resets a stale/deleted default to the
+        // root/default capture folder.
+        source.default_parent_entry_id = resolved_destination_parent_id;
+
+        let mut identities = HashSet::new();
+        for entry in &source.entries {
+            identities.insert(normalize_source_url(&entry.url).map_err(|error| {
+                AppError::Internal(format!(
+                    "stored knowledge source URL is invalid ({}): {error}",
+                    entry.url
+                ))
+            })?);
+        }
+
+        let mut accepted = Vec::new();
+        let mut duplicates = 0usize;
+        for mut entry in entries {
+            entry.source_item_id = None;
+            entry.snapshot_entry_id = None;
+            entry.sync_status = KnowledgeSourceSyncStatus::Pending;
+            entry.last_success_at = None;
+            entry.last_error = None;
+            entry.url = entry.url.trim().to_owned();
+            entry.title = entry
+                .title
+                .take()
+                .map(|title| title.trim().to_owned())
+                .filter(|title| !title.is_empty());
+            let parsed = Url::parse(&entry.url).map_err(|error| {
+                AppError::BadRequest(format!(
+                    "invalid source URL {}: {error}",
+                    entry.url
+                ))
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(AppError::BadRequest(format!(
+                    "only http(s) source URLs are supported: {}",
+                    entry.url
+                )));
+            }
+            let normalized_url = normalize_source_url(&entry.url)?;
+            if !identities.insert(normalized_url) {
+                duplicates += 1;
+                continue;
+            }
+            // A present fresh ID distinguishes an explicit re-add from stale
+            // legacy extra that still names a removed tombstone.
+            entry.source_item_id = Some(KnowledgeSourceItemId::new());
+            accepted.push(entry);
+        }
+
+        if accepted.is_empty() {
+            return Ok(AppendUrlSourceSummary {
+                added: 0,
+                duplicates,
+                fetched: 0,
+                failed: 0,
+                errors: Vec::new(),
+                last_fetched_at: source.last_fetched_at,
+                first_file: None,
+            });
+        }
+        let active_source_entries = source
+            .entries
+            .iter()
+            .filter(|entry| entry.sync_status != KnowledgeSourceSyncStatus::Paused)
+            .count();
+        if active_source_entries + accepted.len() > MAX_SOURCE_ENTRIES {
+            return Err(AppError::BadRequest(format!(
+                "knowledge base URL sources are limited to {MAX_SOURCE_ENTRIES}; {} already configured, {} new after deduplication",
+                active_source_entries,
+                accepted.len()
+            )));
+        }
+
+        let start_index = source.entries.len();
+        let added = accepted.len();
+        let accepted_urls = accepted
+            .iter()
+            .map(|entry| normalize_source_url(&entry.url))
+            .collect::<Result<HashSet<_>, _>>()?;
+        source.entries.extend(accepted);
+        validate_source(&source)?;
+
+        if self.source_repository().is_some() && self.entry_repository().is_some() {
+            // Persist configuration before network work. A failed fetch remains
+            // a visible, retryable source item instead of disappearing from
+            // the product after the request returns.
+            self.persist_source(&mut row, &source).await?;
+            let mut normalized = self
+                .ensure_normalized_source(&row)
+                .await?
+                .ok_or_else(|| {
+                    AppError::Internal(
+                        "knowledge source normalization did not produce an aggregate".into(),
+                    )
+                })?;
+            if normalized.source.default_parent_entry_id
+                != source.default_parent_entry_id
+            {
+                let repository = self.source_repository().ok_or_else(|| {
+                    AppError::Internal(
+                        "knowledge source identity repository is unavailable".into(),
+                    )
+                })?;
+                normalized.source = repository
+                    .update_source(&UpdateKnowledgeSourceParams {
+                        knowledge_source_id: normalized.source.knowledge_source_id.clone(),
+                        expected_revision: normalized.source.revision,
+                        mode: normalized.source.mode,
+                        state: normalized.source.state,
+                        default_parent_entry_id: source.default_parent_entry_id.clone(),
+                        removed_at: normalized.source.removed_at,
+                        updated_at: now_ms(),
+                    })
+                    .await?;
+            }
+            let new_items = normalized
+                .items
+                .iter()
+                .filter(|item| accepted_urls.contains(&item.normalized_url))
+                .cloned()
+                .collect::<Vec<_>>();
+            let (files, mut errors) = self.prepare_managed_source_items(&new_items).await?;
+            let publication = self
+                .publish_managed_source_items(&mut row, &normalized.source, files)
+                .await;
+            errors.extend(publication.errors);
+            if let Some(error) = publication.fatal_error {
+                return Err(error);
+            }
+            self.refresh_legacy_source_cache(&mut row, &mut source)
+                .await?;
+            let info = self.row_to_info(row).await?;
+            self.emitter.emit_base_updated(&info);
+            return Ok(AppendUrlSourceSummary {
+                added,
+                duplicates,
+                fetched: publication.fetched,
+                failed: errors.len(),
+                errors,
+                last_fetched_at: source.last_fetched_at,
+                first_file: publication.published_paths.into_iter().next(),
+            });
+        }
+
+        let (files, mut errors) = self
+            .prepare_source_snapshots_from(&mut source.entries, start_index)
+            .await;
+        let publication = self
+            .publish_prepared_url_source(&mut row, &mut source, files, false)
+            .await;
+        errors.extend(publication.errors);
+        if let Some(error) = publication.fatal_error {
+            return Err(error);
+        }
+
+        let info = self.row_to_info(row).await?;
+        self.emitter.emit_base_updated(&info);
+        Ok(AppendUrlSourceSummary {
+            added,
+            duplicates,
+            fetched: publication.fetched,
+            failed: errors.len(),
+            errors,
+            last_fetched_at: source.last_fetched_at,
+            first_file: publication.published_paths.into_iter().next(),
+        })
+    }
+
+    /// Fetch every entry and prepare `{root}/snapshots/{slug}.md`
+    /// (metadata header + markdown body) entirely in memory. Per-entry failures
+    /// are collected, never fatal.
+    /// Pages larger than the compression threshold are condensed via the
+    /// completer when one is wired (raw-but-truncated otherwise). Entries
+    /// without a title are backfilled from the page `<title>`.
+    ///
+    /// The network/LLM work runs concurrently ([`SOURCE_FETCH_CONCURRENCY`]
+    /// at a time); slug assignment and title backfill then happen serially in
+    /// entry order, so duplicate-slug numbering and error aggregation stay
+    /// deterministic regardless of completion order.
+    async fn prepare_source_snapshots(
+        &self,
+        entries: &mut [KnowledgeSourceEntry],
+    ) -> (Vec<PreparedSourceFile>, Vec<String>) {
+        self.prepare_source_snapshots_from(entries, 0).await
+    }
+
+    /// Prepare only entries at and after `start_index`, while allocating
+    /// snapshot paths against the complete source list. This lets append
+    /// operations fetch only new URLs without changing any existing slug or
+    /// risking a same-slug overwrite.
+    async fn prepare_source_snapshots_from(
+        &self,
+        entries: &mut [KnowledgeSourceEntry],
+        start_index: usize,
+    ) -> (Vec<PreparedSourceFile>, Vec<String>) {
+        let completer = self.completer();
+        let start_index = start_index.min(entries.len());
+        let snapshot_paths = source_snapshot_rel_paths(entries);
+
+        // Phase 1 — fetch (and condense oversized pages) concurrently,
+        // re-indexed by entry position. The futures own their URL (and are
+        // collected eagerly) so the stream type stays free of per-entry
+        // borrows — axum handlers need the whole call graph to be Send.
+        let fetches: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .skip(start_index)
+            .map(|(idx, entry)| {
+                let url = entry.url.clone();
+                let rendered = entry.rendered;
+                let completer = completer.clone();
+                async move { (idx, self.prepare_snapshot_body(&url, rendered, completer.as_deref()).await) }
+            })
+            .collect();
+        let results = stream::iter(fetches)
+            .buffer_unordered(SOURCE_FETCH_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        let mut prepared: Vec<Option<Result<PreparedSnapshot, String>>> =
+            std::iter::repeat_with(|| None).take(entries.len()).collect();
+        for (idx, result) in results {
+            prepared[idx] = Some(result);
+        }
+
+        // Phase 2 — serial, in entry order. Slugs were reserved for every
+        // configured entry before any fetch completed, so a temporary failure
+        // cannot make later duplicate-slug paths shift between refreshes.
+        let mut files = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        for idx in start_index..entries.len() {
+            let entry = &mut entries[idx];
+            let page = match prepared[idx]
+                .take()
+                .expect("every selected entry yields exactly one fetch result")
+            {
+                Ok(page) => page,
+                Err(line) => {
+                    errors.push(line);
+                    continue;
+                }
+            };
+
+            if entry.title.as_deref().map(str::trim).filter(|t| !t.is_empty()).is_none()
+                && let Some(title) = &page.title
+            {
+                entry.title = Some(title.clone());
+            }
+
+            let fetched_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+            let content = source_url::snapshot_markdown(&entry.url, &fetched_at, entry.title.as_deref(), &page.body);
+            files.push(PreparedSourceFile {
+                rel_path: snapshot_paths[idx].clone(),
+                source_label: entry.url.clone(),
+                content,
+            });
+        }
+        (files, errors)
+    }
+
+    async fn prepare_managed_source_items(
+        &self,
+        items: &[KnowledgeSourceItemRow],
+    ) -> Result<(Vec<PreparedManagedSourceFile>, Vec<String>), AppError> {
+        let repository = self.source_repository().ok_or_else(|| {
+            AppError::Internal("knowledge source identity repository is unavailable".into())
+        })?;
+        let completer = self.completer();
+        let mut attempted_items = Vec::new();
+        for item in items
+            .iter()
+            .filter(|item| item.state == KnowledgeSourceState::Active)
+        {
+            attempted_items.push(
+                repository
+                    .record_sync_attempt(
+                        &item.knowledge_source_item_id,
+                        item.revision,
+                        now_ms(),
+                    )
+                    .await?,
+            );
+        }
+
+        let fetches = attempted_items.into_iter().map(|item| {
+            let completer = completer.clone();
+            async move {
+                let result = self
+                    .prepare_snapshot_body(
+                        &item.requested_url,
+                        item.rendered,
+                        completer.as_deref(),
+                    )
+                    .await;
+                (item, result)
+            }
+        });
+        let results = stream::iter(fetches)
+            .buffer_unordered(SOURCE_FETCH_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        let mut prepared = Vec::new();
+        let mut errors = Vec::new();
+        for (item, result) in results {
+            match result {
+                Ok(page) => {
+                    let title = item.title.clone().or(page.title);
+                    let fetched_at = chrono::Utc::now()
+                        .format("%Y-%m-%dT%H:%M:%SZ")
+                        .to_string();
+                    let content = source_url::managed_snapshot_markdown(
+                        &item.knowledge_source_item_id,
+                        &item.requested_url,
+                        Some(&page.final_url),
+                        &fetched_at,
+                        title.as_deref(),
+                        page.truncated,
+                        &page.body,
+                    );
+                    let content_hash = sha256_text(&content);
+                    let staged_item = repository
+                        .stage_sync_publication(&StageKnowledgeSourcePublicationParams {
+                            knowledge_source_item_id: item
+                                .knowledge_source_item_id
+                                .clone(),
+                            expected_revision: item.revision,
+                            pending_published_hash: content_hash.clone(),
+                            pending_final_url: Some(page.final_url.clone()),
+                            pending_title: title.clone(),
+                            staged_at: now_ms(),
+                        })
+                        .await?;
+                    prepared.push(PreparedManagedSourceFile {
+                        item: staged_item,
+                        content,
+                        final_url: page.final_url,
+                        title,
+                        content_hash,
+                    });
+                }
+                Err(error) => {
+                    repository
+                        .record_sync_failure(&RecordKnowledgeSourceSyncFailureParams {
+                            knowledge_source_item_id: item.knowledge_source_item_id.clone(),
+                            expected_revision: item.revision,
+                            status: KnowledgeSourceItemSyncStatus::Failed,
+                            error: error.clone(),
+                            failed_at: now_ms(),
+                        })
+                        .await?;
+                    errors.push(error);
+                }
+            }
+        }
+        prepared.sort_by(|left, right| left.item.ordinal.cmp(&right.item.ordinal));
+        Ok((prepared, errors))
+    }
+
+    async fn recover_pending_source_publications(
+        &self,
+        row: &KnowledgeBaseRow,
+    ) -> Result<usize, AppError> {
+        let (Some(source_repository), Some(entry_repository)) =
+            (self.source_repository(), self.entry_repository())
+        else {
+            return Ok(0);
+        };
+        let _tree_guard = self.acquire_document_tree_write_lock(row).await?;
+        let _base_guard = self.acquire_base_lifecycle_write_lock(row).await?;
+        let current = self.require_base(&row.knowledge_base_id).await?;
+        if current.root_path != row.root_path {
+            return Err(AppError::Conflict(
+                "knowledge base root changed while source publication was recovering; retry"
+                    .into(),
+            ));
+        }
+        self.reconcile_projection_locked(&current, HashMap::new())
+            .await?;
+        let knowledge_base_id = KnowledgeBaseId::parse(&current.knowledge_base_id).map_err(
+            |error| {
+                AppError::Internal(format!(
+                    "stored knowledge base id '{}' is invalid: {error}",
+                    current.knowledge_base_id
+                ))
+            },
+        )?;
+        let root = PathBuf::from(&current.root_path);
+        let mut recovered = 0usize;
+        for source in source_repository
+            .list_sources_for_base(&knowledge_base_id, false)
+            .await?
+            .into_iter()
+            .filter(|source| source.state == KnowledgeSourceState::Active)
+        {
+            for item in source_repository
+                .list_source_items(&source.knowledge_source_id, false)
+                .await?
+                .into_iter()
+                .filter(|item| {
+                    item.state == KnowledgeSourceState::Active
+                        && item.sync_status == KnowledgeSourceItemSyncStatus::Syncing
+                        && item.pending_published_hash.is_some()
+                })
+            {
+                let pending_hash = item
+                    .pending_published_hash
+                    .as_deref()
+                    .expect("filtered above");
+                let entry = match source_repository
+                    .get_managed_entry_provenance(&item.knowledge_source_item_id)
+                    .await?
+                {
+                    Some(provenance) => entry_repository
+                        .get_entry(&knowledge_base_id, &provenance.knowledge_entry_id)
+                        .await?
+                        .filter(|entry| !entry.is_deleted()),
+                    None => None,
+                };
+                let current_content = if let Some(entry) = entry.as_ref() {
+                    let path = safe_md_path_bounded(root.clone(), entry.rel_path.clone()).await?;
+                    match tokio::fs::metadata(&path).await {
+                        Ok(metadata) if metadata.len() <= MAX_FOLDER_IMPORT_FILE_BYTES => {
+                            tokio::fs::read_to_string(&path).await.ok()
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let current_hash = current_content.as_deref().map(sha256_text);
+                if current_hash.as_deref() == Some(pending_hash) {
+                    let completed = source_repository
+                        .record_sync_success(&RecordKnowledgeSourceSyncSuccessParams {
+                            knowledge_source_item_id: item
+                                .knowledge_source_item_id
+                                .clone(),
+                            expected_revision: item.revision,
+                            final_url: item.pending_final_url.clone(),
+                            title: item.pending_title.clone(),
+                            etag: item.etag.clone(),
+                            http_last_modified: item.http_last_modified.clone(),
+                            last_published_hash: pending_hash.to_owned(),
+                            succeeded_at: now_ms(),
+                        })
+                        .await?;
+                    if let Some(entry) = entry {
+                        self.invalidate_search_cache_path(&root.join(&entry.rel_path));
+                        self.emitter.emit_entry_content_updated(
+                            &KnowledgeEntryContentUpdatedEvent {
+                                knowledge_base_id: knowledge_base_id.clone(),
+                                entry_id: entry.knowledge_entry_id,
+                                rel_path: entry.rel_path,
+                                revision: Some(entry.revision),
+                            },
+                        );
+                    }
+                    debug_assert_eq!(
+                        completed.last_published_hash.as_deref(),
+                        Some(pending_hash)
+                    );
+                    recovered += 1;
+                    continue;
+                }
+
+                let (status, error) = if current_hash.is_none()
+                    || current_hash.as_deref() == item.last_published_hash.as_deref()
+                {
+                    (
+                        KnowledgeSourceItemSyncStatus::Failed,
+                        "source refresh was interrupted before filesystem publication; retry",
+                    )
+                } else {
+                    (
+                        KnowledgeSourceItemSyncStatus::Conflicted,
+                        "managed document changed after a staged refresh; recovery preserved it for review",
+                    )
+                };
+                source_repository
+                    .record_sync_failure(&RecordKnowledgeSourceSyncFailureParams {
+                        knowledge_source_item_id: item.knowledge_source_item_id,
+                        expected_revision: item.revision,
+                        status,
+                        error: error.into(),
+                        failed_at: now_ms(),
+                    })
+                    .await?;
+            }
+        }
+        Ok(recovered)
+    }
+
+    async fn fail_prepared_source_attempts(
+        &self,
+        files: &[PreparedManagedSourceFile],
+        message: &str,
+    ) {
+        let Some(repository) = self.source_repository() else {
+            return;
+        };
+        for file in files {
+            if let Err(error) = repository
+                .record_sync_failure(&RecordKnowledgeSourceSyncFailureParams {
+                    knowledge_source_item_id: file.item.knowledge_source_item_id.clone(),
+                    expected_revision: file.item.revision,
+                    status: KnowledgeSourceItemSyncStatus::Failed,
+                    error: message.to_owned(),
+                    failed_at: now_ms(),
+                })
+                .await
+            {
+                tracing::debug!(
+                    source_item_id = %file.item.knowledge_source_item_id,
+                    %error,
+                    "source attempt changed before publication failure could be recorded"
+                );
+            }
+        }
+    }
+
+    /// Fetch one source URL and condense/truncate the body to snapshot size.
+    /// Errors come back as the ready-to-aggregate `"{url}: {error}"` line.
+    ///
+    /// **P3-K3 backend selection**: when `rendered` is set AND a rendering
+    /// backend is wired ([`Self::render_fetcher`], the engine-backed
+    /// `BrowserFetcher`), the URL is fetched through the real browser so JS-heavy
+    /// pages yield their post-render content. Otherwise — `rendered == false`, or
+    /// `rendered == true` but no browser backend is available (`browser-use`
+    /// feature off / not injected) — it gracefully falls back to the default HTTP
+    /// [`Self::fetcher`] (no error: a missing browser backend degrades to HTTP,
+    /// never blocks the snapshot). See [`Self::fetcher_for`].
+    async fn prepare_snapshot_body(
+        &self,
+        url: &str,
+        rendered: bool,
+        completer: Option<&dyn KnowledgeCompleter>,
+    ) -> Result<PreparedSnapshot, String> {
+        let fetcher = self.fetcher_for(rendered);
+        let page = fetcher.fetch_page(url).await.map_err(|e| {
+            tracing::warn!(url, rendered, error = %e, "knowledge source fetch failed");
+            format!("{url}: {e}")
+        })?;
+
+        let final_url = normalize_source_url(&page.final_url).map_err(|error| {
+            format!("{url}: fetcher returned an invalid final URL: {error}")
+        })?;
+        let body = condense_snapshot_body(page.markdown, completer).await;
+        Ok(PreparedSnapshot {
+            title: page.title,
+            final_url,
+            truncated: page.truncated,
+            body,
+        })
+    }
+
+    /// Re-read the registration at a source publication boundary and verify
+    /// that neither its physical root nor its source configuration changed
+    /// during the preceding network/LLM work. The caller must hold the base
+    /// lifecycle writer while using the returned row.
+    async fn current_source_publication_row(
+        &self,
+        expected_row: &KnowledgeBaseRow,
+    ) -> Result<KnowledgeBaseRow, AppError> {
+        let expected_source = source_from_extra(&expected_row.extra)
+            .map_err(|error| {
+                knowledge_row_json_error(&expected_row.knowledge_base_id, error)
+            })?;
+        let registered =
+            self.require_base(&expected_row.knowledge_base_id).await?;
+        if registered.root_path != expected_row.root_path {
+            return Err(AppError::Conflict(
+                "knowledge base root changed while source state was being persisted; retry"
+                    .into(),
+            ));
+        }
+        let current_source = source_from_extra(&registered.extra)
+            .map_err(|error| {
+                knowledge_row_json_error(
+                    &registered.knowledge_base_id,
+                    error,
+                )
+            })?;
+        let expected_value =
+            serde_json::to_value(&expected_source).map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to compare prior knowledge source state: {error}"
+                ))
+            })?;
+        let current_value =
+            serde_json::to_value(&current_source).map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to compare current knowledge source state: {error}"
+                ))
+            })?;
+        if current_value != expected_value {
+            return Err(AppError::Conflict(
+                "knowledge source configuration changed while refresh/sync was running; the newer configuration was preserved"
+                    .into(),
+            ));
+        }
+        Ok(registered)
+    }
+
+    /// Update only `extra.source` on an already re-read row. The caller owns
+    /// the lifecycle writer, so this DB update and any preceding snapshot
+    /// publication form one in-process source commit boundary.
+    async fn persist_source_in_current_row(
+        &self,
+        row: &mut KnowledgeBaseRow,
+        source: &KnowledgeSource,
+    ) -> Result<(), AppError> {
+        let mut extra: serde_json::Value = serde_json::from_str(&row.extra).map_err(|error| {
+            AppError::Internal(format!(
+                "knowledge base {} has invalid extra JSON: {error}",
+                row.knowledge_base_id
+            ))
+        })?;
+        if !extra.is_object() {
+            return Err(AppError::Internal(format!(
+                "knowledge base {} extra must be a JSON object",
+                row.knowledge_base_id
+            )));
+        }
+        extra["source"] =
+            serde_json::to_value(source).map_err(|e| AppError::Internal(format!("source serialize failed: {e}")))?;
+        row.extra = extra.to_string();
+        row.updated_at = now_ms();
+        self.repo.update_base(row).await?;
+        Ok(())
+    }
+
+    /// Write `source` back into the row's `extra.source` and persist the row
+    /// (other `extra` keys are preserved).
+    async fn persist_source(
+        &self,
+        row: &mut KnowledgeBaseRow,
+        source: &KnowledgeSource,
+    ) -> Result<(), AppError> {
+        let registered = self.require_base(&row.knowledge_base_id).await?;
+        let _base_guard =
+            self.acquire_base_lifecycle_write_lock(&registered).await?;
+        let mut registered = self.current_source_publication_row(row).await?;
+        self.persist_source_in_current_row(&mut registered, source)
+            .await?;
+        *row = registered;
+        Ok(())
+    }
+
+    async fn refresh_legacy_source_cache(
+        &self,
+        row: &mut KnowledgeBaseRow,
+        source: &mut KnowledgeSource,
+    ) -> Result<(), AppError> {
+        let Some(repository) = self.source_repository() else {
+            return Ok(());
+        };
+        let normalized = self
+            .ensure_normalized_source(row)
+            .await?
+            .ok_or_else(|| AppError::Internal("normalized knowledge source is missing".into()))?;
+        let mut items = repository
+            .list_source_items(&normalized.source.knowledge_source_id, false)
+            .await?;
+        if items.is_empty() || normalized.source.state == KnowledgeSourceState::Removed {
+            return self.clear_legacy_source_cache(row).await;
+        }
+        items.sort_by(|left, right| {
+            left.ordinal
+                .cmp(&right.ordinal)
+                .then_with(|| left.knowledge_source_item_id.cmp(&right.knowledge_source_item_id))
+        });
+        let mut entries = Vec::with_capacity(items.len());
+        for item in items {
+            let snapshot_entry_id = repository
+                .get_managed_entry_provenance(&item.knowledge_source_item_id)
+                .await?
+                .map(|provenance| provenance.knowledge_entry_id);
+            entries.push(KnowledgeSourceEntry {
+                source_item_id: Some(item.knowledge_source_item_id),
+                url: item.requested_url,
+                title: item.title,
+                rendered: item.rendered,
+                snapshot_entry_id,
+                sync_status: api_sync_status(item.state, item.sync_status),
+                last_success_at: item.last_success_at,
+                last_error: item.last_error,
+            });
+        }
+        source.source_id = Some(normalized.source.knowledge_source_id);
+        source.mode = api_source_mode(normalized.source.mode);
+        source.revision = normalized.source.revision;
+        source.default_parent_entry_id = normalized.source.default_parent_entry_id;
+        source.last_fetched_at = entries.iter().filter_map(|item| item.last_success_at).max();
+        source.entries = entries;
+        let current_cache = source_from_extra(&row.extra)
+            .map_err(|error| knowledge_row_json_error(&row.knowledge_base_id, error))?;
+        if let Some(current) = current_cache {
+            let current_value = serde_json::to_value(current).map_err(|error| {
+                AppError::Internal(format!("failed to compare source cache: {error}"))
+            })?;
+            let rebuilt_value = serde_json::to_value(&*source).map_err(|error| {
+                AppError::Internal(format!("failed to compare rebuilt source cache: {error}"))
+            })?;
+            if current_value == rebuilt_value {
+                return Ok(());
+            }
+        }
+        self.persist_source(row, source).await
+    }
+
+    async fn clear_legacy_source_cache(
+        &self,
+        row: &mut KnowledgeBaseRow,
+    ) -> Result<(), AppError> {
+        let registered = self.require_base(&row.knowledge_base_id).await?;
+        let _base_guard = self.acquire_base_lifecycle_write_lock(&registered).await?;
+        let mut current = self.current_source_publication_row(row).await?;
+        let mut extra: serde_json::Value = serde_json::from_str(&current.extra).map_err(
+            |error| {
+                AppError::Internal(format!(
+                    "knowledge base {} has invalid extra JSON: {error}",
+                    current.knowledge_base_id
+                ))
+            },
+        )?;
+        if let Some(object) = extra.as_object_mut() {
+            object.remove("source");
+        }
+        current.extra = extra.to_string();
+        current.updated_at = now_ms();
+        self.repo.update_base(&current).await?;
+        *row = current;
+        Ok(())
+    }
+
+    /// Publish prepared URL snapshots only after revalidating the exact source
+    /// configuration under tree + lifecycle writers. This prevents an old
+    /// fetch from leaving files behind after the user switches or detaches the
+    /// source while network work is still running.
+    async fn publish_prepared_url_source(
+        &self,
+        row: &mut KnowledgeBaseRow,
+        source: &mut KnowledgeSource,
+        files: Vec<PreparedSourceFile>,
+        prune_orphans: bool,
+    ) -> SourcePublicationOutcome {
+        let previous_stamp = source.last_fetched_at;
+        let mut outcome = SourcePublicationOutcome {
+            fetched: 0,
+            errors: Vec::new(),
+            published_paths: Vec::new(),
+            persisted_stamp: previous_stamp,
+            fatal_error: None,
+        };
+
+        let _tree_guard = match self.acquire_document_tree_write_lock(row).await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                outcome.fatal_error = Some(error);
+                return outcome;
+            }
+        };
+        let _base_guard = match self.acquire_base_lifecycle_write_lock(row).await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                outcome.fatal_error = Some(error);
+                return outcome;
+            }
+        };
+        let mut current = match self.current_source_publication_row(row).await {
+            Ok(current) => current,
+            Err(error) => {
+                outcome.fatal_error = Some(error);
+                return outcome;
+            }
+        };
+        // Network/LLM preparation occurs before these locks and can be slow.
+        // Re-check current consent before publishing any prepared snapshot.
+        if let Err(error) = require_editable_knowledge_tree(&current) {
+            outcome.fatal_error = Some(error);
+            return outcome;
+        }
+        let root = PathBuf::from(&current.root_path);
+        if let Err(error) = validate_knowledge_root_bounded(root.clone()).await {
+            outcome.fatal_error = Some(error);
+            return outcome;
+        }
+
+        for file in files {
+            let published_path = file.rel_path.clone();
+            let path = match safe_md_path_bounded(
+                root.clone(),
+                file.rel_path.clone(),
+            )
+            .await
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    outcome
+                        .errors
+                        .push(format!("{}: {error}", file.source_label));
+                    continue;
+                }
+            };
+            match write_text_atomic(&path, &file.content).await {
+                Ok(()) => {
+                    outcome.fetched += 1;
+                    outcome.published_paths.push(published_path);
+                    self.invalidate_search_cache_path(&path);
+                    self.mark_projection_dirty(&current);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        source = %file.source_label,
+                        %error,
+                        "failed to publish knowledge source snapshot"
+                    );
+                    outcome
+                        .errors
+                        .push(format!("{}: {error}", file.source_label));
+                }
+            }
+        }
+        if outcome.fetched > 0 {
+            source.last_fetched_at = Some(now_ms());
+        }
+        if prune_orphans {
+            // Pruning may quarantine several files before a later entry fails;
+            // mark first so partial success cannot leave stale identities.
+            self.mark_projection_dirty(&current);
+            if let Err(error) = prune_orphan_snapshots(&root, &source.entries).await {
+                outcome.fatal_error = Some(error);
+                return outcome;
+            }
+        }
+        if let Err(error) = self
+            .persist_source_in_current_row(&mut current, source)
+            .await
+        {
+            outcome.fatal_error = Some(error);
+            return outcome;
+        }
+        *row = current;
+        outcome.persisted_stamp = source.last_fetched_at;
+        outcome
+    }
+
+    async fn publish_managed_source_items(
+        &self,
+        row: &mut KnowledgeBaseRow,
+        source: &KnowledgeSourceRow,
+        files: Vec<PreparedManagedSourceFile>,
+    ) -> SourcePublicationOutcome {
+        let mut outcome = SourcePublicationOutcome {
+            fetched: 0,
+            errors: Vec::new(),
+            published_paths: Vec::new(),
+            persisted_stamp: None,
+            fatal_error: None,
+        };
+        let Some(source_repository) = self.source_repository() else {
+            outcome.fatal_error = Some(AppError::Internal(
+                "knowledge source identity repository is unavailable".into(),
+            ));
+            return outcome;
+        };
+        let Some(entry_repository) = self.entry_repository() else {
+            outcome.fatal_error = Some(AppError::Internal(
+                "knowledge entry identity repository is unavailable".into(),
+            ));
+            return outcome;
+        };
+        let _tree_guard = match self.acquire_document_tree_write_lock(row).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.fail_prepared_source_attempts(&files, &error.to_string())
+                    .await;
+                outcome.fatal_error = Some(error);
+                return outcome;
+            }
+        };
+        let _base_guard = match self.acquire_base_lifecycle_write_lock(row).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.fail_prepared_source_attempts(&files, &error.to_string())
+                    .await;
+                outcome.fatal_error = Some(error);
+                return outcome;
+            }
+        };
+        let mut current = match self.require_base(&row.knowledge_base_id).await {
+            Ok(current) => current,
+            Err(error) => {
+                self.fail_prepared_source_attempts(&files, &error.to_string())
+                    .await;
+                outcome.fatal_error = Some(error);
+                return outcome;
+            }
+        };
+        if current.root_path != row.root_path {
+            let error = AppError::Conflict(
+                "knowledge base root changed while source refresh was running; retry".into(),
+            );
+            self.fail_prepared_source_attempts(&files, &error.to_string())
+                .await;
+            outcome.fatal_error = Some(error);
+            return outcome;
+        }
+        if let Err(error) = require_editable_knowledge_tree(&current) {
+            self.fail_prepared_source_attempts(&files, &error.to_string())
+                .await;
+            outcome.fatal_error = Some(error);
+            return outcome;
+        }
+        match source_repository
+            .get_source(&source.knowledge_source_id)
+            .await
+        {
+            Ok(Some(current_source))
+                if current_source.state == KnowledgeSourceState::Active
+                    && current_source.revision == source.revision => {}
+            Ok(Some(_)) => {
+                let error = AppError::Conflict(
+                    "knowledge source configuration changed while refresh was running; retry"
+                        .into(),
+                );
+                self.fail_prepared_source_attempts(&files, &error.to_string())
+                    .await;
+                outcome.fatal_error = Some(error);
+                return outcome;
+            }
+            Ok(None) => {
+                let error = AppError::Conflict(
+                    "knowledge source was removed while refresh was running".into(),
+                );
+                self.fail_prepared_source_attempts(&files, &error.to_string())
+                    .await;
+                outcome.fatal_error = Some(error);
+                return outcome;
+            }
+            Err(error) => {
+                outcome.fatal_error = Some(error.into());
+                return outcome;
+            }
+        }
+        let knowledge_base_id = match KnowledgeBaseId::parse(&current.knowledge_base_id) {
+            Ok(id) => id,
+            Err(error) => {
+                outcome.fatal_error = Some(AppError::Internal(format!(
+                    "stored knowledge base id '{}' is invalid: {error}",
+                    current.knowledge_base_id
+                )));
+                return outcome;
+            }
+        };
+        if let Err(error) = self
+            .reconcile_projection_locked(&current, HashMap::new())
+            .await
+        {
+            self.fail_prepared_source_attempts(&files, &error.to_string())
+                .await;
+            outcome.fatal_error = Some(error);
+            return outcome;
+        }
+        let current_source = match source_repository
+            .get_source(&source.knowledge_source_id)
+            .await
+        {
+            Ok(Some(source)) if source.state == KnowledgeSourceState::Active => source,
+            Ok(_) => {
+                let error = AppError::Conflict(
+                    "knowledge source changed while its document tree was reconciling; retry"
+                        .into(),
+                );
+                self.fail_prepared_source_attempts(&files, &error.to_string())
+                    .await;
+                outcome.fatal_error = Some(error);
+                return outcome;
+            }
+            Err(error) => {
+                outcome.fatal_error = Some(error.into());
+                return outcome;
+            }
+        };
+        let root = PathBuf::from(&current.root_path);
+        let mut published = Vec::new();
+        let mut forced_ids = HashMap::new();
+
+        for prepared in files {
+            let item = match source_repository
+                .get_source_item(&prepared.item.knowledge_source_item_id)
+                .await
+            {
+                Ok(Some(item))
+                    if item.state == KnowledgeSourceState::Active
+                        && item.revision == prepared.item.revision
+                        && item.sync_status == KnowledgeSourceItemSyncStatus::Syncing => item,
+                Ok(Some(_)) => {
+                    outcome.errors.push(format!(
+                        "{}: source configuration changed while the page was being fetched; retry",
+                        prepared.item.requested_url
+                    ));
+                    continue;
+                }
+                Ok(None) => {
+                    outcome.errors.push(format!(
+                        "{}: source item was removed while the page was being fetched",
+                        prepared.item.requested_url
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    outcome.fatal_error = Some(error.into());
+                    return outcome;
+                }
+            };
+            let provenance = match source_repository
+                .get_managed_entry_provenance(&item.knowledge_source_item_id)
+                .await
+            {
+                Ok(provenance) => provenance,
+                Err(error) => {
+                    outcome.fatal_error = Some(error.into());
+                    return outcome;
+                }
+            };
+            let (target_rel_path, stable_entry_id) = if let Some(provenance) = provenance {
+                match entry_repository
+                    .get_entry(&knowledge_base_id, &provenance.knowledge_entry_id)
+                    .await
+                {
+                    Ok(Some(entry)) => (entry.rel_path, Some(entry.knowledge_entry_id)),
+                    Ok(None) => {
+                        let error = "managed document identity is missing; refresh was stopped to avoid creating a duplicate";
+                        if let Err(db_error) = source_repository
+                            .record_sync_failure(&RecordKnowledgeSourceSyncFailureParams {
+                                knowledge_source_item_id: item.knowledge_source_item_id.clone(),
+                                expected_revision: item.revision,
+                                status: KnowledgeSourceItemSyncStatus::Missing,
+                                error: error.into(),
+                                failed_at: now_ms(),
+                            })
+                            .await
+                        {
+                            outcome.fatal_error = Some(db_error.into());
+                            return outcome;
+                        }
+                        outcome
+                            .errors
+                            .push(format!("{}: {error}", item.requested_url));
+                        continue;
+                    }
+                    Err(error) => {
+                        outcome.fatal_error = Some(error.into());
+                        return outcome;
+                    }
+                }
+            } else {
+                let destination_parent_path = if let Some(parent_entry_id) =
+                    current_source.default_parent_entry_id.as_ref()
+                {
+                    match entry_repository
+                        .get_entry(&knowledge_base_id, parent_entry_id)
+                        .await
+                    {
+                        Ok(Some(parent)) if !parent.is_deleted() && parent.is_directory() => {
+                            parent.rel_path
+                        }
+                        _ => {
+                            let error = "the selected web-capture destination no longer exists";
+                            if let Err(db_error) = source_repository
+                                .record_sync_failure(&RecordKnowledgeSourceSyncFailureParams {
+                                    knowledge_source_item_id: item
+                                        .knowledge_source_item_id
+                                        .clone(),
+                                    expected_revision: item.revision,
+                                    status: KnowledgeSourceItemSyncStatus::Missing,
+                                    error: error.into(),
+                                    failed_at: now_ms(),
+                                })
+                                .await
+                            {
+                                outcome.fatal_error = Some(db_error.into());
+                                return outcome;
+                            }
+                            outcome
+                                .errors
+                                .push(format!("{}: {error}", item.requested_url));
+                            continue;
+                        }
+                    }
+                } else {
+                    String::new()
+                };
+                let allocation_root = root.clone();
+                let allocation_parent = destination_parent_path.clone();
+                let requested_url = item.requested_url.clone();
+                match tokio::task::spawn_blocking(move || {
+                    allocate_managed_source_rel_path(
+                        &allocation_root,
+                        &allocation_parent,
+                        &requested_url,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(path)) => (path, None),
+                    Ok(Err(error)) => {
+                        if let Err(db_error) = source_repository
+                            .record_sync_failure(&RecordKnowledgeSourceSyncFailureParams {
+                                knowledge_source_item_id: item
+                                    .knowledge_source_item_id
+                                    .clone(),
+                                expected_revision: item.revision,
+                                status: KnowledgeSourceItemSyncStatus::Failed,
+                                error: error.to_string(),
+                                failed_at: now_ms(),
+                            })
+                            .await
+                        {
+                            outcome.fatal_error = Some(db_error.into());
+                            return outcome;
+                        }
+                        outcome
+                            .errors
+                            .push(format!("{}: {error}", item.requested_url));
+                        continue;
+                    }
+                    Err(error) => {
+                        let message = format!(
+                            "web-capture path allocation task failed: {error}"
+                        );
+                        if let Err(db_error) = source_repository
+                            .record_sync_failure(&RecordKnowledgeSourceSyncFailureParams {
+                                knowledge_source_item_id: item
+                                    .knowledge_source_item_id
+                                    .clone(),
+                                expected_revision: item.revision,
+                                status: KnowledgeSourceItemSyncStatus::Failed,
+                                error: message.clone(),
+                                failed_at: now_ms(),
+                            })
+                            .await
+                        {
+                            tracing::debug!(%db_error, "failed to record source allocation task failure");
+                        }
+                        outcome.fatal_error = Some(AppError::Internal(message));
+                        return outcome;
+                    }
+                }
+            };
+            let path = match safe_md_path_bounded(root.clone(), target_rel_path.clone()).await {
+                Ok(path) => path,
+                Err(error) => {
+                    if let Err(db_error) = source_repository
+                        .record_sync_failure(&RecordKnowledgeSourceSyncFailureParams {
+                            knowledge_source_item_id: item.knowledge_source_item_id.clone(),
+                            expected_revision: item.revision,
+                            status: KnowledgeSourceItemSyncStatus::Failed,
+                            error: error.to_string(),
+                            failed_at: now_ms(),
+                        })
+                        .await
+                    {
+                        outcome.fatal_error = Some(db_error.into());
+                        return outcome;
+                    }
+                    outcome
+                        .errors
+                        .push(format!("{}: {error}", item.requested_url));
+                    continue;
+                }
+            };
+            if let Ok(metadata) = tokio::fs::metadata(&path).await
+                && metadata.len() > MAX_FOLDER_IMPORT_FILE_BYTES
+            {
+                let error = "the managed document is unexpectedly large after an external change; refresh did not read or overwrite it";
+                if let Err(db_error) = source_repository
+                    .record_sync_failure(&RecordKnowledgeSourceSyncFailureParams {
+                        knowledge_source_item_id: item.knowledge_source_item_id.clone(),
+                        expected_revision: item.revision,
+                        status: KnowledgeSourceItemSyncStatus::Conflicted,
+                        error: error.into(),
+                        failed_at: now_ms(),
+                    })
+                    .await
+                {
+                    outcome.fatal_error = Some(db_error.into());
+                    return outcome;
+                }
+                outcome
+                    .errors
+                    .push(format!("{}: {error}", item.requested_url));
+                continue;
+            }
+            let existing = match tokio::fs::read_to_string(&path).await {
+                Ok(content) => Some(content),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    let message = format!(
+                        "failed to read the current managed document before refresh: {error}"
+                    );
+                    if let Err(db_error) = source_repository
+                        .record_sync_failure(&RecordKnowledgeSourceSyncFailureParams {
+                            knowledge_source_item_id: item.knowledge_source_item_id.clone(),
+                            expected_revision: item.revision,
+                            status: KnowledgeSourceItemSyncStatus::Failed,
+                            error: message.clone(),
+                            failed_at: now_ms(),
+                        })
+                        .await
+                    {
+                        outcome.fatal_error = Some(db_error.into());
+                        return outcome;
+                    }
+                    outcome.errors.push(format!(
+                        "{}: {message}",
+                        item.requested_url
+                    ));
+                    continue;
+                }
+            };
+            let mut already_published = false;
+            if let Some(existing) = existing.as_ref() {
+                let existing_hash = sha256_text(existing);
+                let marker_matches = source_url::snapshot_source_item_id(existing)
+                    .as_ref()
+                    == Some(&item.knowledge_source_item_id)
+                    && source_url::snapshot_source_relationship(existing)
+                        .is_none_or(|relationship| relationship == "managed");
+                let baseline_matches = item
+                    .last_published_hash
+                    .as_deref()
+                    .map_or(marker_matches, |hash| hash == existing_hash);
+                let pending_matches = item
+                    .pending_published_hash
+                    .as_deref()
+                    == Some(existing_hash.as_str());
+                if pending_matches {
+                    already_published = true;
+                } else if !baseline_matches {
+                    let error = "the managed document was modified outside NomiFun; refresh did not overwrite those changes";
+                    if let Err(db_error) = source_repository
+                        .record_sync_failure(&RecordKnowledgeSourceSyncFailureParams {
+                            knowledge_source_item_id: item.knowledge_source_item_id.clone(),
+                            expected_revision: item.revision,
+                            status: KnowledgeSourceItemSyncStatus::Conflicted,
+                            error: error.into(),
+                            failed_at: now_ms(),
+                        })
+                        .await
+                    {
+                        outcome.fatal_error = Some(db_error.into());
+                        return outcome;
+                    }
+                    outcome
+                        .errors
+                        .push(format!("{}: {error}", item.requested_url));
+                    continue;
+                }
+            }
+            let write_result = if already_published {
+                Ok(())
+            } else {
+                match existing.as_deref() {
+                    Some(expected) => {
+                        write_text_atomic_if_unchanged(&path, expected, &prepared.content).await
+                    }
+                    None => write_text_atomic_if_absent(&path, &prepared.content).await,
+                }
+            };
+            if let Err(error) = write_result {
+                let message = format!(
+                    "the managed document changed while refresh was publishing: {error}"
+                );
+                if let Err(db_error) = source_repository
+                    .record_sync_failure(&RecordKnowledgeSourceSyncFailureParams {
+                        knowledge_source_item_id: item.knowledge_source_item_id.clone(),
+                        expected_revision: item.revision,
+                        status: KnowledgeSourceItemSyncStatus::Conflicted,
+                        error: message.clone(),
+                        failed_at: now_ms(),
+                    })
+                    .await
+                {
+                    outcome.fatal_error = Some(db_error.into());
+                    return outcome;
+                }
+                outcome
+                    .errors
+                    .push(format!("{}: {message}", item.requested_url));
+                continue;
+            }
+            if let Some(entry_id) = stable_entry_id.clone() {
+                forced_ids.insert(
+                    portable_writeback_path_identity(&target_rel_path),
+                    entry_id,
+                );
+            }
+            self.invalidate_search_cache_path(&path);
+            self.mark_projection_dirty(&current);
+            if let Err(error) = source_repository
+                .record_sync_success(&RecordKnowledgeSourceSyncSuccessParams {
+                    knowledge_source_item_id: prepared.item.knowledge_source_item_id.clone(),
+                    expected_revision: prepared.item.revision,
+                    final_url: Some(prepared.final_url.clone()),
+                    title: prepared.title.clone(),
+                    etag: None,
+                    http_last_modified: None,
+                    last_published_hash: prepared.content_hash.clone(),
+                    succeeded_at: now_ms(),
+                })
+                .await
+            {
+                outcome.fatal_error = Some(error.into());
+                return outcome;
+            }
+            published.push((prepared, target_rel_path));
+        }
+
+        if !published.is_empty() {
+            let projection = match self
+                .reconcile_projection_locked(&current, forced_ids)
+                .await
+            {
+                Ok(Some(projection)) => projection,
+                Ok(None) => {
+                    outcome.fatal_error = Some(AppError::Internal(
+                        "knowledge entry identity projection is unavailable after source publication"
+                            .into(),
+                    ));
+                    return outcome;
+                }
+                Err(error) => {
+                    outcome.fatal_error = Some(error);
+                    return outcome;
+                }
+            };
+            for (prepared, target_rel_path) in published {
+                let portable = portable_writeback_path_identity(&target_rel_path);
+                let Some(entry) = projection
+                    .entries
+                    .iter()
+                    .find(|entry| entry.portable_rel_path == portable)
+                else {
+                    outcome.fatal_error = Some(AppError::Internal(format!(
+                        "published source document has no stable entry at {target_rel_path}"
+                    )));
+                    return outcome;
+                };
+                if let Err(error) = source_repository
+                    .bind_managed_entry(&BindManagedKnowledgeEntryParams {
+                        knowledge_entry_id: entry.knowledge_entry_id.clone(),
+                        knowledge_source_item_id: prepared
+                            .item
+                            .knowledge_source_item_id
+                            .clone(),
+                        created_at: now_ms(),
+                    })
+                    .await
+                {
+                    outcome.fatal_error = Some(error.into());
+                    return outcome;
+                }
+                self.emitter.emit_entry_content_updated(
+                    &KnowledgeEntryContentUpdatedEvent {
+                        knowledge_base_id: knowledge_base_id.clone(),
+                        entry_id: entry.knowledge_entry_id.clone(),
+                        rel_path: target_rel_path.clone(),
+                        revision: Some(entry.revision),
+                    },
+                );
+                outcome.fetched += 1;
+                outcome.published_paths.push(target_rel_path);
+            }
+        }
+        if outcome.fetched > 0 {
+            current.updated_at = now_ms();
+            if let Err(error) = self.repo.update_base(&current).await {
+                tracing::warn!(
+                    kb_id = %current.knowledge_base_id,
+                    %error,
+                    "managed source refresh completed but the base timestamp update failed"
+                );
+            }
+            outcome.persisted_stamp = Some(now_ms());
+        }
+        *row = current;
+        outcome
+    }
+
+    /// Attach, replace, or clear a base's source config (`extra.source`).
+    /// `Some(src)` validates + persists it (server clears any client-sent
+    /// `last_fetched_at`); `None` removes the source. Emits `base-updated`.
+    /// Does NOT fetch — callers trigger `refresh_source` afterward.
+    pub async fn set_source(
+        &self,
+        kb_id: &str,
+        source: Option<KnowledgeSource>,
+    ) -> Result<KnowledgeBaseInfo, AppError> {
+        let mut row = self.require_base(kb_id).await?;
+        match source {
+            Some(mut src) => {
+                if source_from_extra(&row.extra)
+                    .map_err(|error| knowledge_row_json_error(&row.knowledge_base_id, error))?
+                    .is_some()
+                    && self.source_repository().is_some()
+                {
+                    return Err(AppError::BadRequest(
+                        "whole-source replacement is no longer supported; add, refresh, detach, or remove individual web sources so managed documents cannot be orphaned"
+                            .into(),
+                    ));
+                }
+                require_editable_knowledge_tree(&row)?;
+                sanitize_source_entries(&mut src);
+                src.source_id = Some(KnowledgeSourceId::new());
+                src.revision = 0;
+                src.default_parent_entry_id = None;
+                for item in &mut src.entries {
+                    item.source_item_id = Some(KnowledgeSourceItemId::new());
+                    item.snapshot_entry_id = None;
+                    item.sync_status = KnowledgeSourceSyncStatus::Pending;
+                    item.last_success_at = None;
+                    item.last_error = None;
+                }
+                validate_source(&src)?;
+                validate_unique_source_urls(&src)?;
+                src.last_fetched_at = None;
+                self.persist_source(&mut row, &src).await?;
+                let _ = self.ensure_normalized_source(&row).await?;
+            }
+            None => {
+                if let (Some(repository), Some(normalized)) =
+                    (self.source_repository(), self.ensure_normalized_source(&row).await?)
+                {
+                    let provenance = repository
+                        .list_entry_provenance_for_source(
+                            &normalized.source.knowledge_source_id,
+                        )
+                        .await?;
+                    let managed = provenance
+                        .iter()
+                        .filter(|provenance| {
+                            provenance.relationship
+                                == KnowledgeEntryProvenanceRelationship::Managed
+                        })
+                        .count();
+                    if managed > 0 {
+                        return Err(AppError::BadRequest(format!(
+                            "source has {managed} managed document(s); explicitly detach or remove each document instead of clearing the source implicitly"
+                        )));
+                    }
+                    for item in normalized.items {
+                        if !item.is_removed() {
+                            repository
+                                .remove_source_item(
+                                    &item.knowledge_source_item_id,
+                                    item.revision,
+                                    now_ms(),
+                                )
+                                .await?;
+                        }
+                    }
+                    repository
+                        .update_source(&UpdateKnowledgeSourceParams {
+                            knowledge_source_id: normalized.source.knowledge_source_id,
+                            expected_revision: normalized.source.revision,
+                            mode: normalized.source.mode,
+                            state: KnowledgeSourceState::Removed,
+                            default_parent_entry_id: None,
+                            removed_at: Some(now_ms()),
+                            updated_at: now_ms(),
+                        })
+                        .await?;
+                }
+                let registered = self.require_base(kb_id).await?;
+                let _base_guard =
+                    self.acquire_base_lifecycle_write_lock(&registered).await?;
+                row = self.require_base(kb_id).await?;
+                let mut extra: serde_json::Value = serde_json::from_str(&row.extra).map_err(|error| {
+                    AppError::Internal(format!(
+                        "knowledge base {} has invalid extra JSON: {error}",
+                        row.knowledge_base_id
+                    ))
+                })?;
+                if !extra.is_object() {
+                    return Err(AppError::Internal(format!(
+                        "knowledge base {} extra must be a JSON object",
+                        row.knowledge_base_id
+                    )));
+                }
+                if let Some(obj) = extra.as_object_mut() {
+                    obj.remove("source");
+                }
+                row.extra = extra.to_string();
+                row.updated_at = now_ms();
+                self.repo.update_base(&row).await?;
+            }
+        }
+        let info = self.row_to_info(row).await?;
+        self.emitter.emit_base_updated(&info);
+        Ok(info)
+    }
+
+    // ── Bindings & mounting ─────────────────────────────────────────
+
+    pub async fn get_binding(&self, kind: &str, target_id: &str) -> Result<KnowledgeBinding, AppError> {
+        validate_kind(kind)?;
+        let target_id = canonical_target_id(kind, target_id)?;
+        let row = self.repo.get_binding(kind, &target_id).await?;
+        row.map(binding_from_row).transpose().map(|row| row.unwrap_or_default())
+    }
+
+    pub async fn set_binding(
+        &self,
+        kind: &str,
+        target_id: &str,
+        binding: KnowledgeBinding,
+    ) -> Result<KnowledgeBinding, AppError> {
+        validate_kind(kind)?;
+        let target_id = canonical_target_id(kind, target_id)?;
+        if !WRITEBACK_EAGERNESS.contains(&binding.writeback_eagerness.as_str()) {
+            return Err(AppError::BadRequest(format!(
+                "unsupported writeback_eagerness: {}",
+                binding.writeback_eagerness
+            )));
+        }
+        let mut unique = HashSet::with_capacity(binding.kb_ids.len());
+        for id in &binding.kb_ids {
+            if !unique.insert(id.as_str()) {
+                return Err(AppError::BadRequest(format!(
+                    "duplicate knowledge base id in binding: {id}"
+                )));
+            }
+        }
+        let known: HashSet<String> = self.list_base_ids().await?.into_iter().collect();
+        if let Some(id) = binding.kb_ids.iter().find(|id| !known.contains(id.as_str())) {
+            return Err(AppError::NotFound(format!("knowledge base {id} not found")));
+        }
+        let kb_ids = binding.kb_ids.iter().map(ToString::to_string).collect::<Vec<_>>();
+        self.repo
+            .set_binding(
+                kind,
+                &target_id,
+                &kb_ids,
+                binding.enabled,
+                binding.writeback,
+                &binding.writeback_eagerness,
+                binding.channel_write_enabled,
+                now_ms(),
+            )
+            .await?;
+        self.emitter.emit_binding_changed(&serde_json::json!({
+            "target_kind": kind,
+            "target_id": target_id,
+            "enabled": binding.enabled,
+            "writeback": binding.writeback,
+            "writeback_eagerness": binding.writeback_eagerness,
+            "channel_write_enabled": binding.channel_write_enabled,
+            "kb_ids": binding.kb_ids,
+        }));
+        // In-process observer (late-wired by the app layer): lets live
+        // terminal workspaces re-sync mounts/README immediately instead of
+        // waiting for a PTY relaunch. Runs after persistence so observers
+        // always read back the new row.
+        let hook = self
+            .binding_changed_hook
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone());
+        if let Some(hook) = hook {
+            hook(kind, &target_id);
+        }
+        Ok(binding)
+    }
+
+    /// Remove a target's knowledge binding row entirely. For cleanup when the
+    /// target itself goes away (e.g. a deleted companion → `("companion", companion_id)`);
+    /// mirrors the conversation-delete hook below. Deleting a missing row is
+    /// a no-op.
+    pub async fn delete_binding(&self, kind: &str, target_id: &str) -> Result<(), AppError> {
+        validate_kind(kind)?;
+        let target_id = canonical_target_id(kind, target_id)?;
+        self.repo.delete_binding(kind, &target_id).await?;
+        // Same observer contract as set_binding: a deleted row is a binding
+        // change (live terminal workspaces must drop their mounts + README
+        // instead of keeping them until the next relaunch). Fires after
+        // persistence; observers reading back see the default (disabled) row.
+        let hook = self
+            .binding_changed_hook
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone());
+        if let Some(hook) = hook {
+            hook(kind, &target_id);
+        }
+        Ok(())
+    }
+
+    /// Resolve a session's workpath binding without mutating its workspace.
+    pub async fn prepare_mounts_for_session(
+        &self,
+        workpath: &str,
+        workspace: &Path,
+    ) -> Result<PreparedMountPlan, AppError> {
+        let key = workpath_key(workpath);
+        self.prepare_mounts_for_target(WORKPATH_BINDING_KIND, &key, workspace)
+            .await
+    }
+
+    /// Resolve one target's exact binding and runtime metadata without
+    /// touching `.nomi/knowledge`.
+    ///
+    /// This is the first half of the strict runtime path.  The returned plan
+    /// must be activated only after any older runtime using a different
+    /// signature has completed teardown.
+    pub async fn prepare_mounts_for_target(
+        &self,
+        kind: &str,
+        target_id: &str,
+        workspace: &Path,
+    ) -> Result<PreparedMountPlan, AppError> {
+        if self.workspace_overlaps_managed_root(workspace) {
+            return Err(AppError::Conflict(format!(
+                "knowledge mounts refused: workspace {} overlaps the backend data root",
+                workspace.display()
+            )));
+        }
+
+        // Canonicalize now, before signature comparison.  This is also the
+        // trust boundary that collapses junction/symlink/case aliases to one
+        // physical authority.
+        let _workspace_key = crate::workspace_binding::canonical_workspace_key(workspace)?;
+        let binding = self.get_binding(kind, target_id).await?;
+        let mut specs = Vec::<MountSpec>::new();
+        let mut metas = Vec::<(String, KnowledgeBaseRow)>::new();
+        let mut signature_targets = Vec::<(String, String, String)>::new();
+
+        if binding.enabled {
+            let mut used_names = HashSet::<String>::new();
+            for kb_id in &binding.kb_ids {
+                let Some(row) = self.repo.get_base(kb_id.as_str()).await? else {
+                    // Preserve the logical identity of a dangling binding in
+                    // the signature while matching legacy runtime behaviour:
+                    // the absent base has no physical mount or prompt entry.
+                    signature_targets.push((
+                        kb_id.as_str().to_owned(),
+                        "<missing>".to_owned(),
+                        "<missing>".to_owned(),
+                    ));
+                    continue;
+                };
+                let link_name = unique_link_name(&row, &mut used_names);
+                let target = PathBuf::from(&row.root_path);
+                let canonical_target = std::fs::canonicalize(&target).map_err(|error| {
+                    AppError::Conflict(format!(
+                        "bound knowledge base {} root {} cannot be canonicalized: {error}",
+                        kb_id.as_str(),
+                        target.display()
+                    ))
+                })?;
+                if !std::fs::metadata(&canonical_target)
+                    .map(|metadata| metadata.is_dir())
+                    .unwrap_or(false)
+                {
+                    return Err(AppError::Conflict(format!(
+                        "bound knowledge base {} root {} is not a directory",
+                        kb_id.as_str(),
+                        canonical_target.display()
+                    )));
+                }
+                let target_key =
+                    crate::workspace_binding::canonical_workspace_key(&canonical_target)?;
+                signature_targets.push((
+                    kb_id.as_str().to_owned(),
+                    link_name.clone(),
+                    target_key.to_string_lossy().into_owned(),
+                ));
+                specs.push(MountSpec {
+                    link_name: link_name.clone(),
+                    target: canonical_target,
+                });
+                metas.push((link_name, row));
+            }
+        } else {
+            signature_targets.extend(binding.kb_ids.iter().map(|kb_id| {
+                (
+                    kb_id.as_str().to_owned(),
+                    "<disabled>".to_owned(),
+                    "<disabled>".to_owned(),
+                )
+            }));
+        }
+
+        // Resolve mutable prompt metadata in the same ordered pass as the
+        // legacy mount path, but never include it in binding authority.  A
+        // write-back changing README/TOC must not make two runtimes with the
+        // same physical binding conflict.
+        let mut tocs = Vec::with_capacity(metas.len());
+        for (_, row) in &metas {
+            tocs.push(build_toc(Path::new(&row.root_path)).await);
+        }
+        crate::context::apply_toc_budgets(&mut tocs);
+
+        let mut mounts = Vec::with_capacity(metas.len());
+        for ((link_name, row), toc) in metas.into_iter().zip(tocs) {
+            let summary = read_base_summary(Path::new(&row.root_path)).await;
+            let kb_id = KnowledgeBaseId::parse(&row.knowledge_base_id).map_err(|error| {
+                AppError::Internal(format!(
+                    "stored knowledge base id '{}' is invalid: {error}",
+                    row.knowledge_base_id
+                ))
+            })?;
+            let live_sources = match source_from_extra(&row.extra) {
+                Ok(Some(source)) if source.mode == KnowledgeSourceMode::Live => source
+                    .entries
+                    .into_iter()
+                    .filter(|entry| entry.sync_status != KnowledgeSourceSyncStatus::Paused)
+                    .collect(),
+                Ok(_) => Vec::new(),
+                Err(error) => {
+                    return Err(knowledge_row_json_error(&row.knowledge_base_id, error));
+                }
+            };
+            mounts.push(KnowledgeMountInfo {
+                knowledge_base_id: kb_id,
+                name: row.name,
+                description: row.description,
+                rel_path: format!("{KB_MOUNT_REL_DIR}/{link_name}"),
+                toc,
+                summary,
+                live_sources,
+            });
+        }
+
+        let signature_payload = serde_json::to_vec(&(
+            binding.enabled,
+            binding.writeback,
+            binding.writeback_eagerness.as_str(),
+            binding.channel_write_enabled,
+            signature_targets,
+        ))
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "failed to encode knowledge workspace binding signature: {error}"
+            ))
+        })?;
+        let binding_signature =
+            format!("kb-binding-v1:{}", hex::encode(Sha256::digest(&signature_payload)));
+        let outcome = MountOutcome {
+            mounts,
+            writeback: binding.enabled && binding.writeback,
+            writeback_eagerness: binding.writeback_eagerness,
+            channel_write_enabled: binding.channel_write_enabled,
+        };
+        Ok(PreparedMountPlan {
+            workspace: workspace.to_path_buf(),
+            specs,
+            outcome,
+            binding_signature,
+        })
+    }
+
+    /// Synchronize workspace mounts for a target according to its binding.
+    /// Deleted/missing bases are skipped (no FK by design); a disabled or
+    /// empty binding clears previously created mounts. Never fails the
+    /// session start — errors degrade to an empty outcome with warnings.
+    /// Conversation/terminal mounts resolve exclusively through the canonical
+    /// workpath binding (`WORKPATH_BINDING_KIND` + `workpath_key`); v3 never
+    /// reads per-session binding rows as a fallback.
+    pub async fn ensure_mounts_for_target(&self, kind: &str, target_id: &str, workspace: &Path) -> MountOutcome {
+        // Safety guard: when the workspace is the backend data root (or one
+        // of its ancestors), the mount sync / legacy cleanup would run their
+        // destructive sweeps over the directory tree that CONTAINS the
+        // managed knowledge bases. Skip mounting entirely for such targets.
+        if self.workspace_overlaps_managed_root(workspace) {
+            tracing::warn!(
+                kind,
+                target_id,
+                workspace = %workspace.display(),
+                "knowledge mounts skipped: workspace overlaps the backend data root"
+            );
+            return MountOutcome::default();
+        }
+        let binding = match self.get_binding(kind, target_id).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, kind, target_id, "knowledge binding lookup failed");
+                return MountOutcome::default();
+            }
+        };
+
+        let mut specs: Vec<MountSpec> = Vec::new();
+        let mut metas: Vec<(String, KnowledgeBaseRow)> = Vec::new();
+        if binding.enabled {
+            let mut used_names: HashSet<String> = HashSet::new();
+            for kb_id in &binding.kb_ids {
+                let row = match self.repo.get_base(kb_id.as_str()).await {
+                    Ok(Some(row)) => row,
+                    Ok(None) => {
+                        tracing::warn!(kb_id = %kb_id, "bound knowledge base no longer exists; skipping");
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(kb_id = %kb_id, error = %e, "knowledge base lookup failed; skipping");
+                        continue;
+                    }
+                };
+                if let Err(error) =
+                    validate_knowledge_root_bounded(PathBuf::from(&row.root_path))
+                        .await
+                {
+                    tracing::warn!(
+                        kb_id = %kb_id,
+                        root = %row.root_path,
+                        %error,
+                        "bound knowledge base root is unavailable or unsafe; skipping mount"
+                    );
+                    continue;
+                }
+                let link_name = unique_link_name(&row, &mut used_names);
+                specs.push(MountSpec {
+                    link_name: link_name.clone(),
+                    target: PathBuf::from(&row.root_path),
+                });
+                metas.push((link_name, row));
+            }
+        }
+
+        let present = mount::sync_mounts(workspace, specs).await;
+        let present: HashSet<String> = present.into_iter().collect();
+
+        let kept: Vec<(String, KnowledgeBaseRow)> = metas
+            .into_iter()
+            .filter(|(link_name, _)| present.contains(link_name))
+            .collect();
+
+        // Full per-base listings first, then the shared per-KB/global budget
+        // (`context::apply_toc_budgets`) so the prompt cost stays bounded no
+        // matter how many bases are mounted.
+        let mut tocs: Vec<Vec<String>> = Vec::with_capacity(kept.len());
+        for (_, row) in &kept {
+            tocs.push(build_toc(Path::new(&row.root_path)).await);
+        }
+        crate::context::apply_toc_budgets(&mut tocs);
+
+        let mut mounts = Vec::with_capacity(kept.len());
+        for ((link_name, row), toc) in kept.into_iter().zip(tocs) {
+            let summary = read_base_summary(Path::new(&row.root_path)).await;
+            let kb_id = match KnowledgeBaseId::parse(&row.knowledge_base_id) {
+                Ok(id) => id,
+                Err(error) => {
+                    tracing::warn!(
+                        knowledge_base_id = %row.knowledge_base_id,
+                        %error,
+                        "stored knowledge base id is invalid; skipping mount metadata"
+                    );
+                    continue;
+                }
+            };
+            // Live-mode URL sources surface as realtime URLs in the context.
+            // Corrupt persisted JSON is not reinterpreted as "no source":
+            // skip the base and leave an explicit diagnostic.
+            let live_sources = match source_from_extra(&row.extra) {
+                Ok(Some(source)) if source.mode == KnowledgeSourceMode::Live => {
+                    source
+                        .entries
+                        .into_iter()
+                        .filter(|entry| entry.sync_status != KnowledgeSourceSyncStatus::Paused)
+                        .collect()
+                }
+                Ok(_) => Vec::new(),
+                Err(error) => {
+                    tracing::warn!(
+                        knowledge_base_id = %row.knowledge_base_id,
+                        %error,
+                        "stored knowledge source JSON is invalid; skipping mount metadata"
+                    );
+                    continue;
+                }
+            };
+            mounts.push(KnowledgeMountInfo {
+                knowledge_base_id: kb_id,
+                name: row.name,
+                description: row.description,
+                rel_path: format!("{KB_MOUNT_REL_DIR}/{link_name}"),
+                toc,
+                summary,
+                live_sources,
+            });
+        }
+        MountOutcome {
+            mounts,
+            writeback: binding.enabled && binding.writeback,
+            writeback_eagerness: binding.writeback_eagerness,
+            channel_write_enabled: binding.channel_write_enabled,
+        }
+    }
+
+    // ── Internals ───────────────────────────────────────────────────
+
+    /// Search the given bases for `query`, returning up to `limit` ranked hits.
+    /// Walks each base's REAL `root_path` directly (managed or external),
+    /// applying the same `.md`-only + `_inbox`-excluded rules as `build_toc`.
+    /// This bypasses the workspace mount's hidden-dir + self-`.gitignore`
+    /// blindness entirely. Unknown ids are skipped (not an error).
+    pub async fn search_bases(
+        &self,
+        kb_ids: &[KnowledgeBaseId],
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<KnowledgeSearchHit>, AppError> {
+        let query = query.trim();
+        if query.is_empty() || kb_ids.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let config = self.retrieval_config().await?;
+        if matches!(config.rerank, KnowledgeRerankConfig::Remote { .. })
+            && limit > REMOTE_RERANK_MAX_CANDIDATES
+        {
+            return Err(AppError::BadRequest(format!(
+                "remote rerank supports at most {REMOTE_RERANK_MAX_CANDIDATES} results per search"
+            )));
+        }
+        let mut roots: Vec<(KnowledgeBaseId, String, PathBuf)> = Vec::new();
+        for id in kb_ids {
+            if let Ok(Some(row)) = self.repo.get_base(id.as_str()).await {
+                let Ok(kb_id) = KnowledgeBaseId::parse(&row.knowledge_base_id) else {
+                    tracing::warn!(
+                        knowledge_base_id = %row.knowledge_base_id,
+                        "stored knowledge base id is invalid; skipping search root"
+                    );
+                    continue;
+                };
+                roots.push((
+                    kb_id,
+                    row.name.clone(),
+                    PathBuf::from(&row.root_path),
+                ));
+            }
+        }
+        if roots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let scans = roots.into_iter().map(|(kb_id, kb_name, root)| {
+            let cache = Arc::clone(&self.search_cache);
+            async move {
+                let lock_root = root.clone();
+                bounded_root_blocking(
+                    &lock_root,
+                    SEARCH_WALK_BUDGET,
+                    Vec::new(),
+                    move || load_one_knowledge_root(kb_id, kb_name, root, cache),
+                )
+                .await
+            }
+        });
+        let mut documents = stream::iter(scans)
+            .buffer_unordered(LIST_BASES_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        documents.sort_by(|a, b| {
+            a.kb_id
+                .as_str()
+                .cmp(b.kb_id.as_str())
+                .then(a.rel_path.cmp(&b.rel_path))
+        });
+
+        let candidate_limit = if matches!(config.rerank, KnowledgeRerankConfig::Remote { .. }) {
+            limit
+                .saturating_mul(4)
+                .max(limit)
+                .min(REMOTE_RERANK_MAX_CANDIDATES)
+        } else {
+            limit
+        };
+        let mut candidates = match &config.embedding {
+            KnowledgeEmbeddingConfig::Local {} => {
+                local_keyword_candidates(documents, query, candidate_limit)
+            }
+            KnowledgeEmbeddingConfig::Remote { provider_id, model } => {
+                self.remote_embedding_candidates(
+                    documents,
+                    query,
+                    candidate_limit,
+                    provider_id,
+                    model,
+                )
+                .await?
+            }
+        };
+
+        match &config.rerank {
+            KnowledgeRerankConfig::Local {} => {
+                candidates.truncate(limit);
+            }
+            KnowledgeRerankConfig::Remote { provider_id, model } => {
+                candidates = self
+                    .remote_rerank_candidates(candidates, query, limit, provider_id, model)
+                    .await?;
+            }
+        }
+        Ok(candidates.into_iter().map(|candidate| candidate.hit).collect())
+    }
+
+    async fn remote_embedding_candidates(
+        &self,
+        documents: Vec<RetrievalDocument>,
+        query: &str,
+        candidate_limit: usize,
+        provider_id: &str,
+        model: &str,
+    ) -> Result<Vec<RetrievalCandidate>, AppError> {
+        if documents.is_empty() || candidate_limit == 0 {
+            return Ok(Vec::new());
+        }
+        if documents.len() > REMOTE_RETRIEVAL_MAX_DOCUMENTS {
+            return Err(AppError::BadRequest(format!(
+                "remote embedding search received {} documents; narrow the knowledge-base scope to at most {REMOTE_RETRIEVAL_MAX_DOCUMENTS} documents",
+                documents.len()
+            )));
+        }
+        let model_ref = ModelRef {
+            provider_id: provider_id.to_owned(),
+            model: model.to_owned(),
+        };
+        let mut bounded = Vec::new();
+        let mut total_chars = 0usize;
+        for document in documents {
+            let text = retrieval_document_text(&document);
+            let chars = text.chars().count();
+            if total_chars.saturating_add(chars) > REMOTE_RETRIEVAL_MAX_TOTAL_CHARS {
+                return Err(AppError::BadRequest(format!(
+                    "remote embedding search exceeds the {REMOTE_RETRIEVAL_MAX_TOTAL_CHARS}-character query-time document budget; narrow the knowledge-base scope"
+                )));
+            }
+            total_chars += chars;
+            bounded.push((document, text));
+        }
+        if bounded.is_empty() {
+            return Ok(Vec::new());
+        }
+        let invoke = self.retrieval_model_invoke()?;
+        let start_revision = invoke
+            .resolve_task_config(&model_ref, ModelTask::Embedding)
+            .await
+            .map_err(AppError::from)?
+            .config_revision;
+
+        let query_vectors = invoke_embedding_batch(&invoke, &model_ref, vec![query.to_owned()]).await?;
+        let query_vector = query_vectors.into_iter().next().ok_or_else(|| {
+            AppError::BadGateway("embedding provider returned no query vector".into())
+        })?;
+        validate_embedding_vector(&query_vector, None, "query")?;
+        let dimension = query_vector.len();
+
+        let mut candidates = Vec::with_capacity(bounded.len());
+        for batch in bounded.chunks(REMOTE_EMBEDDING_BATCH_SIZE) {
+            let inputs = batch.iter().map(|(_, text)| text.clone()).collect::<Vec<_>>();
+            let vectors = invoke_embedding_batch(&invoke, &model_ref, inputs).await?;
+            if vectors.len() != batch.len() {
+                return Err(AppError::BadGateway(format!(
+                    "embedding provider returned {} vectors for {} documents",
+                    vectors.len(),
+                    batch.len()
+                )));
+            }
+            for ((document, _), vector) in batch.iter().zip(vectors) {
+                validate_embedding_vector(&vector, Some(dimension), &document.rel_path)?;
+                let similarity = cosine_similarity(&query_vector, &vector).ok_or_else(|| {
+                    AppError::BadGateway(format!(
+                        "embedding provider returned an unusable vector for '{}'",
+                        document.rel_path
+                    ))
+                })?;
+                candidates.push(RetrievalCandidate {
+                    hit: KnowledgeSearchHit {
+                        kb_id: document.kb_id.clone(),
+                        kb_name: document.kb_name.clone(),
+                        rel_path: document.rel_path.clone(),
+                        heading: document.heading.clone(),
+                        snippet: best_snippet(
+                            &document.content,
+                            &query.to_lowercase(),
+                            &query_terms(&query.to_lowercase()),
+                        ),
+                        score: similarity_score(similarity),
+                    },
+                    content: Arc::clone(&document.content),
+                });
+            }
+        }
+        let end_revision = invoke
+            .resolve_task_config(&model_ref, ModelTask::Embedding)
+            .await
+            .map_err(AppError::from)?
+            .config_revision;
+        if end_revision != start_revision {
+            return Err(AppError::Conflict(format!(
+                "embedding provider configuration changed during retrieval (revision {start_revision} -> {end_revision}); retry the search"
+            )));
+        }
+        candidates.sort_by(|a, b| {
+            b.hit
+                .score
+                .cmp(&a.hit.score)
+                .then(a.hit.kb_id.as_str().cmp(b.hit.kb_id.as_str()))
+                .then(a.hit.rel_path.cmp(&b.hit.rel_path))
+        });
+        candidates.truncate(candidate_limit);
+        Ok(candidates)
+    }
+
+    async fn remote_rerank_candidates(
+        &self,
+        candidates: Vec<RetrievalCandidate>,
+        query: &str,
+        limit: usize,
+        provider_id: &str,
+        model: &str,
+    ) -> Result<Vec<RetrievalCandidate>, AppError> {
+        if candidates.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let invoke = self.retrieval_model_invoke()?;
+        let expected = limit.min(candidates.len());
+        let top_n = u32::try_from(expected)
+            .map_err(|_| AppError::BadRequest("knowledge search limit is too large".into()))?;
+        let documents = candidates
+            .iter()
+            .map(retrieval_candidate_text)
+            .collect::<Vec<_>>();
+        let outcome = invoke
+            .invoke(
+                &ModelRef {
+                    provider_id: provider_id.to_owned(),
+                    model: model.to_owned(),
+                },
+                TaskRequest::Rerank(RerankRequest {
+                    query: query.to_owned(),
+                    documents,
+                    top_n: Some(top_n),
+                    extra: serde_json::json!({}),
+                }),
+            )
+            .await
+            .map_err(AppError::from)?;
+        let TaskOutcome::Done(TaskResult::Reranked(results)) = outcome else {
+            return Err(AppError::BadGateway(
+                "rerank provider did not return a completed rerank result".into(),
+            ));
+        };
+        if results.len() != expected {
+            return Err(AppError::BadGateway(format!(
+                "rerank provider returned {} results; expected {expected}",
+                results.len()
+            )));
+        }
+        let mut source = candidates.into_iter().map(Some).collect::<Vec<_>>();
+        let mut ordered = Vec::with_capacity(expected);
+        for result in results {
+            if !result.relevance_score.is_finite() {
+                return Err(AppError::BadGateway(
+                    "rerank provider returned a non-finite relevance score".into(),
+                ));
+            }
+            let Some(slot) = source.get_mut(result.index) else {
+                return Err(AppError::BadGateway(format!(
+                    "rerank provider returned out-of-range index {} for {} candidates",
+                    result.index,
+                    source.len()
+                )));
+            };
+            let Some(mut candidate) = slot.take() else {
+                return Err(AppError::BadGateway(format!(
+                    "rerank provider returned duplicate index {}",
+                    result.index
+                )));
+            };
+            candidate.hit.score = relevance_score(result.relevance_score);
+            ordered.push(candidate);
+        }
+        Ok(ordered)
+    }
+
+    fn retrieval_model_invoke(&self) -> Result<Arc<ModelInvokeService>, AppError> {
+        self.model_invoke
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .ok_or_else(|| AppError::Conflict("knowledge model invocation is not wired".into()))
+    }
+
+    /// Empty the search content cache (forced refresh / test isolation).
+    pub fn clear_search_cache(&self) {
+        let mut guard = self.search_cache.write().unwrap_or_else(|e| e.into_inner());
+        guard.entries.clear();
+        guard.total_bytes = 0;
+    }
+
+    #[cfg(test)]
+    fn search_cache_len(&self) -> usize {
+        self.search_cache.read().unwrap_or_else(|e| e.into_inner()).entries.len()
+    }
+
+    /// Resolve which knowledge base IDs a caller at `cwd` may search.
+    ///
+    /// - `cwd` empty OR maps to `DEFAULT_WORKPATH_KEY` (backend-managed temp
+    ///   workspace) OR no `workpath` binding exists for the key → returns ALL
+    ///   registered base IDs (broadest fallback — the model still cannot widen
+    ///   scope beyond what is registered).
+    /// - Otherwise → returns the `kb_ids` from the workpath binding (same set
+    ///   `ensure_mounts_for_target` would mount).
+    ///
+    /// Used by [`crate::mcp_server`] to resolve the search scope at runtime
+    /// from the caller's cwd rather than relying on baked `kb_ids`.
+    pub async fn resolve_kb_ids_for_cwd(&self, cwd: &str) -> Vec<KnowledgeBaseId> {
+        use crate::workpath::{DEFAULT_WORKPATH_KEY, WORKPATH_BINDING_KIND, session_workpath_key};
+
+        let key = if cwd.trim().is_empty() {
+            DEFAULT_WORKPATH_KEY.to_owned()
+        } else {
+            session_workpath_key(std::path::Path::new(cwd), &self.data_dir)
+        };
+
+        // DEFAULT_WORKPATH_KEY → all bases (no per-path scoping).
+        if key == DEFAULT_WORKPATH_KEY {
+            return self.all_base_ids().await;
+        }
+
+        // Look up the workpath binding — same row `ensure_mounts_for_target` uses.
+        match self.get_binding(WORKPATH_BINDING_KIND, &key).await {
+            Ok(binding) if binding.enabled && !binding.kb_ids.is_empty() => {
+                binding.kb_ids
+            }
+            // No row, disabled, or empty → fallback to all bases.
+            _ => self.all_base_ids().await,
+        }
+    }
+
+    /// All registered base IDs (the broadest search scope). Used as fallback
+    /// when no workpath binding narrows it.
+    async fn all_base_ids(&self) -> Vec<KnowledgeBaseId> {
+        match self.repo.list_bases().await {
+            Ok(rows) => rows
+                .into_iter()
+                .filter_map(|row| match KnowledgeBaseId::parse(&row.knowledge_base_id) {
+                    Ok(id) => Some(id),
+                    Err(error) => {
+                        tracing::warn!(
+                            knowledge_base_id = %row.knowledge_base_id,
+                            %error,
+                            "stored knowledge base id is invalid; omitting from scope"
+                        );
+                        None
+                    }
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to list knowledge bases for scope resolution");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Resolve the WRITE context for a terminal CLI caller's cwd: the bound
+    /// kb_ids (scope), the governing workpath binding (drives the write policy),
+    /// and a stable workpath key for staged-inbox placement. Mirrors
+    /// [`Self::resolve_kb_ids_for_cwd`] but also returns the binding + key the
+    /// write path needs. An empty/temp cwd (DEFAULT_WORKPATH_KEY) yields the
+    /// default binding (writeback off → policy Disabled), so a CLI started in an
+    /// unbound directory cannot write until the user enables write-back there.
+    pub async fn resolve_write_context_for_cwd(
+        &self,
+        cwd: &str,
+    ) -> (Vec<KnowledgeBaseId>, KnowledgeBinding, String) {
+        use crate::workpath::{DEFAULT_WORKPATH_KEY, WORKPATH_BINDING_KIND};
+
+        let key = self.workpath_key_for_cwd(cwd);
+        if key == DEFAULT_WORKPATH_KEY {
+            return (self.all_base_ids().await, KnowledgeBinding::default(), key);
+        }
+        let binding = self.get_binding(WORKPATH_BINDING_KIND, &key).await.unwrap_or_default();
+        let bound = if binding.enabled && !binding.kb_ids.is_empty() {
+            binding.kb_ids.clone()
+        } else {
+            self.all_base_ids().await
+        };
+        (bound, binding, key)
+    }
+
+    /// Live knowledge scope for a TERMINAL session's workspace: the binding
+    /// row is the single source of truth at CALL time, with no all-bases
+    /// convenience fallback — a terminal whose binding is disabled or empty
+    /// honestly has nothing mounted. Unlike the write-context resolver above,
+    /// the `__default__` sentinel also reads its real binding row, because
+    /// the terminal create-time picker persists exactly there for
+    /// backend-managed workspaces. Returns `(kb_ids, binding, workpath_key)`.
+    pub async fn resolve_terminal_scope_for_cwd(
+        &self,
+        cwd: &str,
+    ) -> (Vec<KnowledgeBaseId>, KnowledgeBinding, String) {
+        use crate::workpath::WORKPATH_BINDING_KIND;
+
+        let key = self.terminal_workpath_key_for_cwd(cwd);
+        let binding = self.get_binding(WORKPATH_BINDING_KIND, &key).await.unwrap_or_default();
+        let bound = if binding.enabled {
+            binding.kb_ids.clone()
+        } else {
+            Vec::new()
+        };
+        (bound, binding, key)
+    }
+
+    /// Backend data directory — used by `export` to place import temp dirs
+    /// next to the managed bases (same volume, cheap renames).
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// True when the managed knowledge root (`{data_dir}/knowledge`) and the
+    /// workspace overlap in either direction: the workspace IS the data root
+    /// or an ancestor of it (its sweep would run over the tree containing
+    /// every managed base), or the workspace lives INSIDE the managed root
+    /// (its sweep would run inside a knowledge base's own files).
+    /// Canonicalized on both sides so junction/symlink/8.3 spellings cannot
+    /// dodge the check; a path that fails to canonicalize (not yet existing)
+    /// is compared as-is.
+    fn workspace_overlaps_managed_root(&self, workspace: &Path) -> bool {
+        let managed_lexical = self.data_dir.join(KB_MANAGED_REL_DIR);
+        let managed = std::fs::canonicalize(&managed_lexical)
+            .map(|canonical| nomifun_common::paths::simplified(&canonical))
+            .unwrap_or(managed_lexical);
+        let ws = std::fs::canonicalize(workspace)
+            .map(|canonical| nomifun_common::paths::simplified(&canonical))
+            .unwrap_or_else(|_| workspace.to_path_buf());
+        managed.starts_with(&ws) || ws.starts_with(&managed)
+    }
+
+    async fn require_base(&self, id: &str) -> Result<KnowledgeBaseRow, AppError> {
+        let id = KnowledgeBaseId::parse(id).map_err(|error| {
+            AppError::BadRequest(format!("invalid knowledge base id '{id}': {error}"))
+        })?;
+        self.repo
+            .get_base(id.as_str())
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("knowledge base {} not found", id.as_str())))
+    }
+}
+
+fn load_one_knowledge_root(
+    kb_id: KnowledgeBaseId,
+    kb_name: String,
+    root: PathBuf,
+    cache: Arc<RwLock<SearchCacheInner>>,
+) -> Vec<RetrievalDocument> {
+    if let Err(error) = validate_knowledge_root(&root) {
+        tracing::warn!(
+            knowledge_base_id = %kb_id,
+            root = %root.display(),
+            %error,
+            "skipping unavailable or unsafe knowledge search root"
+        );
+        return Vec::new();
+    }
+    let mut documents = Vec::new();
+    for entry in vault_walker(&root) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if !is_md(path) {
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(&root) else {
+            continue;
+        };
+        let Some(rel) = rel.to_str().map(|rel| rel.replace('\\', "/")) else {
+            tracing::warn!(
+                path = %path.display(),
+                "skipping non-Unicode knowledge path during search"
+            );
+            continue;
+        };
+        let (mtime_ms, size) = match entry.metadata() {
+            Ok(metadata) => (
+                metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| {
+                        time.duration_since(std::time::UNIX_EPOCH).ok()
+                    })
+                    .map(|duration| duration.as_millis() as u64)
+                    .unwrap_or(0),
+                metadata.len(),
+            ),
+            Err(_) => (0, 0),
+        };
+        let absolute = path.to_path_buf();
+        let cached = {
+            let guard =
+                cache.read().unwrap_or_else(|error| error.into_inner());
+            guard
+                .entries
+                .get(&absolute)
+                .filter(|cached| {
+                    cached.mtime_ms == mtime_ms
+                        && cached.bytes as u64 == size
+                })
+                .map(|cached| {
+                    (
+                        Arc::clone(&cached.content),
+                        Arc::clone(&cached.heading),
+                    )
+                })
+        };
+        let (content, heading): (Arc<str>, Arc<str>) =
+            if let Some(cached) = cached {
+                cached
+            } else {
+                let Ok(raw) = std::fs::read_to_string(path) else {
+                    continue;
+                };
+                let heading: Arc<str> = first_heading_text(&raw).into();
+                let content: Arc<str> = raw.into();
+                if content.len() <= MAX_SEARCH_CACHE_FILE_BYTES {
+                    let mut guard = cache
+                        .write()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if let Some(old) = guard.entries.remove(&absolute) {
+                        guard.total_bytes =
+                            guard.total_bytes.saturating_sub(old.bytes);
+                    }
+                    if guard.total_bytes + content.len()
+                        <= MAX_SEARCH_CACHE_BYTES
+                    {
+                        guard.total_bytes += content.len();
+                        guard.entries.insert(
+                            absolute,
+                            CachedDoc {
+                                mtime_ms,
+                                content: Arc::clone(&content),
+                                heading: Arc::clone(&heading),
+                                bytes: content.len(),
+                            },
+                        );
+                    }
+                }
+                (content, heading)
+            };
+        documents.push(RetrievalDocument {
+            kb_id: kb_id.clone(),
+            kb_name: kb_name.clone(),
+            rel_path: rel,
+            heading: heading.to_string(),
+            content,
+        });
+    }
+    documents
+}
+
+fn local_keyword_candidates(
+    documents: Vec<RetrievalDocument>,
+    query: &str,
+    limit: usize,
+) -> Vec<RetrievalCandidate> {
+    let query_lc = query.to_lowercase();
+    let terms = query_terms(&query_lc);
+    let mut candidates = documents
+        .into_iter()
+        .filter_map(|document| {
+            let (score, snippet) = score_md(
+                &document.rel_path,
+                &document.heading,
+                &document.content,
+                &query_lc,
+                &terms,
+            )?;
+            Some(RetrievalCandidate {
+                hit: KnowledgeSearchHit {
+                    kb_id: document.kb_id,
+                    kb_name: document.kb_name,
+                    rel_path: document.rel_path,
+                    heading: document.heading,
+                    snippet,
+                    score,
+                },
+                content: document.content,
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| {
+        b.hit
+            .score
+            .cmp(&a.hit.score)
+            .then(a.hit.kb_id.as_str().cmp(b.hit.kb_id.as_str()))
+            .then(a.hit.rel_path.cmp(&b.hit.rel_path))
+    });
+    candidates.truncate(limit);
+    candidates
+}
+
+fn retrieval_document_text(document: &RetrievalDocument) -> String {
+    let body = document
+        .content
+        .chars()
+        .take(REMOTE_RETRIEVAL_MAX_DOCUMENT_CHARS)
+        .collect::<String>();
+    format!(
+        "Knowledge base: {}\nPath: {}\nHeading: {}\n\n{}",
+        document.kb_name, document.rel_path, document.heading, body
+    )
+}
+
+fn retrieval_candidate_text(candidate: &RetrievalCandidate) -> String {
+    let body = candidate
+        .content
+        .chars()
+        .take(REMOTE_RETRIEVAL_MAX_DOCUMENT_CHARS)
+        .collect::<String>();
+    format!(
+        "Knowledge base: {}\nPath: {}\nHeading: {}\n\n{}",
+        candidate.hit.kb_name, candidate.hit.rel_path, candidate.hit.heading, body
+    )
+}
+
+async fn invoke_embedding_batch(
+    invoke: &ModelInvokeService,
+    model_ref: &ModelRef,
+    inputs: Vec<String>,
+) -> Result<Vec<Vec<f32>>, AppError> {
+    let expected = inputs.len();
+    let outcome = invoke
+        .invoke(
+            model_ref,
+            TaskRequest::Embedding(EmbedRequest {
+                inputs,
+                extra: serde_json::json!({}),
+            }),
+        )
+        .await
+        .map_err(AppError::from)?;
+    let TaskOutcome::Done(TaskResult::Embeddings(vectors)) = outcome else {
+        return Err(AppError::BadGateway(
+            "embedding provider did not return completed embedding vectors".into(),
+        ));
+    };
+    if vectors.len() != expected {
+        return Err(AppError::BadGateway(format!(
+            "embedding provider returned {} vectors for {expected} inputs",
+            vectors.len()
+        )));
+    }
+    Ok(vectors)
+}
+
+fn validate_embedding_vector(
+    vector: &[f32],
+    expected_dimension: Option<usize>,
+    label: &str,
+) -> Result<(), AppError> {
+    if vector.is_empty() {
+        return Err(AppError::BadGateway(format!(
+            "embedding provider returned an empty vector for '{label}'"
+        )));
+    }
+    if let Some(expected) = expected_dimension {
+        if vector.len() != expected {
+            return Err(AppError::BadGateway(format!(
+                "embedding provider returned dimension {} for '{label}'; expected {expected}",
+                vector.len()
+            )));
+        }
+    }
+    if vector.iter().any(|value| !value.is_finite()) {
+        return Err(AppError::BadGateway(format!(
+            "embedding provider returned a non-finite vector for '{label}'"
+        )));
+    }
+    let norm = vector
+        .iter()
+        .map(|value| f64::from(*value) * f64::from(*value))
+        .sum::<f64>();
+    if !norm.is_finite() || norm <= f64::EPSILON {
+        return Err(AppError::BadGateway(format!(
+            "embedding provider returned a zero-norm vector for '{label}'"
+        )));
+    }
+    Ok(())
+}
+
+fn cosine_similarity(left: &[f32], right: &[f32]) -> Option<f32> {
+    if left.len() != right.len() || left.is_empty() {
+        return None;
+    }
+    let mut dot = 0.0f64;
+    let mut left_norm = 0.0f64;
+    let mut right_norm = 0.0f64;
+    for (left, right) in left.iter().zip(right) {
+        let left = f64::from(*left);
+        let right = f64::from(*right);
+        if !left.is_finite() || !right.is_finite() {
+            return None;
+        }
+        dot += left * right;
+        left_norm += left * left;
+        right_norm += right * right;
+    }
+    let denominator = left_norm.sqrt() * right_norm.sqrt();
+    if !denominator.is_finite() || denominator <= f64::EPSILON {
+        return None;
+    }
+    let similarity = dot / denominator;
+    similarity.is_finite().then_some(similarity.clamp(-1.0, 1.0) as f32)
+}
+
+fn similarity_score(similarity: f32) -> u32 {
+    (((f64::from(similarity).clamp(-1.0, 1.0) + 1.0) * 500_000.0).round()) as u32
+}
+
+fn relevance_score(score: f32) -> u32 {
+    (f64::from(score).max(0.0).min(f64::from(u32::MAX) / 1_000_000.0) * 1_000_000.0)
+        .round() as u32
+}
+
+/// Conversation-delete hook: drop the conversation's knowledge binding so
+/// rows don't accumulate as orphans. Failures are logged, never propagated
+/// (hook contract).
+#[async_trait::async_trait]
+impl nomifun_common::OnConversationDelete for KnowledgeService {
+    async fn on_conversation_deleted(&self, _user_id: &str, conversation_id: &str) {
+        if let Err(e) = self
+            .repo
+            .delete_binding("conversation", conversation_id)
+            .await
+        {
+            tracing::warn!(conversation_id, error = %e, "failed to delete knowledge binding");
+        }
+    }
+}
+
+impl KnowledgeService {
+
+    async fn row_to_info(&self, row: KnowledgeBaseRow) -> Result<KnowledgeBaseInfo, AppError> {
+        let source = source_from_extra(&row.extra)
+            .map_err(|error| knowledge_row_json_error(&row.knowledge_base_id, error))?;
+        let tree_access = knowledge_tree_access(&row)?;
+        let root = PathBuf::from(&row.root_path);
+        let root_for_stats_lock = root.clone();
+        // Bounded so a slow/stale NAS mount degrades (assume present, counts
+        // unknown) instead of hanging the list/detail response past the
+        // client's request timeout — the reported "加载失败" failure mode.
+        let (file_count, total_size, root_exists) =
+            bounded_root_blocking(
+                &root_for_stats_lock,
+                BASE_WALK_BUDGET,
+                (0u64, 0u64, true),
+                move || {
+                if validate_knowledge_root(&root).is_err() {
+                    return (0u64, 0u64, false);
+                }
+                let mut count = 0u64;
+                let mut size = 0u64;
+                for entry in vault_walker(&root) {
+                    if entry.file_type().is_file() && is_md(entry.path()) {
+                        count += 1;
+                        size += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    }
+                }
+                (count, size, true)
+            },
+            )
+            .await;
+
+        let tags = tags_from_row(&row)?;
+
+        let kind = derive_kind(row.managed, source.as_ref()).to_string();
+
+        Ok(KnowledgeBaseInfo {
+            knowledge_base_id: KnowledgeBaseId::parse(&row.knowledge_base_id).map_err(|error| {
+                AppError::Internal(format!(
+                    "stored knowledge base id '{}' is invalid: {error}",
+                    row.knowledge_base_id
+                ))
+            })?,
+            name: row.name,
+            description: row.description,
+            root_path: row.root_path,
+            managed: row.managed,
+            tree_access,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            file_count,
+            total_size,
+            root_exists,
+            source,
+            source_fetch: None,
+            tags,
+            kind,
+        })
+    }
+}
+
+fn validate_kind(kind: &str) -> Result<(), AppError> {
+    if BINDING_KINDS.contains(&kind) {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(format!("unsupported binding kind: {kind}")))
+    }
+}
+
+/// Canonical storage form of a binding `target_id`. Workpath targets are
+/// re-normalized server-side ([`workpath_key`] is idempotent), so every
+/// client spelling of the same directory (trailing slash, backslashes)
+/// converges on one binding row; other kinds carry opaque ids unchanged.
+fn canonical_target_id(kind: &str, target_id: &str) -> Result<String, AppError> {
+    let invalid = |error: UuidV7Error| {
+        AppError::BadRequest(format!("invalid {kind} target id '{target_id}': {error}"))
+    };
+    match kind {
+        WORKPATH_BINDING_KIND => Ok(workpath_key(target_id)),
+        "conversation" => ConversationId::parse(target_id).map(|id| id.into_string()).map_err(invalid),
+        "terminal" => TerminalId::parse(target_id).map(|id| id.into_string()).map_err(invalid),
+        "companion" => CompanionId::parse(target_id).map(|id| id.into_string()).map_err(invalid),
+        _ => Err(AppError::BadRequest(format!("unsupported binding kind: {kind}"))),
+    }
+}
+
+/// Run one completion against either the completer's default model
+/// (`override_model = None`) or an explicit `(provider_id, model)`
+/// (`Some`). The single dispatch point so the default-vs-override branch is
+/// written once for every knowledge LLM call.
+async fn complete_dispatch(
+    completer: &dyn KnowledgeCompleter,
+    system: &str,
+    user: &str,
+    override_model: Option<&(String, String)>,
+) -> Result<String, AppError> {
+    match override_model {
+        Some((provider_id, model)) => completer.complete_with(system, user, provider_id, model).await,
+        None => completer.complete(system, user).await,
+    }
+}
+
+/// Overview-call wrapper around [`complete_dispatch`] (the overview path
+/// inlines its own retry loop, so it only needs the single-shot dispatch).
+async fn complete_overview(
+    completer: &dyn KnowledgeCompleter,
+    user: &str,
+    override_model: Option<&(String, String)>,
+) -> Result<String, AppError> {
+    complete_dispatch(completer, autogen::OVERVIEW_SYSTEM, user, override_model).await
+}
+
+/// Run one description-only completion with the overview path's tolerance:
+/// one retry on parse failure (the model occasionally wraps in prose),
+/// provider failures propagate immediately, and the result is clamped to
+/// [`autogen::DESCRIPTION_MAX_CHARS`]. `override_model` pins an explicit
+/// `(provider_id, model)` (UI picker); `None` uses the completer's default.
+async fn complete_description(
+    completer: &dyn KnowledgeCompleter,
+    system: &str,
+    user: &str,
+    override_model: Option<&(String, String)>,
+) -> Result<String, AppError> {
+    let mut last_err = String::new();
+    for attempt in 0..2 {
+        let raw = complete_dispatch(completer, system, user, override_model).await?;
+        match autogen::parse_description_output(&raw) {
+            Ok(description) => return Ok(autogen::clamp_description(&description)),
+            Err(e) => {
+                last_err = e;
+                tracing::debug!(attempt, error = %last_err, "knowledge description output unparseable");
+            }
+        }
+    }
+    Err(AppError::BadGateway(format!(
+        "knowledge description output unparseable: {last_err}"
+    )))
+}
+
+fn binding_from_row((row, kb_ids): (KnowledgeBindingRow, Vec<String>)) -> Result<KnowledgeBinding, AppError> {
+    if !WRITEBACK_EAGERNESS.contains(&row.writeback_eagerness.as_str()) {
+        return Err(AppError::Internal(format!(
+            "knowledge binding '{}' contains invalid writeback_eagerness '{}'",
+            row.id, row.writeback_eagerness
+        )));
+    }
+    let kb_ids = kb_ids
+        .into_iter()
+        .map(|id| KnowledgeBaseId::parse(id.clone()).map_err(|error| {
+            AppError::Internal(format!(
+                "knowledge binding '{}' contains invalid base id '{id}': {error}",
+                row.id
+            ))
+        }))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(KnowledgeBinding {
+        enabled: row.enabled,
+        writeback: row.writeback,
+        writeback_eagerness: row.writeback_eagerness,
+        channel_write_enabled: row.channel_write_enabled,
+        kb_ids,
+    })
+}
+
+#[derive(Debug)]
+enum KnowledgeExtraError {
+    InvalidJson(serde_json::Error),
+    NotObject,
+    InvalidSource(serde_json::Error),
+}
+
+impl std::fmt::Display for KnowledgeExtraError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidJson(error) => write!(formatter, "extra is invalid JSON: {error}"),
+            Self::NotObject => formatter.write_str("extra must be a JSON object"),
+            Self::InvalidSource(error) => {
+                write!(formatter, "extra.source is invalid: {error}")
+            }
+        }
+    }
+}
+
+fn knowledge_row_json_error(knowledge_base_id: &str, error: KnowledgeExtraError) -> AppError {
+    AppError::Internal(format!(
+        "knowledge base {knowledge_base_id} has invalid persisted metadata: {error}"
+    ))
+}
+
+/// Deserialize the canonical `extra.source` field.
+///
+/// An absent field is a valid source-less base. Invalid JSON, a non-object
+/// `extra`, or a malformed `source` is persisted corruption and must not be
+/// silently reinterpreted as absence.
+fn source_from_extra(extra: &str) -> Result<Option<KnowledgeSource>, KnowledgeExtraError> {
+    let value: serde_json::Value =
+        serde_json::from_str(extra).map_err(KnowledgeExtraError::InvalidJson)?;
+    let object = value.as_object().ok_or(KnowledgeExtraError::NotObject)?;
+    object
+        .get("source")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(KnowledgeExtraError::InvalidSource)
+}
+
+fn knowledge_tree_access(row: &KnowledgeBaseRow) -> Result<KnowledgeTreeAccess, AppError> {
+    match row.tree_access.as_str() {
+        "editable" => Ok(KnowledgeTreeAccess::Editable),
+        "read_only" => Ok(KnowledgeTreeAccess::ReadOnly),
+        value => Err(AppError::Internal(format!(
+            "knowledge base {} has invalid tree_access value: {value}",
+            row.knowledge_base_id
+        ))),
+    }
+}
+
+fn persisted_knowledge_tree_access(access: KnowledgeTreeAccess) -> &'static str {
+    match access {
+        KnowledgeTreeAccess::Editable => "editable",
+        KnowledgeTreeAccess::ReadOnly => "read_only",
+    }
+}
+
+fn require_editable_knowledge_tree(row: &KnowledgeBaseRow) -> Result<(), AppError> {
+    if knowledge_tree_access(row)? == KnowledgeTreeAccess::Editable {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
+            "knowledge base is read-only; explicitly grant folder edit access before changing its files or directories"
+                .into(),
+        ))
+    }
+}
+
+fn tags_from_row(row: &KnowledgeBaseRow) -> Result<Vec<String>, AppError> {
+    row.tags
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "knowledge base {} has invalid tags JSON: {error}",
+                row.knowledge_base_id
+            ))
+        })
+        .map(Option::unwrap_or_default)
+}
+
+/// Derive the UI type discriminator for a knowledge base:
+/// - `"web"` when a URL source is attached (`kind == "url"`)
+/// - `"blank"` for managed bases with no source (user creates from scratch)
+/// - `"local"` for non-managed (user-referenced directory) bases
+fn derive_kind(managed: bool, source: Option<&KnowledgeSource>) -> &'static str {
+    match source.map(|s| s.kind.as_str()) {
+        Some("url") => "web",
+        _ => if managed { "blank" } else { "local" },
+    }
+}
+
+/// Syntactic validation of a client-supplied source config (full SSRF
+/// resolution happens per fetch, not here — live-mode URLs are stored
+/// without ever being fetched by us).
+///
+/// **P3-K3**: the per-entry `rendered` flag is meaningful only for URL sources.
+/// It needs no dedicated check here because the `kind != "url"` guard below
+/// rejects every non-URL source outright (rendered or not), so a `rendered`
+/// entry can only ever reach storage on a `url` source. The flag must also be
+/// backed by a valid http(s) URL — already guaranteed by the per-entry URL
+/// validation in the loop. `rendered` is best-effort routing (browser backend
+/// when wired, HTTP otherwise), so an unsupported value can never make a config
+/// invalid; there is intentionally nothing to reject.
+fn validate_source(source: &KnowledgeSource) -> Result<(), AppError> {
+    if source.kind != "url" {
+        return Err(AppError::BadRequest(format!(
+            "unsupported source kind \"{}\" (only \"url\" is supported)",
+            source.kind
+        )));
+    }
+    validate_url_source(source)
+}
+
+fn sanitize_source_entries(source: &mut KnowledgeSource) {
+    for entry in &mut source.entries {
+        entry.url = entry.url.trim().to_owned();
+        entry.title = entry
+            .title
+            .take()
+            .map(|title| title.trim().to_owned())
+            .filter(|title| !title.is_empty());
+    }
+}
+
+fn validate_unique_source_urls(source: &KnowledgeSource) -> Result<(), AppError> {
+    let mut identities = HashSet::with_capacity(source.entries.len());
+    for entry in &source.entries {
+        let identity = normalize_source_url(&entry.url)?;
+        if !identities.insert(identity) {
+            return Err(AppError::BadRequest(format!(
+                "duplicate source URL: {}",
+                entry.url
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn persisted_source_mode(mode: KnowledgeSourceMode) -> PersistedKnowledgeSourceMode {
+    match mode {
+        KnowledgeSourceMode::Live => PersistedKnowledgeSourceMode::Live,
+        KnowledgeSourceMode::Snapshot => PersistedKnowledgeSourceMode::Snapshot,
+    }
+}
+
+fn api_source_mode(mode: PersistedKnowledgeSourceMode) -> KnowledgeSourceMode {
+    match mode {
+        PersistedKnowledgeSourceMode::Live => KnowledgeSourceMode::Live,
+        PersistedKnowledgeSourceMode::Snapshot => KnowledgeSourceMode::Snapshot,
+    }
+}
+
+fn persisted_sync_status(status: KnowledgeSourceSyncStatus) -> KnowledgeSourceItemSyncStatus {
+    match status {
+        KnowledgeSourceSyncStatus::Pending => KnowledgeSourceItemSyncStatus::Pending,
+        KnowledgeSourceSyncStatus::Syncing => KnowledgeSourceItemSyncStatus::Syncing,
+        KnowledgeSourceSyncStatus::Synced => KnowledgeSourceItemSyncStatus::Synced,
+        KnowledgeSourceSyncStatus::Failed => KnowledgeSourceItemSyncStatus::Failed,
+        KnowledgeSourceSyncStatus::Conflicted => KnowledgeSourceItemSyncStatus::Conflicted,
+        KnowledgeSourceSyncStatus::Missing => KnowledgeSourceItemSyncStatus::Missing,
+        KnowledgeSourceSyncStatus::Paused => KnowledgeSourceItemSyncStatus::Pending,
+    }
+}
+
+fn api_sync_status(
+    state: KnowledgeSourceState,
+    status: KnowledgeSourceItemSyncStatus,
+) -> KnowledgeSourceSyncStatus {
+    if state != KnowledgeSourceState::Active {
+        return KnowledgeSourceSyncStatus::Paused;
+    }
+    match status {
+        KnowledgeSourceItemSyncStatus::Pending => KnowledgeSourceSyncStatus::Pending,
+        KnowledgeSourceItemSyncStatus::Syncing => KnowledgeSourceSyncStatus::Syncing,
+        KnowledgeSourceItemSyncStatus::Synced => KnowledgeSourceSyncStatus::Synced,
+        KnowledgeSourceItemSyncStatus::Failed => KnowledgeSourceSyncStatus::Failed,
+        KnowledgeSourceItemSyncStatus::Conflicted => KnowledgeSourceSyncStatus::Conflicted,
+        KnowledgeSourceItemSyncStatus::Missing => KnowledgeSourceSyncStatus::Missing,
+    }
+}
+
+fn api_source_relationship(
+    relationship: KnowledgeEntryProvenanceRelationship,
+) -> KnowledgeEntrySourceRelationship {
+    match relationship {
+        KnowledgeEntryProvenanceRelationship::Managed => {
+            KnowledgeEntrySourceRelationship::Managed
+        }
+        KnowledgeEntryProvenanceRelationship::Detached => {
+            KnowledgeEntrySourceRelationship::Detached
+        }
+        KnowledgeEntryProvenanceRelationship::Copy => KnowledgeEntrySourceRelationship::Copy,
+    }
+}
+
+fn validate_url_source(source: &KnowledgeSource) -> Result<(), AppError> {
+    if source.entries.is_empty() {
+        return Err(AppError::BadRequest("source.entries must not be empty".into()));
+    }
+    if source.entries.len() > MAX_SOURCE_HISTORY_ENTRIES {
+        return Err(AppError::BadRequest(format!(
+            "source history exceeds the limit of {MAX_SOURCE_HISTORY_ENTRIES} entries"
+        )));
+    }
+    let active_entries = source
+        .entries
+        .iter()
+        .filter(|entry| entry.sync_status != KnowledgeSourceSyncStatus::Paused)
+        .count();
+    if active_entries > MAX_SOURCE_ENTRIES {
+        return Err(AppError::BadRequest(format!(
+            "active source.entries exceeds the limit of {MAX_SOURCE_ENTRIES} (got {active_entries})"
+        )));
+    }
+    for entry in &source.entries {
+        if entry.url.len() > 8192 || entry.url.contains('\0') {
+            return Err(AppError::BadRequest(
+                "source URL must be at most 8192 bytes and contain no NUL".into(),
+            ));
+        }
+        if entry
+            .title
+            .as_ref()
+            .is_some_and(|title| title.len() > 1024 || title.contains('\0'))
+        {
+            return Err(AppError::BadRequest(
+                "source title must be at most 1024 bytes and contain no NUL".into(),
+            ));
+        }
+        let url = Url::parse(entry.url.trim())
+            .map_err(|e| AppError::BadRequest(format!("invalid source URL {}: {e}", entry.url)))?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err(AppError::BadRequest(format!(
+                "only http(s) source URLs are supported: {}",
+                entry.url
+            )));
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(AppError::BadRequest(
+                "source URLs must not contain embedded credentials".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_source_url(raw: &str) -> Result<String, AppError> {
+    let mut url = Url::parse(raw.trim())
+        .map_err(|error| AppError::BadRequest(format!("invalid source URL {raw}: {error}")))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(AppError::BadRequest(format!(
+            "only http(s) source URLs are supported: {raw}"
+        )));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(AppError::BadRequest(
+            "source URLs must not contain embedded credentials".into(),
+        ));
+    }
+    // URL fragments are client-side navigation and never reach the fetcher;
+    // treating them as source identity would create duplicate captures of the
+    // same network resource.
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
+/// Allocate deterministic snapshot paths for the complete ordered source.
+/// Reserve a slug even when that entry's current fetch fails; otherwise a
+/// later same-slug URL would move between `slug.md` and `slug-2.md` as network
+/// outcomes change, potentially overwriting the wrong page on an append.
+fn source_snapshot_rel_paths(entries: &[KnowledgeSourceEntry]) -> Vec<String> {
+    let mut used_slugs: HashSet<String> = HashSet::new();
+    entries
+        .iter()
+        .map(|entry| {
+            let slug_base = Url::parse(entry.url.trim())
+                .map(|url| source_url::slug_for_url(&url))
+                .unwrap_or_else(|_| "page".into());
+            let mut slug = slug_base.clone();
+            let mut suffix = 2;
+            while !used_slugs.insert(slug.clone()) {
+                slug = format!("{slug_base}-{suffix}");
+                suffix += 1;
+            }
+            format!("{}/{slug}.md", source_url::SNAPSHOT_REL_DIR)
+        })
+        .collect()
+}
+
+fn allocate_managed_source_rel_path(
+    root: &Path,
+    destination_parent_rel_path: &str,
+    requested_url: &str,
+) -> Result<String, AppError> {
+    validate_knowledge_root(root)?;
+    let (parent, parent_rel_path) = if destination_parent_rel_path.is_empty() {
+        let directory_name = source_url::SNAPSHOT_REL_DIR;
+        let directory = match find_portable_tree_child(root, directory_name)? {
+            Some(existing) => {
+                if metadata_is_link_or_reparse(&existing.path, &existing.metadata)
+                    || !existing.metadata.is_dir()
+                {
+                    return Err(AppError::Conflict(
+                        "the default web-capture destination is not a real directory".into(),
+                    ));
+                }
+                existing.path
+            }
+            None => {
+                let path = root.join(directory_name);
+                std::fs::create_dir(&path).map_err(|error| {
+                    AppError::Internal(format!(
+                        "failed to create default web-capture directory: {error}"
+                    ))
+                })?;
+                path
+            }
+        };
+        (directory, directory_name.to_owned())
+    } else {
+        let (path, metadata) = resolve_tree_existing_path(root, destination_parent_rel_path)?;
+        if !metadata.is_dir() {
+            return Err(AppError::BadRequest(format!(
+                "web-capture destination is not a directory: {destination_parent_rel_path}"
+            )));
+        }
+        (path, destination_parent_rel_path.to_owned())
+    };
+    let parsed = Url::parse(requested_url).map_err(|error| {
+        AppError::Internal(format!(
+            "stored knowledge source URL is invalid ({requested_url}): {error}"
+        ))
+    })?;
+    let base = source_url::slug_for_url(&parsed);
+    for sequence in 1..=10_000usize {
+        let name = if sequence == 1 {
+            format!("{base}.md")
+        } else {
+            format!("{base}-{sequence}.md")
+        };
+        validate_portable_path_component(&name)?;
+        if find_portable_tree_child(&parent, &name)?.is_none() {
+            return Ok(join_tree_rel_path(&parent_rel_path, &name));
+        }
+    }
+    Err(AppError::Conflict(
+        "could not allocate a unique file name for the captured web page".into(),
+    ))
+}
+
+fn allocate_copy_rel_path(
+    root: &Path,
+    destination_parent_rel_path: &str,
+    preferred_name: &str,
+) -> Result<String, AppError> {
+    validate_knowledge_root(root)?;
+    let (parent, parent_rel_path) = if destination_parent_rel_path.is_empty() {
+        (root.to_path_buf(), String::new())
+    } else {
+        let (path, metadata) = resolve_tree_existing_path(root, destination_parent_rel_path)?;
+        if !metadata.is_dir() {
+            return Err(AppError::BadRequest(
+                "copy destination must be a directory".into(),
+            ));
+        }
+        (path, destination_parent_rel_path.to_owned())
+    };
+    let preferred = validate_tree_entry_name(preferred_name)?;
+    if !is_md(Path::new(&preferred)) {
+        return Err(AppError::BadRequest(
+            "editable knowledge copies must use a .md file name".into(),
+        ));
+    }
+    let stem = preferred.strip_suffix(".md").unwrap_or(&preferred);
+    for sequence in 1..=10_000usize {
+        let name = if sequence == 1 {
+            preferred.clone()
+        } else {
+            format!("{stem} ({sequence}).md")
+        };
+        if find_portable_tree_child(&parent, &name)?.is_none() {
+            return Ok(join_tree_rel_path(&parent_rel_path, &name));
+        }
+    }
+    Err(AppError::Conflict(
+        "could not allocate a unique editable-copy file name".into(),
+    ))
+}
+
+fn allocate_source_trash_path(
+    root: &Path,
+    source_item_id: &KnowledgeSourceItemId,
+    original_name: &str,
+) -> Result<PathBuf, AppError> {
+    validate_knowledge_root(root)?;
+    let trash = root.join(".nomifun-trash");
+    match std::fs::symlink_metadata(&trash) {
+        Ok(metadata) => {
+            if metadata_is_link_or_reparse(&trash, &metadata) || !metadata.is_dir() {
+                return Err(AppError::Conflict(
+                    "knowledge trash must be a real directory".into(),
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&trash).map_err(|error| {
+                AppError::Internal(format!("failed to create knowledge trash: {error}"))
+            })?;
+        }
+        Err(error) => {
+            return Err(AppError::Internal(format!(
+                "failed to inspect knowledge trash: {error}"
+            )));
+        }
+    }
+    let safe_name = original_name.replace(['/', '\\'], "-");
+    let safe_name = source_url::truncate_to_bytes(&safe_name, 160)
+        .trim_end_matches([' ', '.']);
+    let safe_name = if safe_name.is_empty() {
+        "document.md"
+    } else {
+        safe_name
+    };
+    for _ in 0..128 {
+        let candidate = trash.join(format!("source-{source_item_id}-{}-{safe_name}", generate_id()));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(AppError::Conflict(
+        "could not allocate a recoverable trash path for the source document".into(),
+    ))
+}
+
+async fn ensure_snapshot_trash_dir(root: &Path) -> Result<PathBuf, AppError> {
+    validate_knowledge_root_bounded(root.to_path_buf()).await?;
+    let snapshots = root.join(source_url::SNAPSHOT_REL_DIR);
+    let snapshots_metadata =
+        tokio::fs::symlink_metadata(&snapshots).await.map_err(|error| {
+            AppError::Internal(format!(
+                "failed to inspect knowledge snapshots directory: {error}"
+            ))
+        })?;
+    if metadata_is_link_or_reparse(&snapshots, &snapshots_metadata)
+        || !snapshots_metadata.is_dir()
+    {
+        return Err(AppError::Conflict(
+            "knowledge snapshots directory must be a real directory".into(),
+        ));
+    }
+    let trash = snapshots.join("_trash");
+    match tokio::fs::symlink_metadata(&trash).await {
+        Ok(metadata) => {
+            if metadata_is_link_or_reparse(&trash, &metadata)
+                || !metadata.is_dir()
+            {
+                return Err(AppError::Conflict(
+                    "knowledge snapshot trash must be a real directory"
+                        .into(),
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match tokio::fs::create_dir(&trash).await {
+                Ok(()) => {}
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(AppError::Internal(format!(
+                        "failed to create knowledge snapshot trash: {error}"
+                    )));
+                }
+            }
+            let metadata =
+                tokio::fs::symlink_metadata(&trash).await.map_err(|error| {
+                    AppError::Internal(format!(
+                        "failed to inspect created knowledge snapshot trash: {error}"
+                    ))
+                })?;
+            if metadata_is_link_or_reparse(&trash, &metadata)
+                || !metadata.is_dir()
+            {
+                return Err(AppError::Conflict(
+                    "knowledge snapshot trash was replaced during creation"
+                        .into(),
+                ));
+            }
+        }
+        Err(error) => {
+            return Err(AppError::Internal(format!(
+                "failed to inspect knowledge snapshot trash: {error}"
+            )));
+        }
+    }
+    Ok(trash)
+}
+
+/// Move one managed snapshot into a unique recoverable trash entry. When
+/// `expected_content` is supplied, an editor replacement detected immediately
+/// before the atomic no-clobber move is preserved in place.
+async fn quarantine_snapshot_file(
+    root: &Path,
+    source: &Path,
+    expected_content: Option<&str>,
+) -> Result<bool, AppError> {
+    validate_knowledge_root_bounded(root.to_path_buf()).await?;
+    let metadata = match tokio::fs::symlink_metadata(source).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        Err(error) => {
+            return Err(AppError::Internal(format!(
+                "failed to inspect knowledge snapshot {}: {error}",
+                source.display()
+            )));
+        }
+    };
+    if metadata_is_link_or_reparse(source, &metadata) || !metadata.is_file() {
+        return Err(AppError::Conflict(format!(
+            "knowledge snapshot is not a real file: {}",
+            source.display()
+        )));
+    }
+    if let Some(expected) = expected_content {
+        let current = tokio::time::timeout(
+            KNOWLEDGE_FILE_IO_TIMEOUT,
+            tokio::fs::read_to_string(source),
+        )
+        .await
+        .map_err(|_| {
+            AppError::Timeout(format!(
+                "knowledge snapshot compare timed out: {}",
+                source.display()
+            ))
+        })?
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "failed to compare knowledge snapshot {}: {error}",
+                source.display()
+            ))
+        })?;
+        if current != expected {
+            tracing::info!(
+                path = %source.display(),
+                "preserving snapshot because its contents changed before quarantine"
+            );
+            return Ok(false);
+        }
+    }
+    let trash = ensure_snapshot_trash_dir(root).await?;
+    let destination = trash.join(format!(
+        "snapshot-{}.md",
+        generate_id()
+    ));
+    publish_file_no_clobber(source, &destination)
+        .await
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "failed to quarantine knowledge snapshot {}: {error}",
+                source.display()
+            ))
+        })?;
+    Ok(true)
+}
+
+/// Quarantine `{root}/snapshots/*.md` files whose managed-header `source_url` no
+/// longer appears in the configured entries (orphans left behind after the
+/// entry list shrank). Files WITHOUT a managed `source_url` header are
+/// user-authored and never touched. The entire mutation boundary is no-follow,
+/// recoverable, and fail-closed.
+async fn prune_orphan_snapshots(
+    root: &Path,
+    entries: &[KnowledgeSourceEntry],
+) -> Result<(), AppError> {
+    validate_knowledge_root_bounded(root.to_path_buf()).await?;
+    let urls: HashSet<&str> = entries.iter().map(|e| e.url.trim()).collect();
+    let snap_dir = root.join(source_url::SNAPSHOT_REL_DIR);
+    let snapshot_metadata = match tokio::fs::symlink_metadata(&snap_dir).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(AppError::Internal(format!(
+                "failed to inspect knowledge snapshots directory: {error}"
+            )));
+        }
+    };
+    if metadata_is_link_or_reparse(&snap_dir, &snapshot_metadata)
+        || !snapshot_metadata.is_dir()
+    {
+        return Err(AppError::Conflict(
+            "knowledge snapshots directory must be a real directory, not a link or reparse point"
+                .into(),
+        ));
+    }
+    let mut dir = tokio::fs::read_dir(&snap_dir).await.map_err(|error| {
+        AppError::Internal(format!(
+            "failed to read knowledge snapshots directory: {error}"
+        ))
+    })?;
+    while let Some(entry) = dir.next_entry().await.map_err(|error| {
+        AppError::Internal(format!(
+            "failed to scan knowledge snapshots directory: {error}"
+        ))
+    })? {
+        let path = entry.path();
+        let metadata = tokio::fs::symlink_metadata(&path).await.map_err(|error| {
+            AppError::Internal(format!(
+                "failed to inspect knowledge snapshot {}: {error}",
+                path.display()
+            ))
+        })?;
+        if metadata_is_link_or_reparse(&path, &metadata) {
+            return Err(AppError::Conflict(format!(
+                "knowledge snapshot is a link or reparse point: {}",
+                path.display()
+            )));
+        }
+        if !metadata.is_file() || !is_md(&path) {
+            continue;
+        }
+        let content = tokio::fs::read_to_string(&path).await.map_err(|error| {
+            AppError::Internal(format!(
+                "failed to read knowledge snapshot {}: {error}",
+                path.display()
+            ))
+        })?;
+        // No managed source_url header ⇒ not ours ⇒ keep.
+        let Some(src_url) = source_url::snapshot_source_url(&content) else {
+            continue;
+        };
+        if !urls.contains(src_url.trim()) {
+            if quarantine_snapshot_file(root, &path, Some(&content)).await? {
+                tracing::info!(path = %path.display(), source_url = src_url, "quarantined orphan knowledge snapshot");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Atomic text write (temp sibling + rename), creating parent dirs.
+/// Condense an oversized snapshot body for storage and flag lossy results.
+/// Above the compress threshold (and with a completer) the body is
+/// LLM-summarized; the summarizer's input is byte-capped, so a body larger than
+/// that cap is summarized from its HEAD only. A final hard cap bounds storage.
+/// When either path drops content, a visible marker is appended so a partial
+/// snapshot is never mistaken — by the user OR the agent — for the full doc.
+async fn condense_snapshot_body(body: String, completer: Option<&dyn KnowledgeCompleter>) -> String {
+    let original_len = body.len();
+    let mut out = body;
+    let mut summarized_from_head = false;
+    if out.len() > autogen::SNAPSHOT_COMPRESS_THRESHOLD
+        && let Some(completer) = completer
+    {
+        let input_truncated = out.len() > autogen::SNAPSHOT_LLM_INPUT_MAX;
+        let input = source_url::truncate_to_bytes(&out, autogen::SNAPSHOT_LLM_INPUT_MAX);
+        match completer.complete(autogen::SNAPSHOT_COMPRESS_SYSTEM, input).await {
+            Ok(condensed) if !condensed.trim().is_empty() => {
+                out = condensed.trim().to_owned();
+                summarized_from_head = input_truncated;
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "snapshot compression failed; storing raw"),
+        }
+    }
+    let mut hard_truncated = false;
+    if out.len() > source_url::SNAPSHOT_MAX_BYTES {
+        out = source_url::truncate_to_bytes(&out, source_url::SNAPSHOT_MAX_BYTES).to_owned();
+        hard_truncated = true;
+    }
+    if summarized_from_head {
+        out.push_str(&format!(
+            "\n\n> ⚠️ 注:本快照由原文前 {} KB 摘要生成(原文约 {} KB),后半内容未纳入。\n",
+            autogen::SNAPSHOT_LLM_INPUT_MAX / 1024,
+            original_len / 1024
+        ));
+    } else if hard_truncated {
+        out.push_str(&format!(
+            "\n\n> ⚠️ 注:本快照内容已截断至 {} KB 上限。\n",
+            source_url::SNAPSHOT_MAX_BYTES / 1024
+        ));
+    }
+    out
+}
+
+async fn write_text_atomic(path: &Path, content: &str) -> Result<(), AppError> {
+    use tokio::io::AsyncWriteExt;
+
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to create parent dirs: {e}")))?;
+    }
+    let tmp = atomic_tmp_path(path);
+    let mut file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to write file: {e}")))?;
+    let write_result = async {
+        file.write_all(content.as_bytes()).await?;
+        file.sync_all().await
+    }
+    .await;
+    drop(file);
+    if let Err(e) = write_result {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(AppError::Internal(format!("failed to write file: {e}")));
+    }
+    if let Err(error) = preserve_replaced_file_metadata(path, &tmp).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(AppError::Internal(format!(
+            "failed to preserve knowledge document metadata: {error}"
+        )));
+    }
+    if let Err(error) = replace_file_atomic(&tmp, path).await {
+        if error.source_can_be_removed {
+            let _ = tokio::fs::remove_file(&tmp).await;
+        } else {
+            tracing::error!(
+                temp_path = %tmp.display(),
+                "atomic replacement recovery could not restore the destination; preserving the only new-content copy"
+            );
+        }
+        return Err(AppError::Internal(format!(
+            "failed to finalize file: {error}"
+        )));
+    }
+    Ok(())
+}
+
+/// Publish a replacement only if the source-of-truth bytes still match the
+/// snapshot used to build it. This closes the common editor/sync race between
+/// direct write-back's read+append and atomic rename. The compare is performed
+/// immediately before publication; a conflict is retryable against fresh
+/// content instead of overwriting an out-of-band edit.
+async fn write_text_atomic_if_unchanged(
+    path: &Path,
+    expected: &str,
+    content: &str,
+) -> Result<(), AppError> {
+    use tokio::io::AsyncWriteExt;
+
+    let Some(parent) = path.parent() else {
+        return Err(AppError::BadRequest(
+            "knowledge document path has no parent".into(),
+        ));
+    };
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to create parent dirs: {e}")))?;
+    let tmp = atomic_tmp_path(path);
+    let mut file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to write file: {e}")))?;
+    let write_result = async {
+        file.write_all(content.as_bytes()).await?;
+        file.sync_all().await
+    }
+    .await;
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(AppError::Internal(format!(
+            "failed to write file: {error}"
+        )));
+    }
+    if let Err(error) = preserve_replaced_file_metadata(path, &tmp).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(AppError::Internal(format!(
+            "failed to preserve knowledge document metadata: {error}"
+        )));
+    }
+
+    let current = match tokio::time::timeout(
+        KNOWLEDGE_FILE_IO_TIMEOUT,
+        tokio::fs::read(path),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(AppError::Timeout(format!(
+                "knowledge document compare timed out: {}",
+                path.display()
+            )));
+        }
+    };
+    match current {
+        Ok(bytes) if bytes == expected.as_bytes() => {}
+        Ok(_) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(AppError::Conflict(
+                "Knowledge document changed while write-back was preparing; retry against the latest content"
+                    .into(),
+            ));
+        }
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(AppError::Conflict(format!(
+                "Knowledge document changed or disappeared while write-back was preparing: {error}"
+            )));
+        }
+    }
+
+    if let Err(error) = replace_file_atomic(&tmp, path).await {
+        if error.source_can_be_removed {
+            let _ = tokio::fs::remove_file(&tmp).await;
+        } else {
+            tracing::error!(
+                temp_path = %tmp.display(),
+                "atomic replacement recovery could not restore the destination; preserving the only new-content copy"
+            );
+        }
+        return Err(AppError::Internal(format!(
+            "failed to finalize file: {error}"
+        )));
+    }
+    Ok(())
+}
+
+async fn write_text_atomic_if_absent(path: &Path, content: &str) -> Result<(), AppError> {
+    use tokio::io::AsyncWriteExt;
+
+    let Some(parent) = path.parent() else {
+        return Err(AppError::BadRequest(
+            "knowledge document path has no parent".into(),
+        ));
+    };
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|error| {
+            AppError::Internal(format!("failed to create parent dirs: {error}"))
+        })?;
+    let tmp = atomic_tmp_path(path);
+    let mut file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp)
+        .await
+        .map_err(|error| AppError::Internal(format!("failed to write file: {error}")))?;
+    let write_result = async {
+        file.write_all(content.as_bytes()).await?;
+        file.sync_all().await
+    }
+    .await;
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(AppError::Internal(format!(
+            "failed to write file: {error}"
+        )));
+    }
+
+    if let Err(error) = publish_file_no_clobber(&tmp, path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            return Err(AppError::Conflict(
+                "Knowledge document appeared while write-back was preparing; retry against the new file"
+                    .into(),
+            ));
+        }
+        return Err(AppError::Internal(format!(
+            "failed to finalize file: {error}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn preserve_replaced_file_metadata(
+    destination: &Path,
+    replacement: &Path,
+) -> std::io::Result<()> {
+    let destination = destination.to_owned();
+    let replacement = replacement.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let metadata = match std::fs::metadata(&destination) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        std::fs::set_permissions(&replacement, metadata.permissions())?;
+        match xattr::list(&destination) {
+            Ok(names) => {
+                for name in names {
+                    let copy_result = xattr::get(&destination, &name).and_then(|value| {
+                        if let Some(value) = value {
+                            xattr::set(&replacement, &name, &value)
+                        } else {
+                            Ok(())
+                        }
+                    });
+                    if let Err(error) = copy_result {
+                        tracing::debug!(
+                            attribute = %name.to_string_lossy(),
+                            %error,
+                            "knowledge document extended attribute could not be preserved"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "knowledge filesystem does not expose copyable extended attributes"
+                );
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| {
+        std::io::Error::other(format!("metadata preservation task failed: {error}"))
+    })?
+}
+
+#[cfg(not(unix))]
+async fn preserve_replaced_file_metadata(
+    _destination: &Path,
+    _replacement: &Path,
+) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+const WINDOWS_ATOMIC_RETRY_DELAYS_MS: &[u64] =
+    &[0, 10, 25, 50, 100, 200, 400, 800];
+
+#[cfg(unix)]
+fn hard_link_move_no_clobber_with<F>(
+    source: &Path,
+    destination: &Path,
+    remove_file: F,
+) -> std::io::Result<()>
+where
+    F: Fn(&Path) -> std::io::Result<()>,
+{
+    std::fs::hard_link(source, destination)?;
+    if let Err(unlink_error) = remove_file(source) {
+        return match remove_file(destination) {
+            Ok(()) => Err(unlink_error),
+            Err(rollback_error) => Err(std::io::Error::new(
+                unlink_error.kind(),
+                format!(
+                    "failed to remove source after no-clobber link: {unlink_error}; \
+                     failed to roll back destination copy: {rollback_error}"
+                ),
+            )),
+        };
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn publish_file_no_clobber(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    // The no-clobber target mutation and durability sync are one
+    // cancellation-indivisible publication phase.
+    before_atomic_publication(destination);
+    let source = source.to_owned();
+    let destination = destination.to_owned();
+    (|| {
+        let source_c = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "knowledge temp path contains NUL",
+            )
+        })?;
+        let destination_c =
+            CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "knowledge destination path contains NUL",
+                )
+            })?;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        // SAFETY: the C strings remain alive for this no-replace syscall.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                source_c.as_ptr(),
+                libc::AT_FDCWD,
+                destination_c.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        // SAFETY: the C strings remain alive for this no-replace syscall.
+        let result = unsafe {
+            libc::renamex_np(
+                source_c.as_ptr(),
+                destination_c.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        } as libc::c_long;
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        let result = -1;
+
+        let sync_parent = |path: &Path| -> std::io::Result<()> {
+            if let Some(parent) = path.parent() {
+                std::fs::File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        };
+
+        if result == 0 {
+            sync_parent(&destination)?;
+            if source.parent() != destination.parent() {
+                sync_parent(&source)?;
+            }
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let unsupported = matches!(
+            error.raw_os_error(),
+            Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
+        );
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let unsupported =
+            matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOTSUP));
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        let unsupported = true;
+
+        if !unsupported {
+            return Err(error);
+        }
+        hard_link_move_no_clobber_with(
+            &source,
+            &destination,
+            |path| std::fs::remove_file(path),
+        )?;
+        sync_parent(&destination)?;
+        if source.parent() != destination.parent() {
+            sync_parent(&source)?;
+        }
+        Ok(())
+    })()
+}
+
+#[cfg(windows)]
+async fn publish_file_no_clobber(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::{
+        ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    before_atomic_publication(destination);
+    let source = windows_api_path(source);
+    let destination = windows_api_path(destination);
+    (|| {
+        // SAFETY: both buffers are NUL-terminated UTF-16 paths and remain
+        // alive for the synchronous MoveFileExW call.
+        for &retry_delay_ms in WINDOWS_ATOMIC_RETRY_DELAYS_MS {
+            if retry_delay_ms != 0 {
+                std::thread::sleep(Duration::from_millis(retry_delay_ms));
+            }
+            if unsafe {
+                MoveFileExW(
+                    source.as_ptr(),
+                    destination.as_ptr(),
+                    MOVEFILE_WRITE_THROUGH,
+                )
+            } != 0
+            {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            let retryable = error.raw_os_error().is_some_and(|code| {
+                code as u32 == ERROR_SHARING_VIOLATION
+                    || code as u32 == ERROR_LOCK_VIOLATION
+            });
+            if !retryable
+                || retry_delay_ms
+                    == *WINDOWS_ATOMIC_RETRY_DELAYS_MS
+                        .last()
+                        .expect("retry schedule is non-empty")
+            {
+                return Err(error);
+            }
+        }
+        unreachable!("bounded MoveFileExW attempts always return")
+    })()
+}
+
+#[derive(Debug)]
+struct AtomicReplaceError {
+    error: std::io::Error,
+    /// False only when an OS reported a partial commit and recovery could not
+    /// restore the destination. The temp file may then be the sole copy of the
+    /// requested new bytes and must never be deleted by generic cleanup.
+    source_can_be_removed: bool,
+}
+
+impl AtomicReplaceError {
+    fn unchanged(error: std::io::Error) -> Self {
+        Self {
+            error,
+            source_can_be_removed: true,
+        }
+    }
+
+    #[cfg(windows)]
+    fn preserve_source(error: std::io::Error) -> Self {
+        Self {
+            error,
+            source_can_be_removed: false,
+        }
+    }
+}
+
+impl std::fmt::Display for AtomicReplaceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for AtomicReplaceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+#[cfg(not(windows))]
+async fn replace_file_atomic(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), AtomicReplaceError> {
+    // Once publication begins there is deliberately no await: cancelling the
+    // owner cannot report the write-back quiesced while a late rename is still
+    // able to mutate the finished turn's knowledge target.
+    before_atomic_publication(destination);
+    std::fs::rename(source, destination).map_err(AtomicReplaceError::unchanged)?;
+    #[cfg(unix)]
+    if let Some(parent) = destination.parent() {
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(AtomicReplaceError::unchanged)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn replace_file_atomic(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), AtomicReplaceError> {
+    use windows_sys::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND, ERROR_LOCK_VIOLATION, ERROR_PATH_NOT_FOUND,
+        ERROR_SHARING_VIOLATION, ERROR_UNABLE_TO_MOVE_REPLACEMENT,
+        ERROR_UNABLE_TO_MOVE_REPLACEMENT_2,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        DeleteFileW, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        REPLACEFILE_IGNORE_ACL_ERRORS, ReplaceFileW,
+    };
+
+    // Keep the complete retry/recovery transaction inside one poll. Once the
+    // target-path mutation starts, cancellation cannot release the exact turn
+    // owner before Windows has either committed or restored the destination.
+    before_atomic_publication(destination);
+    let backup_path = atomic_backup_path(destination);
+    let source = windows_api_path(source);
+    let destination = windows_api_path(destination);
+    let backup = windows_api_path(&backup_path);
+    (|| {
+        let move_without_clobber = |from: &[u16], to: &[u16]| {
+            for &retry_delay_ms in WINDOWS_ATOMIC_RETRY_DELAYS_MS {
+                if retry_delay_ms != 0 {
+                    std::thread::sleep(Duration::from_millis(retry_delay_ms));
+                }
+                // SAFETY: both slices are NUL-terminated UTF-16 paths and
+                // remain alive for this synchronous call.
+                if unsafe {
+                    MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH)
+                } != 0
+                {
+                    return Ok(());
+                }
+                let error = std::io::Error::last_os_error();
+                let retryable = error.raw_os_error().is_some_and(|code| {
+                    code as u32 == ERROR_SHARING_VIOLATION
+                        || code as u32 == ERROR_LOCK_VIOLATION
+                });
+                if !retryable
+                    || retry_delay_ms
+                        == *WINDOWS_ATOMIC_RETRY_DELAYS_MS
+                            .last()
+                            .expect("retry schedule is non-empty")
+                {
+                    return Err(error);
+                }
+            }
+            unreachable!("bounded MoveFileExW attempts always return")
+        };
+        let remove_backup = || {
+            // SAFETY: `backup` is a live, NUL-terminated UTF-16 path.
+            if unsafe { DeleteFileW(backup.as_ptr()) } == 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        %error,
+                        "could not remove completed knowledge replacement backup"
+                    );
+                }
+            }
+        };
+
+        for &retry_delay_ms in WINDOWS_ATOMIC_RETRY_DELAYS_MS {
+            if retry_delay_ms != 0 {
+                std::thread::sleep(Duration::from_millis(retry_delay_ms));
+            }
+            // ReplaceFileW preserves the destination file's ACL, attributes,
+            // creation time and identity metadata. A unique same-directory
+            // backup also makes the API's documented partial-commit states
+            // recoverable instead of allowing generic cleanup to lose data.
+            if unsafe {
+                ReplaceFileW(
+                    destination.as_ptr(),
+                    source.as_ptr(),
+                    backup.as_ptr(),
+                    REPLACEFILE_IGNORE_ACL_ERRORS,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            } != 0 {
+                remove_backup();
+                return Ok(());
+            }
+            let mut error = std::io::Error::last_os_error();
+            let error_code = error.raw_os_error().map(|code| code as u32);
+
+            if error_code == Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2) {
+                // The old destination has moved to `backup`; `source` still
+                // contains the requested new bytes. Finish the commit when
+                // possible, otherwise restore the old destination.
+                match move_without_clobber(&source, &destination) {
+                    Ok(()) => {
+                        remove_backup();
+                        return Ok(());
+                    }
+                    Err(commit_error) => {
+                        return match move_without_clobber(&backup, &destination) {
+                            Ok(()) => Err(AtomicReplaceError::unchanged(
+                                std::io::Error::other(format!(
+                                    "Windows partially replaced the file; the original was restored after the new file could not be published: {commit_error}"
+                                )),
+                            )),
+                            Err(restore_error) => Err(AtomicReplaceError::preserve_source(
+                                std::io::Error::other(format!(
+                                    "Windows partially replaced the file and recovery could not restore the destination (publish: {commit_error}; restore: {restore_error})"
+                                )),
+                            )),
+                        };
+                    }
+                }
+            }
+            if error_code == Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT) {
+                // With a backup name supplied, Microsoft documents that both
+                // files retain their original names. The caller may safely
+                // remove the unpublished source temp.
+                return Err(AtomicReplaceError::unchanged(error));
+            }
+
+            let destination_missing = error.raw_os_error().is_some_and(|code| {
+                code as u32 == ERROR_FILE_NOT_FOUND
+                    || code as u32 == ERROR_PATH_NOT_FOUND
+            });
+            if destination_missing {
+                match move_without_clobber(&source, &destination) {
+                    Ok(()) => {
+                        remove_backup();
+                        return Ok(());
+                    }
+                    Err(move_error) => {
+                        error = move_error;
+                    }
+                }
+            }
+            let retryable = error.raw_os_error().is_some_and(|code| {
+                code as u32 == ERROR_SHARING_VIOLATION
+                    || code as u32 == ERROR_LOCK_VIOLATION
+            });
+            if !retryable
+                || retry_delay_ms
+                    == *WINDOWS_ATOMIC_RETRY_DELAYS_MS
+                        .last()
+                        .expect("retry schedule is non-empty")
+            {
+                return Err(AtomicReplaceError::unchanged(error));
+            }
+        }
+        unreachable!("bounded ReplaceFileW attempts always return")
+    })()
+}
+
+#[cfg(windows)]
+fn windows_api_path(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let slash = b'\\' as u16;
+    let question = b'?' as u16;
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    let raw: Vec<u16> = normalized
+        .as_os_str()
+        .encode_wide()
+        .map(|unit| if unit == b'/' as u16 { slash } else { unit })
+        .collect();
+    let already_extended =
+        raw.starts_with(&[slash, slash, question, slash]);
+    let mut out = if already_extended || !normalized.is_absolute() {
+        raw
+    } else if raw.starts_with(&[slash, slash]) {
+        let mut extended = "\\\\?\\UNC\\"
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        extended.extend_from_slice(&raw[2..]);
+        extended
+    } else {
+        let mut extended = "\\\\?\\".encode_utf16().collect::<Vec<_>>();
+        extended.extend_from_slice(&raw);
+        extended
+    };
+    out.push(0);
+    out
+}
+
+/// A collision-free sibling temp path for atomic write+replace. The UUIDv7
+/// suffix remains unique across process restarts, so an orphan from a crash
+/// cannot collide when an OS later reuses the same process id. The `.tmp` tail
+/// keeps orphaned files out of markdown listings and search.
+#[cfg(not(test))]
+#[inline]
+fn before_atomic_publication(_target: &Path) {}
+
+/// Deterministic test seam immediately before the target-path syscall.
+///
+/// This is intentionally synchronous: tests can abort the async owner while it
+/// is stopped here and prove that the owner cannot quiesce until publication
+/// itself returns. Hooks are keyed by their unique target so parallel tests do
+/// not interfere with normal writes or each other.
+#[cfg(test)]
+#[derive(Debug)]
+struct AtomicPublicationTestHook {
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: StdMutex<std::sync::mpsc::Receiver<()>>,
+}
+
+#[cfg(test)]
+fn atomic_publication_test_hooks(
+) -> &'static StdMutex<HashMap<PathBuf, Arc<AtomicPublicationTestHook>>> {
+    static HOOKS: std::sync::OnceLock<
+        StdMutex<HashMap<PathBuf, Arc<AtomicPublicationTestHook>>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn install_atomic_publication_test_hook(
+    target: &Path,
+) -> (
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::SyncSender<()>,
+) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let hook = Arc::new(AtomicPublicationTestHook {
+        entered: entered_tx,
+        release: StdMutex::new(release_rx),
+    });
+    atomic_publication_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(target.to_path_buf(), hook);
+    (entered_rx, release_tx)
+}
+
+#[cfg(test)]
+fn before_atomic_publication(target: &Path) {
+    let hook = atomic_publication_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(target);
+    let Some(hook) = hook else {
+        return;
+    };
+    let _ = hook.entered.send(());
+    let _ = hook
+        .release
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .recv();
+}
+
+/// A collision-free sibling temp path for atomic write+rename. Two concurrent
+/// writers targeting the same file MUST NOT share a temp name (they would
+/// truncate each other); the pid+counter suffix makes each unique. The `.tmp`
+/// tail keeps the temp out of `is_md` listings/search, and an orphan left by a
+/// crash is harmless (never listed).
+fn atomic_tmp_path(path: &Path) -> PathBuf {
+    let temp_name = format!(".nomifun-write-{}.tmp", generate_id());
+    path.parent()
+        .map(|parent| parent.join(&temp_name))
+        .unwrap_or_else(|| PathBuf::from(temp_name))
+}
+
+
+
+#[cfg(windows)]
+fn atomic_backup_path(path: &Path) -> PathBuf {
+    let backup_name = format!(".nomifun-backup-{}.tmp", generate_id());
+    path.parent()
+        .map(|parent| parent.join(&backup_name))
+        .unwrap_or_else(|| PathBuf::from(backup_name))
+}
+
+/// Max chars of the mount-time `summary` extracted from a base's README.
+const SUMMARY_MAX_CHARS: usize = 400;
+
+/// Locate the base's root README case-insensitively (`README.md`,
+/// `readme.md`, … — Linux filesystems distinguish them). Prefers the exact
+/// `README.md` spelling when several casings coexist; otherwise the
+/// lexicographically-smallest UTF-8 filename wins. Returns the file's ACTUAL
+/// path so reads and overwrites hit the existing file instead of creating a
+/// parallel one.
+async fn find_readme_path(root: &Path) -> Option<PathBuf> {
+    let mut fallbacks: Vec<(String, PathBuf)> = Vec::new();
+    let mut dir = tokio::fs::read_dir(root).await.ok()?;
+    while let Ok(Some(entry)) = dir.next_entry().await {
+        if !entry.file_type().await.is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name == "README.md" {
+            return Some(entry.path());
+        }
+        if name.eq_ignore_ascii_case("README.md") {
+            fallbacks.push((name.to_owned(), entry.path()));
+        }
+    }
+    fallbacks.sort_by(|a, b| a.0.cmp(&b.0));
+    fallbacks.into_iter().next().map(|(_, path)| path)
+}
+
+/// First non-heading paragraph of the base's root README (matched
+/// case-insensitively), truncated to [`SUMMARY_MAX_CHARS`]. `None` when the
+/// base has no README (yet) — the AI-autogen README task fills these in over
+/// time.
+async fn read_base_summary(root: &Path) -> Option<String> {
+    validate_knowledge_root_bounded(root.to_path_buf()).await.ok()?;
+    let path = find_readme_path(root).await?;
+    let text = tokio::fs::read_to_string(path).await.ok()?;
+    extract_readme_summary(&text)
+}
+
+/// Extract the first non-heading paragraph from markdown text: headings and
+/// blank lines before it are skipped, badge (`[![…`) and raw-HTML (`<…`)
+/// lines cannot START the paragraph (README boilerplate noise), its
+/// consecutive non-blank non-heading lines are joined with spaces, and the
+/// result is truncated to [`SUMMARY_MAX_CHARS`] chars (with a trailing `…`
+/// marker when truncation actually happened).
+fn extract_readme_summary(text: &str) -> Option<String> {
+    let mut para: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            if !para.is_empty() {
+                break;
+            }
+            continue;
+        }
+        // Badge rows and HTML blocks are layout noise, not prose — skip them
+        // while still hunting for the first real paragraph.
+        if para.is_empty() && (trimmed.starts_with("[![") || trimmed.starts_with('<')) {
+            continue;
+        }
+        para.push(trimmed);
+    }
+    if para.is_empty() {
+        return None;
+    }
+    let joined = para.join(" ");
+    let mut summary: String = joined.chars().take(SUMMARY_MAX_CHARS).collect();
+    if joined.chars().count() > SUMMARY_MAX_CHARS {
+        summary.push('…');
+    }
+    Some(summary)
+}
+
+/// Ordering rank for TOC entries so the highest-signal files survive the
+/// per-base budget (`context::apply_toc_budgets` keeps the first N): root
+/// index/README/overview first, then any index-like file, then shallower
+/// paths before deeper. Pure path-based — no file reads. Ties fall through to
+/// lexicographic in the caller.
+fn toc_rank(rel: &str) -> (u8, usize) {
+    let lower = rel.to_lowercase();
+    let depth = rel.matches('/').count();
+    let stem = lower.rsplit('/').next().unwrap_or(lower.as_str());
+    let is_index = matches!(stem, "readme.md" | "index.md" | "overview.md" | "_index.md")
+        || stem.starts_with("readme.");
+    let tier = if is_index && depth == 0 {
+        0
+    } else if is_index {
+        1
+    } else {
+        2
+    };
+    (tier, depth)
+}
+
+/// Build the full per-base table of contents: one `rel/path.md — first
+/// heading` line per document, `_inbox/` excluded (unreviewed staged
+/// write-backs are not authoritative navigation). Budgeting/aggregation is
+/// applied afterwards across all mounted bases via
+/// [`crate::context::apply_toc_budgets`].
+async fn build_toc(root: &Path) -> Vec<String> {
+    let root = root.to_path_buf();
+    let lock_root = root.clone();
+    // Bounded + machinery-pruned: at session mount this opens every note for its
+    // first heading, so a slow/large NAS vault must degrade to an empty toc
+    // rather than block session start.
+    bounded_root_blocking(&lock_root, BASE_WALK_BUDGET, Vec::new(), move || {
+        if validate_knowledge_root(&root).is_err() {
+            return Vec::new();
+        }
+        let mut rels: Vec<String> = vault_walker(&root)
+            .filter(|e| e.file_type().is_file() && is_md(e.path()))
+            .filter_map(|e| {
+                Some(e.path().strip_prefix(&root).ok()?.to_str()?.replace('\\', "/"))
+            })
+            .collect();
+        rels.sort_by(|a, b| toc_rank(a).cmp(&toc_rank(b)).then_with(|| a.cmp(b)));
+        rels.into_iter()
+            .map(|rel| match first_heading(&root.join(&rel)) {
+                Some(title) => format!("{rel} — {title}"),
+                None => rel,
+            })
+            .collect()
+    })
+    .await
+}
+
+/// First `# `-style heading of a markdown file, read from the first KB only
+/// (bounds IO for large files); single line, truncated to keep the prompt
+/// row compact.
+/// First ATX markdown heading (`# …` … `###### …`) in `text`, trimmed. Requires
+/// whitespace (or end-of-line) after the `#` run, so a shebang `#!/bin/sh`, a
+/// `#hashtag`, or a `# comment` inside code is NOT mistaken for a title; skips
+/// fenced code blocks (``` / ~~~) and a leading YAML front-matter block (whose
+/// `# comment` lines and `key: #x` are not headings).
+fn first_atx_heading(text: &str) -> Option<String> {
+    let mut in_fence: Option<char> = None;
+    let mut in_frontmatter = false;
+    let mut started = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        // A leading `---` (first non-empty line) opens a YAML front-matter block.
+        if !started && !trimmed.is_empty() {
+            started = true;
+            if trimmed == "---" {
+                in_frontmatter = true;
+                continue;
+            }
+        }
+        if in_frontmatter {
+            if trimmed == "---" || trimmed == "..." {
+                in_frontmatter = false;
+            }
+            continue;
+        }
+        // Toggle fenced code-block state on ``` / ~~~ (a fence only closes on the
+        // same marker char it opened with).
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            let fence_char = trimmed.chars().next().unwrap_or('`');
+            match in_fence {
+                Some(open) if open == fence_char => in_fence = None,
+                Some(_) => {}
+                None => in_fence = Some(fence_char),
+            }
+            continue;
+        }
+        if in_fence.is_some() {
+            continue;
+        }
+        let hashes = trimmed.chars().take_while(|&c| c == '#').count();
+        if (1..=6).contains(&hashes) {
+            let rest = &trimmed[hashes..];
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                let title = rest.trim();
+                if !title.is_empty() {
+                    return Some(title.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn first_heading(path: &Path) -> Option<String> {
+    use std::io::Read;
+    // 4 KiB is enough to clear a typical YAML front-matter block before the
+    // first heading (the old 1 KiB could be entirely front-matter).
+    let mut buf = vec![0u8; 4096];
+    let mut file = std::fs::File::open(path).ok()?;
+    let n = file.read(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf[..n]);
+    let title = first_atx_heading(&text)?;
+    Some(title.chars().take(60).collect())
+}
+
+async fn complete_turn_writeback_llm(
+    completer: &Arc<dyn KnowledgeCompleter>,
+    model: Option<&ProviderWithModel>,
+    system: &'static str,
+    prompt: &str,
+    stage: &'static str,
+) -> Result<String, String> {
+    let completion = async {
+        match model {
+            Some(model) => {
+                let effective_model = model.use_model.as_deref().unwrap_or(&model.model);
+                completer
+                    .complete_with(system, prompt, &model.provider_id, effective_model)
+                    .await
+            }
+            None => completer.complete(system, prompt).await,
+        }
+    };
+    match tokio::time::timeout(TURN_WRITEBACK_LLM_TIMEOUT, completion).await {
+        Ok(Ok(raw)) => Ok(raw),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!(
+            "turn writeback {stage} timed out after {}s",
+            TURN_WRITEBACK_LLM_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+/// Direct write-back must never ask a model to recreate an existing document:
+/// a prompt excerpt cannot represent an arbitrarily large file and would make
+/// silent truncation/data loss possible. Preserve the original bytes exactly
+/// and append only a genuinely new proposal.
+fn merge_direct_turn_writeback(existing: &str, proposal: &str) -> String {
+    let proposal = proposal.trim();
+    if proposal.is_empty() || contains_markdown_block(existing, proposal) {
+        return existing.to_owned();
+    }
+    // A model that ignores the contract and resends the whole document plus its
+    // addition would otherwise get the document appended to itself. When the
+    // proposal demonstrably contains every existing line, taking it wholesale
+    // loses nothing — every original byte is inside it — and yields what the
+    // model actually meant. This only catches a verbatim restatement; a
+    // reworded or reordered rewrite still appends, which is the safe direction.
+    if !existing.trim().is_empty() && contains_markdown_block(proposal, existing.trim()) {
+        return format!("{proposal}\n");
+    }
+    let separator = if existing.is_empty() || existing.ends_with("\n\n") {
+        ""
+    } else if existing.ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    format!("{existing}{separator}{proposal}\n")
+}
+
+/// Treat a proposal as already present only when it occupies complete markdown
+/// line boundaries. A plain substring check would incorrectly discard a new
+/// proposal such as `foo` merely because an existing paragraph contains
+/// `foobar`. Normalize CRLF for retry idempotence across platforms without
+/// changing the original bytes that are ultimately preserved on disk.
+fn contains_markdown_block(existing: &str, proposal: &str) -> bool {
+    let existing = existing.replace("\r\n", "\n").replace('\r', "\n");
+    let proposal = proposal.replace("\r\n", "\n").replace('\r', "\n");
+    let proposal = proposal.trim();
+    if proposal.is_empty() {
+        return true;
+    }
+
+    existing.match_indices(proposal).any(|(start, matched)| {
+        let end = start + matched.len();
+        let starts_on_boundary = start == 0 || existing.as_bytes().get(start - 1) == Some(&b'\n');
+        let ends_on_boundary = end == existing.len() || existing.as_bytes().get(end) == Some(&b'\n');
+        starts_on_boundary && ends_on_boundary
+    })
+}
+
+pub(crate) fn is_md(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("md"))
+}
+
+fn markdown_identity(content: &str) -> String {
+    content
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim()
+        .to_owned()
+}
+
+/// True for a directory that is knowledge-base *machinery*, never a source of
+/// knowledge documents, and must be pruned from every base walk BEFORE its
+/// contents are stat'd: any hidden (dot-prefixed) directory — `.obsidian/`
+/// (Obsidian plugins + workspace + cache), `.git/`, `.trash/` — plus a couple
+/// of well-known heavy non-note dirs. The root itself (depth 0) is never
+/// pruned, so a base may still be rooted at a dotted path.
+///
+/// This is both a correctness fix (those files are not notes) and the dominant
+/// performance fix: on a real Obsidian vault the `.obsidian/` tree alone can
+/// dwarf the note count, and descending into it issues one `readdir`/`stat`
+/// network round-trip per entry — on a slow NAS mount that is what pushes the
+/// per-base walk past the client request timeout and surfaces as "加载失败".
+pub(crate) fn is_machinery_dir(entry: &walkdir::DirEntry) -> bool {
+    if entry.depth() == 0 {
+        return false;
+    }
+    // WalkDir's `follow_links(false)` handles ordinary symlinks, but Windows
+    // junctions/name-surrogate reparse directories are not consistently
+    // reported as symlinks. Apply the same no-follow rule used by write paths.
+    if std::fs::symlink_metadata(entry.path())
+        .is_ok_and(|metadata| {
+            metadata_is_link_or_reparse(entry.path(), &metadata)
+        })
+    {
+        return true;
+    }
+    if !entry.file_type().is_dir() {
+        return false;
+    }
+    let Some(name) = entry.file_name().to_str() else {
+        // A path that cannot be represented by the cross-platform API must
+        // never leak into handles/TOCs or be traversed as agent context.
+        return true;
+    };
+    is_excluded_tree_dir_name(name)
+}
+
+/// The canonical markdown walker for a knowledge-base `root`: a [`walkdir`]
+/// iterator that prunes [`is_machinery_dir`] directories before descending, so
+/// no `stat` is ever issued inside `.obsidian/`, `.git/`, etc. `follow_links`
+/// stays at walkdir's default (`false`) — that is correct and must be kept, as
+/// it rules out symlink-cycle / root-escape traversal. Every KB file walk goes
+/// through here so the traversal policy is defined once.
+fn vault_walker(root: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
+    walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .follow_root_links(false)
+        .into_iter()
+        .filter_entry(|e| !is_machinery_dir(e))
+        .flatten()
+}
+
+fn prepare_folder_import(
+    requested_source: &Path,
+    destination_root: &Path,
+) -> Result<PreparedFolderImport, AppError> {
+    if !requested_source.is_absolute() {
+        return Err(AppError::BadRequest(
+            "folder import source_path must be absolute".into(),
+        ));
+    }
+    let requested_metadata = std::fs::symlink_metadata(requested_source).map_err(|error| {
+        AppError::BadRequest(format!(
+            "folder import source does not exist ({}): {error}",
+            requested_source.display()
+        ))
+    })?;
+    if !requested_metadata.is_dir()
+        || metadata_is_link_or_reparse(requested_source, &requested_metadata)
+    {
+        return Err(AppError::BadRequest(
+            "folder import source must be a real directory, not a symlink, junction, or reparse point"
+                .into(),
+        ));
+    }
+
+    let source_root = std::fs::canonicalize(requested_source)
+        .map(|path| nomifun_common::paths::simplified(&path))
+        .map_err(|error| {
+            AppError::BadRequest(format!(
+                "failed to resolve folder import source {}: {error}",
+                requested_source.display()
+            ))
+        })?;
+    validate_knowledge_root(&source_root)?;
+    let destination_root = std::fs::canonicalize(destination_root)
+        .map(|path| nomifun_common::paths::simplified(&path))
+        .map_err(|error| {
+            AppError::BadRequest(format!(
+                "failed to resolve knowledge destination {}: {error}",
+                destination_root.display()
+            ))
+        })?;
+    if root_identities_overlap(
+        &portable_absolute_path_identity(&source_root),
+        &portable_absolute_path_identity(&destination_root),
+    ) {
+        return Err(AppError::BadRequest(
+            "the imported folder and knowledge base root must not contain one another".into(),
+        ));
+    }
+
+    let raw_source_name = source_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            AppError::BadRequest("folder import source must have a Unicode name".into())
+        })?;
+    let source_name = sanitize_import_directory_name(raw_source_name);
+    let mut files = Vec::new();
+    let mut skipped = 0usize;
+    let mut total_size = 0u64;
+    let mut portable_paths = HashSet::new();
+
+    let walker = walkdir::WalkDir::new(&source_root)
+        .follow_links(false)
+        .follow_root_links(false)
+        .into_iter()
+        .filter_entry(|entry| !is_machinery_dir(entry));
+    for entry in walker {
+        let entry = entry.map_err(|error| {
+            AppError::BadRequest(format!(
+                "failed to scan imported folder {}: {error}",
+                source_root.display()
+            ))
+        })?;
+        if entry.depth() == 0 || entry.file_type().is_dir() {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(entry.path()).map_err(|error| {
+            AppError::BadRequest(format!(
+                "failed to inspect imported entry {}: {error}",
+                entry.path().display()
+            ))
+        })?;
+        if metadata_is_link_or_reparse(entry.path(), &metadata)
+            || !metadata.is_file()
+            || !is_md(entry.path())
+        {
+            skipped += 1;
+            continue;
+        }
+        if files.len() >= MAX_FOLDER_IMPORT_FILES {
+            return Err(AppError::BadRequest(format!(
+                "folder import exceeds the limit of {MAX_FOLDER_IMPORT_FILES} Markdown files"
+            )));
+        }
+        if metadata.len() > MAX_FOLDER_IMPORT_FILE_BYTES {
+            return Err(AppError::BadRequest(format!(
+                "Markdown file exceeds the {} MB import limit: {}",
+                MAX_FOLDER_IMPORT_FILE_BYTES / 1024 / 1024,
+                entry.path().display()
+            )));
+        }
+        let relative = entry.path().strip_prefix(&source_root).map_err(|error| {
+            AppError::Internal(format!("failed to resolve imported Markdown path: {error}"))
+        })?;
+        let mut components = Vec::new();
+        for component in relative.components() {
+            let Component::Normal(component) = component else {
+                return Err(AppError::BadRequest(format!(
+                    "invalid imported Markdown path: {}",
+                    relative.display()
+                )));
+            };
+            let component = component.to_str().ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "imported Markdown path must be Unicode: {}",
+                    relative.display()
+                ))
+            })?;
+            validate_portable_path_component(component)?;
+            components.push(component.to_owned());
+        }
+        let rel_path = components.join("/");
+        let portable_identity = portable_writeback_path_identity(&rel_path);
+        if !portable_paths.insert(portable_identity) {
+            return Err(AppError::Conflict(format!(
+                "imported folder contains Markdown paths that alias across Windows, Linux, or macOS: {rel_path}"
+            )));
+        }
+        let bytes = std::fs::read(entry.path()).map_err(|error| {
+            AppError::BadRequest(format!(
+                "failed to read imported Markdown ({}): {error}",
+                entry.path().display()
+            ))
+        })?;
+        let actual_size = bytes.len() as u64;
+        if actual_size > MAX_FOLDER_IMPORT_FILE_BYTES {
+            return Err(AppError::BadRequest(format!(
+                "Markdown file grew beyond the {} MB import limit while being read: {}",
+                MAX_FOLDER_IMPORT_FILE_BYTES / 1024 / 1024,
+                entry.path().display()
+            )));
+        }
+        total_size = total_size
+            .checked_add(actual_size)
+            .ok_or_else(|| AppError::BadRequest("folder import size overflow".into()))?;
+        if total_size > MAX_FOLDER_IMPORT_TOTAL_BYTES {
+            return Err(AppError::BadRequest(format!(
+                "folder import exceeds the {} MB total limit",
+                MAX_FOLDER_IMPORT_TOTAL_BYTES / 1024 / 1024
+            )));
+        }
+        let content = String::from_utf8(bytes).map_err(|error| {
+            AppError::BadRequest(format!(
+                "imported Markdown must be valid UTF-8 ({}): {error}",
+                entry.path().display()
+            ))
+        })?;
+        files.push(PreparedFolderImportFile { rel_path, content });
+    }
+
+    files.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+    if files.is_empty() {
+        return Err(AppError::BadRequest(
+            "the selected folder contains no importable .md documents".into(),
+        ));
+    }
+    Ok(PreparedFolderImport {
+        source_name,
+        files,
+        skipped,
+        total_size,
+    })
+}
+
+fn sanitize_import_directory_name(raw_name: &str) -> String {
+    let cleaned = raw_name
+        .chars()
+        .map(|character| match character {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            character if character.is_control() => '_',
+            character => character,
+        })
+        .collect::<String>();
+    let cleaned = cleaned.trim().trim_end_matches('.').trim();
+    let mut bounded = String::new();
+    let mut utf16_len = 0usize;
+    for character in cleaned.chars() {
+        let next_bytes = bounded.len() + character.len_utf8();
+        let next_utf16 = utf16_len + character.len_utf16();
+        // Leave room for a human-readable collision suffix such as ` (128)`.
+        if next_bytes > 220 || next_utf16 > 220 {
+            break;
+        }
+        bounded.push(character);
+        utf16_len = next_utf16;
+    }
+    let bounded = bounded.trim().trim_end_matches('.').trim();
+    if bounded.is_empty()
+        || validate_portable_path_component(bounded).is_err()
+        || is_excluded_tree_dir_name(bounded)
+    {
+        "imported-notes".into()
+    } else {
+        bounded.to_owned()
+    }
+}
+
+fn create_unique_import_directory(
+    root: &Path,
+    preferred_name: &str,
+) -> Result<(String, PathBuf), AppError> {
+    validate_knowledge_root(root)?;
+    let base_name = sanitize_import_directory_name(preferred_name);
+    for sequence in 1..=10_000usize {
+        let candidate = if sequence == 1 {
+            base_name.clone()
+        } else {
+            format!("{base_name} ({sequence})")
+        };
+        validate_portable_path_component(&candidate)?;
+        if find_portable_tree_child(root, &candidate)?.is_some() {
+            continue;
+        }
+        let target = root.join(&candidate);
+        match std::fs::create_dir(&target) {
+            Ok(()) => return Ok((candidate, target)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                continue;
+            }
+            Err(error) => {
+                return Err(AppError::Internal(format!(
+                    "failed to create folder import destination {}: {error}",
+                    target.display()
+                )));
+            }
+        }
+    }
+    Err(AppError::Conflict(
+        "could not allocate a unique destination folder for the imported notes".into(),
+    ))
+}
+
+
+fn root_blocking_inspection_lock(root: &Path) -> Arc<AsyncMutex<()>> {
+    let key = portable_absolute_path_identity(root);
+    let locks =
+        ROOT_BLOCKING_INSPECTION_LOCKS.get_or_init(|| {
+            StdMutex::new(HashMap::new())
+        });
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        lock
+    } else {
+        let lock = Arc::new(AsyncMutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
+    }
+}
+
+/// Root-keyed single-flight wrapper for non-cancellable filesystem blockers.
+/// The semaphore permit and root guard are moved into the blocking closure, so
+/// they remain held even when the caller times out and drops the JoinHandle.
+/// A manual retry then waits on the existing inspector instead of spawning
+/// another permanently blocked stat/walk for the same offline NAS root.
+async fn bounded_root_blocking<T: Send + 'static>(
+    root: &Path,
+    budget: Duration,
+    on_timeout: T,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let started = std::time::Instant::now();
+    let limit = ROOT_BLOCKING_INSPECTION_LIMIT
+        .get_or_init(|| {
+            Arc::new(Semaphore::new(
+                KNOWLEDGE_BLOCKING_INSPECTION_CONCURRENCY,
+            ))
+        })
+        .clone();
+    let root_lock = root_blocking_inspection_lock(root);
+    let acquired = tokio::time::timeout(budget, async move {
+        let root_guard = root_lock.lock_owned().await;
+        let permit = limit
+            .acquire_owned()
+            .await
+            .expect("root inspection semaphore is never closed");
+        (permit, root_guard)
+    })
+    .await;
+    let (permit, root_guard) = match acquired {
+        Ok(acquired) => acquired,
+        Err(_) => return on_timeout,
+    };
+    let remaining = budget.saturating_sub(started.elapsed());
+    let handle = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _root_guard = root_guard;
+        f()
+    });
+    match tokio::time::timeout(remaining, handle).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(_)) | Err(_) => on_timeout,
+    }
+}
+
+/// Per-base walk budget. Pruning ([`is_machinery_dir`]) makes a healthy vault
+/// walk finish well within this; the budget is the safety net for a large or
+/// stale NAS mount so the list/detail response never blocks past it.
+const BASE_WALK_BUDGET: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// Max concurrent per-base walks in [`KnowledgeService::list_bases`]. Small and
+/// fixed: enough to overlap a few slow (NAS) bases with the fast local ones
+/// without fanning out an unbounded number of blocking-pool tasks.
+const LIST_BASES_CONCURRENCY: usize = 8;
+
+/// Budget for a full `search_bases` sweep (walk + cold-cache reads across every
+/// scoped base). More generous than a single-base stat walk because search
+/// legitimately reads file bodies; on expiry the search degrades to the hits
+/// gathered so far being dropped (empty) rather than hanging the agent tool.
+const SEARCH_WALK_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Split a lowercased query into non-empty, deduped whitespace terms. For CJK
+/// (no spaces) this yields the whole query as one term, which still
+/// substring-matches — adequate for the keyword tier.
+fn query_terms(query_lc: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    query_lc
+        .split_whitespace()
+        .filter(|t| !t.is_empty())
+        .filter(|t| seen.insert(t.to_string()))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// First markdown heading (`# ...`) text, trimmed of leading `#`/space, or "".
+/// The content-string counterpart of [`first_heading`] (which reads from disk).
+fn first_heading_text(content: &str) -> String {
+    first_atx_heading(content).unwrap_or_default()
+}
+
+/// Score a markdown doc against the query. Returns `(score, snippet)` or `None`
+/// when nothing matches. Path/heading hits weigh more than body frequency.
+fn score_md(
+    rel_path: &str,
+    heading: &str,
+    content: &str,
+    query_lc: &str,
+    terms: &[String],
+) -> Option<(u32, String)> {
+    let path_lc = rel_path.to_lowercase();
+    let heading_lc = heading.to_lowercase();
+    let content_lc = content.to_lowercase();
+    let mut score: u32 = 0;
+    if path_lc.contains(query_lc) || heading_lc.contains(query_lc) {
+        score += 8;
+    }
+    if content_lc.contains(query_lc) {
+        score += 5;
+    }
+    for t in terms {
+        if path_lc.contains(t.as_str()) {
+            score += 4;
+        }
+        if heading_lc.contains(t.as_str()) {
+            score += 3;
+        }
+        let tf = content_lc.matches(t.as_str()).count() as u32;
+        score += tf.min(5);
+    }
+    if score == 0 {
+        return None;
+    }
+    Some((score, best_snippet(content, query_lc, terms)))
+}
+
+/// First content line containing the query or any term, capped to ~200 chars.
+fn best_snippet(content: &str, query_lc: &str, terms: &[String]) -> String {
+    let pick = content.lines().find(|line| {
+        let l = line.to_lowercase();
+        l.contains(query_lc) || terms.iter().any(|t| l.contains(t.as_str()))
+    });
+    let line = pick.unwrap_or_else(|| content.lines().next().unwrap_or("")).trim();
+    let mut s: String = line.chars().take(200).collect();
+    if line.chars().count() > 200 {
+        s.push('…');
+    }
+    s
+}
+
+/// Strip a workspace-mount prefix the model may have prepended by mistake,
+/// returning a path relative to the base root. The model sees the mount at
+/// `.nomi/knowledge/{link}/…` but `knowledge_write` expects a base-relative
+/// path; without this, `.nomi/knowledge/Finance/terms.md` would create a new
+/// nested file instead of updating `terms.md`. Only the unambiguous mount
+/// prefix is stripped — a bare `Finance/x.md` is left to the resolver's
+/// existence/collision logic.
+fn deconfuse_rel_path(rel_path: &str) -> String {
+    let normalized = rel_path.trim().replace('\\', "/");
+    let p = normalized.strip_prefix("./").unwrap_or(&normalized);
+    let components: Vec<&str> = p.split('/').collect();
+    let mount_components: Vec<&str> = KB_MOUNT_REL_DIR.split('/').collect();
+    if components.len() > mount_components.len()
+        && components
+            .iter()
+            .zip(mount_components.iter())
+            .all(|(actual, expected)| {
+                portable_path_component_identity(actual)
+                    == portable_path_component_identity(expected)
+            })
+    {
+        // Drop both the portable mount prefix and its link-name segment.
+        return components[mount_components.len() + 1..].join("/");
+    }
+    p.to_owned()
+}
+
+pub(crate) fn portable_path_component_identity(component: &str) -> String {
+    // Canonical normalization plus full Unicode case folding matches the
+    // caseless aliases exposed by default Windows/macOS filesystems without
+    // collapsing unrelated compatibility characters (for example ① and 1).
+    let normalized = component.nfc().collect::<String>();
+    unicase::UniCase::unicode(normalized.as_str())
+        .to_folded_case()
+        .nfc()
+        .collect()
+}
+
+fn turn_writeback_is_cancelled(req: &TurnWritebackRequest) -> bool {
+    req.cancellation
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
+}
+
+fn portable_turn_writeback_lock_path(rel_path: &str) -> String {
+    portable_writeback_path_identity(rel_path)
+}
+
+pub fn portable_writeback_path_identity(rel_path: &str) -> String {
+    deconfuse_rel_path(rel_path)
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .map(portable_path_component_identity)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+
+fn portable_absolute_path_identity(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .map(portable_path_component_identity)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn root_identities_overlap(left: &str, right: &str) -> bool {
+    left == right
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn root_group_locks(
+    registry: &StdMutex<HashMap<String, Weak<AsyncRwLock<()>>>>,
+    key: String,
+) -> Vec<Arc<AsyncRwLock<()>>> {
+    let mut locks = registry
+        .lock()
+        .expect("knowledge root lock map poisoned");
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    // `strong_count`/`contains_key` is not sufficient: the final owner can
+    // disappear between those observations and a later Weak::upgrade. Hold
+    // the requested strong Arc while the registry mutex is still held, and
+    // immediately replace an expired Weak.
+    let requested = if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        lock
+    } else {
+        let lock = Arc::new(AsyncRwLock::new(()));
+        locks.insert(key.clone(), Arc::downgrade(&lock));
+        lock
+    };
+    let mut overlapping = locks
+        .iter()
+        .filter_map(|(existing_key, lock)| {
+            root_identities_overlap(existing_key, &key)
+                .then(|| Weak::upgrade(lock))
+                .flatten()
+                .map(|lock| (existing_key.clone(), lock))
+        })
+        .collect::<Vec<_>>();
+    debug_assert!(
+        overlapping
+            .iter()
+            .any(|(_, lock)| Arc::ptr_eq(lock, &requested)),
+        "requested knowledge root lock must remain in its overlap group"
+    );
+    overlapping.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut seen = HashSet::new();
+    overlapping
+        .into_iter()
+        .filter_map(|(_, lock)| {
+            let identity = Arc::as_ptr(&lock) as usize;
+            seen.insert(identity).then_some(lock)
+        })
+        .collect()
+}
+
+fn validate_canonical_write_target(rel_path: &str) -> Result<(), AppError> {
+    let components: Vec<&str> = rel_path.split('/').collect();
+    if components
+        .iter()
+        .take(components.len().saturating_sub(1))
+        .any(|component| is_excluded_tree_dir_name(component))
+    {
+        return Err(AppError::BadRequest(
+            "knowledge writes cannot target a directory hidden from review and search".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_relocate_request_id(request_id: &str) -> Result<(), AppError> {
+    if request_id.is_empty()
+        || request_id.len() > 128
+        || !request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && !byte.is_ascii_whitespace())
+    {
+        return Err(AppError::BadRequest(
+            "request_id must contain 1 to 128 visible ASCII characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn relocate_request_sha256(
+    fingerprint: &RelocateRequestFingerprint,
+) -> Result<String, AppError> {
+    let canonical = serde_json::to_vec(fingerprint).map_err(|error| {
+        AppError::Internal(format!(
+            "failed to canonicalize knowledge-tree relocation command: {error}"
+        ))
+    })?;
+    let mut digest = Sha256::new();
+    digest.update(b"knowledge-tree-relocate-v1\0");
+    digest.update(canonical);
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn sha256_text(content: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(content.as_bytes());
+    hex::encode(digest.finalize())
+}
+
+fn rewrite_snapshot_relationship(
+    content: &str,
+    source_item_id: &KnowledgeSourceItemId,
+    relationship: &str,
+) -> Result<String, AppError> {
+    if !matches!(relationship, "managed" | "detached" | "copy")
+        || source_url::snapshot_source_url(content).is_none()
+    {
+        return Err(AppError::Conflict(
+            "the document no longer has a valid managed-source header".into(),
+        ));
+    }
+    let mut lines = content.lines().map(str::to_owned).collect::<Vec<_>>();
+    let yaml_frontmatter = lines.first().is_some_and(|line| line.trim() == "---");
+    let separator = lines
+        .iter()
+        .enumerate()
+        .skip(usize::from(yaml_frontmatter))
+        .find_map(|(index, line)| (line.trim() == "---").then_some(index))
+        .ok_or_else(|| {
+            AppError::Conflict("the managed-source header is incomplete".into())
+        })?;
+    lines.retain(|line| {
+        let trimmed = line.trim();
+        !trimmed.starts_with("> **nomifun_source_item_id**:")
+            && !trimmed.starts_with("> **nomifun_source_relationship**:")
+            && !trimmed.starts_with("nomifun_source_item_id:")
+            && !trimmed.starts_with("nomifun_source_relationship:")
+    });
+    let separator = lines
+        .iter()
+        .enumerate()
+        .skip(usize::from(yaml_frontmatter))
+        .find_map(|(index, line)| (line.trim() == "---").then_some(index))
+        .unwrap_or(separator.min(lines.len()));
+    lines.insert(
+        separator,
+        if yaml_frontmatter {
+            format!("nomifun_source_item_id: {source_item_id}")
+        } else {
+            format!("> **nomifun_source_item_id**: {source_item_id}")
+        },
+    );
+    lines.insert(
+        separator + 1,
+        if yaml_frontmatter {
+            format!("nomifun_source_relationship: {relationship}")
+        } else {
+            format!("> **nomifun_source_relationship**: {relationship}")
+        },
+    );
+    let mut rewritten = lines.join("\n");
+    rewritten.push('\n');
+    Ok(rewritten)
+}
+
+fn validate_write_request(req: &WriteRequest) -> Result<(), AppError> {
+    if req.content.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "refusing to write empty knowledge content".into(),
+        ));
+    }
+    if matches!(req.policy.mode, WriteMode::Disabled) {
+        return Err(AppError::Forbidden(
+            "write-back is disabled for this session".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn safe_md_path_bounded(
+    root: PathBuf,
+    rel_path: String,
+) -> Result<PathBuf, AppError> {
+    let display_path = rel_path.clone();
+    let timeout = AppError::Timeout(format!(
+            "knowledge path inspection timed out for {display_path}"
+        ));
+    let lock_root = root.clone();
+    bounded_root_blocking(
+        &lock_root,
+        KNOWLEDGE_PATH_INSPECTION_TIMEOUT,
+        Err(timeout),
+        move || safe_md_path(&root, &rel_path),
+    )
+    .await
+}
+
+#[derive(Debug)]
+struct PortablePathResolution {
+    rel_path: String,
+    exists: bool,
+}
+
+/// Resolve only the requested path chain using the same Unicode/case identity
+/// on every supported OS. This avoids a full-vault collision walk while still
+/// preventing Linux from creating a second spelling that would alias on
+/// default Windows/macOS filesystems.
+async fn resolve_portable_md_path(
+    root: PathBuf,
+    rel_path: String,
+) -> Result<PortablePathResolution, AppError> {
+    let display_path = rel_path.clone();
+    let timeout_display_path = display_path.clone();
+    tokio::time::timeout(KNOWLEDGE_PATH_INSPECTION_TIMEOUT, async move {
+        let components = rel_path.split('/').collect::<Vec<_>>();
+        let mut directory = root;
+        let mut actual_components = Vec::with_capacity(components.len());
+
+        for (index, requested) in components.iter().enumerate() {
+            let requested_identity = portable_path_component_identity(requested);
+            let mut entries = tokio::fs::read_dir(&directory)
+                .await
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "failed to inspect knowledge path {}: {error}",
+                        directory.display()
+                    ))
+                })?;
+            let mut matches = Vec::new();
+            while let Some(entry) = entries.next_entry().await.map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to inspect knowledge path {}: {error}",
+                    directory.display()
+                ))
+            })? {
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if portable_path_component_identity(&name) == requested_identity {
+                    matches.push((name, entry.path()));
+                }
+            }
+            if matches.is_empty() {
+                actual_components.extend(
+                    components[index..]
+                        .iter()
+                        .map(|component| (*component).to_owned()),
+                );
+                return Ok(PortablePathResolution {
+                    rel_path: actual_components.join("/"),
+                    exists: false,
+                });
+            }
+            if matches.len() > 1 {
+                return Err(AppError::Conflict(format!(
+                    "more than one knowledge path entry aliases \"{requested}\" across Windows, Linux and macOS; rename the duplicates before writing"
+                )));
+            }
+
+            let (actual_name, actual_path) =
+                matches.pop().expect("one portable path match");
+            let metadata = tokio::fs::symlink_metadata(&actual_path)
+                .await
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "failed to inspect knowledge path {}: {error}",
+                        actual_path.display()
+                    ))
+                })?;
+            if metadata_is_link_or_reparse(&actual_path, &metadata) {
+                return Err(AppError::BadRequest(
+                    "knowledge paths must not traverse symlinks, junctions, or other name-surrogate reparse points"
+                        .into(),
+                ));
+            }
+            let is_last = index + 1 == components.len();
+            if is_last {
+                if !metadata.is_file() || !is_md(&actual_path) {
+                    return Err(AppError::BadRequest(format!(
+                        "knowledge document is not a regular markdown file: {display_path}"
+                    )));
+                }
+            } else if !metadata.is_dir() {
+                return Err(AppError::BadRequest(format!(
+                    "knowledge path parent is not a directory: {}",
+                    actual_components
+                        .iter()
+                        .chain(std::iter::once(&actual_name))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("/")
+                )));
+            }
+            actual_components.push(actual_name);
+            directory = actual_path;
+        }
+        Ok(PortablePathResolution {
+            rel_path: actual_components.join("/"),
+            exists: true,
+        })
+    })
+    .await
+    .map_err(|_| {
+        AppError::Timeout(format!(
+            "knowledge path inspection timed out: {timeout_display_path}"
+        ))
+    })?
+}
+
+/// Join `rel_path` onto `root`, rejecting traversal (absolute paths, `..`,
+/// drive prefixes) and non-markdown extensions.
+fn safe_md_path(root: &Path, rel_path: &str) -> Result<PathBuf, AppError> {
+    validate_knowledge_root(root)?;
+    let rel = Path::new(rel_path);
+    if rel.as_os_str().is_empty() {
+        return Err(AppError::BadRequest("path must not be empty".into()));
+    }
+    let mut resolved = root.to_path_buf();
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(component) => {
+                let component = component
+                    .to_str()
+                    .ok_or_else(|| AppError::BadRequest("path must be valid Unicode".into()))?;
+                validate_portable_path_component(component)?;
+                resolved.push(component);
+                match std::fs::symlink_metadata(&resolved) {
+                    Ok(metadata) if metadata_is_link_or_reparse(&resolved, &metadata) => {
+                        return Err(AppError::BadRequest(
+                            "knowledge paths must not traverse symlinks, junctions, or other reparse points".into(),
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(AppError::Internal(format!(
+                            "failed to inspect knowledge path component {}: {error}",
+                            resolved.display()
+                        )));
+                    }
+                }
+            }
+            _ => return Err(AppError::BadRequest(format!("invalid path: {rel_path}"))),
+        }
+    }
+    if !is_md(rel) {
+        return Err(AppError::BadRequest("only .md files are supported".into()));
+    }
+    Ok(resolved)
+}
+
+/// Verify every physical root component without following a name-surrogate
+/// entry. Registration stores a canonical path, so any symlink/junction in
+/// this chain indicates that the root was retargeted after registration.
+fn validate_knowledge_root(root: &Path) -> Result<(), AppError> {
+    if !root.is_absolute() {
+        return Err(AppError::BadRequest(
+            "knowledge base root must be absolute".into(),
+        ));
+    }
+    let mut cursor = PathBuf::new();
+    let mut saw_normal = false;
+    for component in root.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => {
+                cursor.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(AppError::BadRequest(
+                    "knowledge base root must be a canonical physical path"
+                        .into(),
+                ));
+            }
+            Component::Normal(_) => {
+                saw_normal = true;
+                cursor.push(component.as_os_str());
+                let metadata =
+                    std::fs::symlink_metadata(&cursor).map_err(|error| {
+                        AppError::Internal(format!(
+                            "failed to inspect knowledge root {}: {error}",
+                            cursor.display()
+                        ))
+                    })?;
+                if metadata_is_link_or_reparse(&cursor, &metadata) {
+                    return Err(AppError::Conflict(format!(
+                        "knowledge base root was replaced or retargeted through a symlink, junction, or name-surrogate reparse point: {}",
+                        cursor.display()
+                    )));
+                }
+                if !metadata.is_dir() {
+                    return Err(AppError::Conflict(format!(
+                        "knowledge base root component is no longer a directory: {}",
+                        cursor.display()
+                    )));
+                }
+            }
+        }
+    }
+    if !saw_normal {
+        return Err(AppError::BadRequest(
+            "a filesystem, drive, or network-share root cannot be used as a knowledge base"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_knowledge_root_bounded(
+    root: PathBuf,
+) -> Result<(), AppError> {
+    let display = root.display().to_string();
+    let timeout = AppError::Timeout(format!(
+            "knowledge root inspection timed out: {display}"
+        ));
+    let lock_root = root.clone();
+    bounded_root_blocking(
+        &lock_root,
+        KNOWLEDGE_PATH_INSPECTION_TIMEOUT,
+        Err(timeout),
+        move || validate_knowledge_root(&root),
+    )
+    .await
+}
+
+#[cfg(not(windows))]
+fn metadata_is_link_or_reparse(_path: &Path, metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn metadata_is_link_or_reparse(path: &Path, metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    if !windows_file_attributes_are_reparse_point(metadata.file_attributes()) {
+        return false;
+    }
+    // Cloud Files/OneDrive placeholders are reparse points but not path
+    // redirections. Reject only name-surrogate tags (symlink/junction-like);
+    // fail closed if a tagged entry cannot be inspected.
+    windows_reparse_tag(path)
+        .map(|tag| tag & 0x2000_0000 != 0)
+        .unwrap_or(true)
+}
+
+#[cfg(windows)]
+fn windows_file_attributes_are_reparse_point(attributes: u32) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(windows)]
+fn windows_reparse_tag(path: &Path) -> std::io::Result<u32> {
+    use std::mem::{size_of, zeroed};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FileAttributeTagInfo, GetFileInformationByHandleEx,
+        OPEN_EXISTING,
+    };
+
+    let path = windows_api_path(path);
+    // SAFETY: path is NUL-terminated; the returned handle is closed below.
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the output buffer has the exact Win32 structure size and the
+    // valid handle remains open for the call.
+    let mut info: FILE_ATTRIBUTE_TAG_INFO = unsafe { zeroed() };
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileAttributeTagInfo,
+            (&mut info as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    };
+    // SAFETY: handle was returned by CreateFileW above.
+    unsafe {
+        CloseHandle(handle);
+    }
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(info.ReparseTag)
+    }
+}
+
+fn validate_portable_path_component(component: &str) -> Result<(), AppError> {
+    let invalid_character = component.chars().any(|character| {
+        character.is_control()
+            || matches!(character, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+    });
+    if component.is_empty()
+        || component.ends_with([' ', '.'])
+        || component.as_bytes().len() > 255
+        || component.encode_utf16().count() > 255
+        || invalid_character
+    {
+        return Err(AppError::BadRequest(format!(
+            "path component is not portable across Windows, Linux and macOS: {component}"
+        )));
+    }
+
+    let portable_component = portable_path_component_identity(component);
+    let basename = portable_component
+        .split_once('.')
+        .map(|(basename, _)| basename)
+        .unwrap_or(portable_component.as_str());
+    let reserved = matches!(basename, "con" | "prn" | "aux" | "nul")
+        || basename
+            .strip_prefix("com")
+            .or_else(|| basename.strip_prefix("lpt"))
+            .is_some_and(|suffix| {
+                (suffix.len() == 1
+                    && matches!(suffix.as_bytes()[0], b'1'..=b'9'))
+                    || matches!(suffix, "¹" | "²" | "³")
+            });
+    if reserved {
+        return Err(AppError::BadRequest(format!(
+            "path component is reserved on Windows: {component}"
+        )));
+    }
+    Ok(())
+}
+
+fn is_excluded_tree_dir_name(name: &str) -> bool {
+    let identity = portable_path_component_identity(name);
+    identity.starts_with('.')
+        || identity == portable_path_component_identity("node_modules")
+        || identity == portable_path_component_identity("_trash")
+}
+
+
+fn looks_like_windows_drive_prefix(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    bytes.len() == 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
+}
+
+fn normalize_tree_rel_path(rel_path: &str) -> Result<String, AppError> {
+    let normalized = rel_path.trim().replace('\\', "/");
+    let trimmed = normalized.trim_matches('/');
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut segments = Vec::new();
+    for segment in trimmed.split('/') {
+        if segment.is_empty()
+            || segment == "."
+            || segment == ".."
+            || looks_like_windows_drive_prefix(segment)
+        {
+            return Err(AppError::BadRequest(format!("invalid path: {rel_path}")));
+        }
+        validate_portable_path_component(segment)?;
+        if is_excluded_tree_dir_name(segment) {
+            return Err(AppError::BadRequest(format!(
+                "directory is excluded: {segment}"
+            )));
+        }
+        segments.push(segment);
+    }
+    Ok(segments.join("/"))
+}
+
+fn join_tree_rel_path(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+#[derive(Debug)]
+struct ScannedProjectionEntry {
+    name: String,
+    rel_path: String,
+    portable_rel_path: String,
+    kind: String,
+    fs_identity: Option<String>,
+    source_item_id: Option<KnowledgeSourceItemId>,
+    source_url: Option<String>,
+    source_relationship: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct SourceProjectionHints {
+    managed_item_ids: HashSet<KnowledgeSourceItemId>,
+    managed_urls: HashSet<String>,
+    entry_ids_by_item: HashMap<KnowledgeSourceItemId, KnowledgeEntryId>,
+    entry_ids_by_url: HashMap<String, KnowledgeEntryId>,
+    web_provenance_entry_ids: HashSet<KnowledgeEntryId>,
+}
+
+fn scan_knowledge_entry_projection(
+    root: &Path,
+    knowledge_base_id: &KnowledgeBaseId,
+    existing: &[KnowledgeEntryRow],
+    source_hints: SourceProjectionHints,
+    forced_ids: &HashMap<String, KnowledgeEntryId>,
+) -> Result<Vec<UpsertKnowledgeEntryParams>, AppError> {
+    validate_knowledge_root(root)?;
+    let mut scanned = Vec::new();
+    let mut directories = vec![(String::new(), root.to_path_buf())];
+    while let Some((parent_rel_path, directory)) = directories.pop() {
+        let children = std::fs::read_dir(&directory).map_err(|error| {
+            AppError::Internal(format!(
+                "failed to read knowledge directory {} while reconciling identities: {error}",
+                directory.display()
+            ))
+        })?;
+        let mut children = children
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to enumerate knowledge directory {} while reconciling identities: {error}",
+                    directory.display()
+                ))
+            })?;
+        children.sort_by_key(|entry| entry.file_name());
+        for child in children {
+            let Some(name) = child.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            // An entry that cannot participate in the product's portable path
+            // policy stays filesystem-owned and visible in legacy listings,
+            // but cannot safely receive a cross-platform stable projection.
+            if validate_portable_path_component(&name).is_err() {
+                continue;
+            }
+            let path = child.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to inspect knowledge entry {} while reconciling identities: {error}",
+                    path.display()
+                ))
+            })?;
+            if metadata_is_link_or_reparse(&path, &metadata) {
+                continue;
+            }
+            let rel_path = join_tree_rel_path(&parent_rel_path, &name);
+            let portable_rel_path = portable_writeback_path_identity(&rel_path);
+            if metadata.is_dir() {
+                if is_excluded_tree_dir_name(&name) {
+                    continue;
+                }
+                scanned.push(ScannedProjectionEntry {
+                    name,
+                    rel_path: rel_path.clone(),
+                    portable_rel_path,
+                    kind: KNOWLEDGE_ENTRY_KIND_DIRECTORY.into(),
+                    fs_identity: filesystem_entry_identity(&path, &metadata),
+                    source_item_id: None,
+                    source_url: None,
+                    source_relationship: None,
+                });
+                directories.push((rel_path, path));
+            } else if metadata.is_file() {
+                let (source_item_id, source_url, source_relationship) = if is_md(&path) {
+                    read_snapshot_projection_identity(&path)
+                } else {
+                    (None, None, None)
+                };
+                scanned.push(ScannedProjectionEntry {
+                    name,
+                    rel_path,
+                    portable_rel_path,
+                    kind: KNOWLEDGE_ENTRY_KIND_FILE.into(),
+                    fs_identity: filesystem_entry_identity(&path, &metadata),
+                    source_item_id,
+                    source_url,
+                    source_relationship,
+                });
+            }
+        }
+    }
+    scanned.sort_by(|left, right| {
+        left.rel_path
+            .matches('/')
+            .count()
+            .cmp(&right.rel_path.matches('/').count())
+            .then_with(|| left.portable_rel_path.cmp(&right.portable_rel_path))
+            .then_with(|| left.rel_path.cmp(&right.rel_path))
+    });
+
+    let mut existing_by_id = HashMap::with_capacity(existing.len());
+    let mut existing_by_path: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut existing_by_fs_identity: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, entry) in existing.iter().enumerate() {
+        existing_by_id.insert(entry.knowledge_entry_id.clone(), index);
+        existing_by_path
+            .entry(entry.portable_rel_path.clone())
+            .or_default()
+            .push(index);
+        if let Some(identity) = entry.fs_identity.as_ref() {
+            existing_by_fs_identity
+                .entry(identity.clone())
+                .or_default()
+                .push(index);
+        }
+    }
+
+    let mut used_ids = HashSet::with_capacity(scanned.len());
+    let mut assigned = Vec::with_capacity(scanned.len());
+    for scanned_entry in scanned {
+        let forced_id = forced_ids.get(&scanned_entry.portable_rel_path).cloned();
+        let source_is_managed = scanned_entry
+            .source_relationship
+            .as_deref()
+            .is_none_or(|relationship| relationship == "managed");
+        let candidate_index = forced_id
+            .as_ref()
+            .and_then(|id| existing_by_id.get(id).copied())
+            .or_else(|| source_is_managed.then(|| {
+                scanned_entry
+                    .source_item_id
+                    .as_ref()
+                    .and_then(|source_item_id| {
+                        source_hints.entry_ids_by_item.get(source_item_id)
+                    })
+                    .and_then(|id| existing_by_id.get(id).copied())
+            }).flatten())
+            .or_else(|| source_is_managed.then(|| {
+                scanned_entry
+                    .source_url
+                    .as_ref()
+                    .and_then(|url| source_hints.entry_ids_by_url.get(url))
+                    .and_then(|id| existing_by_id.get(id).copied())
+            }).flatten())
+            .or_else(|| {
+                select_projection_identity_candidate(
+                    existing_by_path.get(&scanned_entry.portable_rel_path),
+                    existing,
+                    &used_ids,
+                    &scanned_entry.kind,
+                    false,
+                )
+            })
+            .or_else(|| {
+                scanned_entry.fs_identity.as_ref().and_then(|identity| {
+                    select_projection_identity_candidate(
+                        existing_by_fs_identity.get(identity),
+                        existing,
+                        &used_ids,
+                        &scanned_entry.kind,
+                        true,
+                    )
+                })
+            });
+        let prior = candidate_index.map(|index| existing[index].clone());
+        let knowledge_entry_id = forced_id
+            .or_else(|| prior.as_ref().map(|entry| entry.knowledge_entry_id.clone()))
+            .unwrap_or_else(KnowledgeEntryId::new);
+        // A malformed historical projection or ambiguous hard-link identity
+        // must never assign one stable ID to two live filesystem entries.
+        let knowledge_entry_id = if used_ids.insert(knowledge_entry_id.clone()) {
+            knowledge_entry_id
+        } else {
+            let fresh = KnowledgeEntryId::new();
+            used_ids.insert(fresh.clone());
+            fresh
+        };
+        assigned.push((scanned_entry, knowledge_entry_id, prior));
+    }
+
+    let ids_by_path = assigned
+        .iter()
+        .map(|(entry, id, _)| (entry.portable_rel_path.clone(), id.clone()))
+        .collect::<HashMap<_, _>>();
+    let timestamp = now_ms();
+    let mut projected = Vec::with_capacity(assigned.len());
+    for (entry, knowledge_entry_id, prior) in assigned {
+        let parent_portable_path = entry
+            .portable_rel_path
+            .rsplit_once('/')
+            .map(|(parent, _)| parent);
+        let parent_entry_id = parent_portable_path
+            .and_then(|parent| ids_by_path.get(parent))
+            .cloned();
+        let source_is_managed = entry
+            .source_relationship
+            .as_deref()
+            .is_none_or(|relationship| relationship == "managed");
+        let inferred_origin = if source_hints
+            .web_provenance_entry_ids
+            .contains(&knowledge_entry_id)
+            || entry.source_relationship.is_some()
+            || (source_is_managed
+                && (entry
+                    .source_item_id
+                    .as_ref()
+                    .is_some_and(|source_item_id| {
+                        source_hints.managed_item_ids.contains(source_item_id)
+                    })
+                    || entry
+                        .source_url
+                        .as_ref()
+                        .is_some_and(|url| source_hints.managed_urls.contains(url))))
+        {
+            KNOWLEDGE_ENTRY_ORIGIN_URL_SNAPSHOT
+        } else {
+            KNOWLEDGE_ENTRY_ORIGIN_USER
+        };
+        let origin = if prior.as_ref().is_some_and(|prior| {
+            prior.origin == KNOWLEDGE_ENTRY_ORIGIN_GENERATED
+        }) {
+            KNOWLEDGE_ENTRY_ORIGIN_GENERATED.into()
+        } else {
+            inferred_origin.into()
+        };
+        let unchanged = prior.as_ref().is_some_and(|prior| {
+            prior.parent_entry_id == parent_entry_id
+                && prior.name == entry.name
+                && prior.kind == entry.kind
+                && prior.origin == origin
+                && prior.rel_path == entry.rel_path
+                && prior.portable_rel_path == entry.portable_rel_path
+                && prior.fs_identity == entry.fs_identity
+                && prior.deleted_at.is_none()
+        });
+        let revision = prior
+            .as_ref()
+            .map(|prior| {
+                if unchanged {
+                    prior.revision
+                } else {
+                    prior.revision.saturating_add(1)
+                }
+            })
+            .unwrap_or_default();
+        projected.push(UpsertKnowledgeEntryParams {
+            knowledge_entry_id,
+            knowledge_base_id: knowledge_base_id.clone(),
+            parent_entry_id,
+            name: entry.name,
+            kind: entry.kind,
+            origin,
+            rel_path: entry.rel_path,
+            portable_rel_path: entry.portable_rel_path,
+            fs_identity: entry.fs_identity,
+            // Content remains filesystem-owned. Hashing every document is not
+            // required to establish identity and would turn a metadata repair
+            // into an unbounded content read.
+            content_hash: None,
+            revision,
+            deleted_at: None,
+            created_at: prior.as_ref().map_or(timestamp, |prior| prior.created_at),
+            updated_at: prior
+                .as_ref()
+                .filter(|_| unchanged)
+                .map_or(timestamp, |prior| prior.updated_at),
+        });
+    }
+    projected.sort_by(|left, right| {
+        left.portable_rel_path
+            .cmp(&right.portable_rel_path)
+            .then_with(|| left.knowledge_entry_id.cmp(&right.knowledge_entry_id))
+    });
+    Ok(projected)
+}
+
+/// Read only the bounded leading metadata region used by managed snapshots.
+/// Ownership recovery never needs the document body and must not turn a tree
+/// reconciliation into an unbounded content scan.
+fn read_snapshot_projection_identity(
+    path: &Path,
+) -> (Option<KnowledgeSourceItemId>, Option<String>, Option<String>) {
+    const HEADER_LIMIT: u64 = 32 * 1024;
+    let Ok(file) = std::fs::File::open(path) else {
+        return (None, None, None);
+    };
+    let mut bytes = Vec::new();
+    if file.take(HEADER_LIMIT).read_to_end(&mut bytes).is_err() {
+        return (None, None, None);
+    }
+    let Ok(header) = std::str::from_utf8(&bytes) else {
+        return (None, None, None);
+    };
+    let source_item_id = source_url::snapshot_source_item_id(header);
+    let source_url = source_url::snapshot_source_url(header)
+        .and_then(|raw| normalize_source_url(raw).ok());
+    let source_relationship = source_url::snapshot_source_relationship(header).map(str::to_owned);
+    (source_item_id, source_url, source_relationship)
+}
+
+fn select_projection_identity_candidate(
+    candidates: Option<&Vec<usize>>,
+    existing: &[KnowledgeEntryRow],
+    used_ids: &HashSet<KnowledgeEntryId>,
+    kind: &str,
+    include_deleted: bool,
+) -> Option<usize> {
+    candidates?.iter().copied().filter(|index| {
+        !used_ids.contains(&existing[*index].knowledge_entry_id)
+            && (include_deleted || existing[*index].deleted_at.is_none())
+    }).min_by_key(|index| {
+        let entry = &existing[*index];
+        (
+            entry.deleted_at.is_some(),
+            entry.kind != kind,
+            std::cmp::Reverse(entry.updated_at),
+        )
+    })
+}
+
+#[cfg(unix)]
+fn filesystem_entry_identity(_path: &Path, metadata: &std::fs::Metadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    Some(format!("unix:{}:{}", metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+fn filesystem_entry_identity(path: &Path, _metadata: &std::fs::Metadata) -> Option<String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, GetFileInformationByHandle,
+    };
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        // Directories need FILE_FLAG_BACKUP_SEMANTICS. Opening the reparse
+        // point itself keeps this helper aligned with the caller's
+        // symlink/reparse safety check instead of following a late swap.
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .ok()?;
+    let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    let ok = unsafe {
+        GetFileInformationByHandle(file.as_raw_handle().cast(), info.as_mut_ptr())
+    };
+    if ok == 0 {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    let file_index = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
+    Some(format!(
+        "windows:{}:{}",
+        info.dwVolumeSerialNumber, file_index
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn filesystem_entry_identity(_path: &Path, _metadata: &std::fs::Metadata) -> Option<String> {
+    None
+}
+
+fn projection_snapshot_matches(
+    current: &[KnowledgeEntryRow],
+    snapshot: &[UpsertKnowledgeEntryParams],
+) -> bool {
+    if current.len() != snapshot.len() {
+        return false;
+    }
+    let mut current = current
+        .iter()
+        .map(UpsertKnowledgeEntryParams::from)
+        .collect::<Vec<_>>();
+    current.sort_by(|left, right| {
+        left.portable_rel_path
+            .cmp(&right.portable_rel_path)
+            .then_with(|| left.knowledge_entry_id.cmp(&right.knowledge_entry_id))
+    });
+    current == snapshot
+}
+
+fn tree_parent_rel_path(rel_path: &str) -> &str {
+    rel_path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+fn projection_tree_level_matches(
+    root: &Path,
+    rel_path: &str,
+    filesystem_entries: &[KbTreeEntry],
+    projected: &[KnowledgeEntryRow],
+) -> bool {
+    let filesystem = filesystem_entries
+        .iter()
+        .filter_map(|entry| {
+            normalize_tree_rel_path(&entry.rel_path)
+                .ok()
+                .map(|path| (portable_writeback_path_identity(&path), entry.is_dir))
+        })
+        .collect::<HashSet<_>>();
+    let projected_paths = projected
+        .iter()
+        .filter(|entry| {
+            tree_parent_rel_path(&entry.rel_path) == rel_path
+                && (entry.kind == KNOWLEDGE_ENTRY_KIND_DIRECTORY
+                    || is_md(Path::new(&entry.rel_path)))
+        })
+        .map(|entry| {
+            (
+                entry.portable_rel_path.clone(),
+                entry.kind == KNOWLEDGE_ENTRY_KIND_DIRECTORY,
+            )
+        })
+        .collect::<HashSet<_>>();
+    if filesystem != projected_paths {
+        return false;
+    }
+
+    // Path-only comparison misses the atomic-save pattern used by Obsidian
+    // and many editors: replace the file at the same path with a new inode,
+    // then rename it later. Refreshing the projected physical identity while
+    // the path is still known is what lets that later rename retain its ID.
+    let projected_by_path = projected
+        .iter()
+        .map(|entry| (entry.portable_rel_path.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    filesystem_entries.iter().all(|entry| {
+        let portable_path = portable_writeback_path_identity(&entry.rel_path);
+        let Some(projected) = projected_by_path.get(portable_path.as_str()) else {
+            return false;
+        };
+        let path = root.join(&entry.rel_path);
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            return false;
+        };
+        !metadata_is_link_or_reparse(&path, &metadata)
+            && filesystem_entry_identity(&path, &metadata) == projected.fs_identity
+    })
+}
+
+fn hydrate_tree_entries(
+    entries: &mut [KbTreeEntry],
+    projected: &[KnowledgeEntryRow],
+    tree_access: KnowledgeTreeAccess,
+    source_by_entry: &SourceMetadataByEntry,
+) {
+    let by_path = projected
+        .iter()
+        .map(|entry| (entry.portable_rel_path.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    for entry in entries {
+        let portable_path = portable_writeback_path_identity(&entry.rel_path);
+        let Some(projected_entry) = by_path.get(portable_path.as_str()) else {
+            continue;
+        };
+        entry.entry_id = Some(projected_entry.knowledge_entry_id.clone());
+        entry.revision = Some(projected_entry.revision);
+        entry.parent_entry_id = projected_entry.parent_entry_id.clone();
+        entry.parent_entry_id = projected_entry.parent_entry_id.clone();
+        entry.origin = Some(projected_entry.origin.clone());
+        entry.source = source_by_entry
+            .get(&projected_entry.knowledge_entry_id)
+            .cloned();
+        let has_managed_descendant = entry.is_dir
+            && projected.iter().any(|candidate| {
+                candidate
+                    .rel_path
+                    .strip_prefix(&format!("{}/", entry.rel_path))
+                    .is_some()
+                    && source_by_entry
+                        .get(&candidate.knowledge_entry_id)
+                        .is_some_and(|source| {
+                            source.relationship == KnowledgeEntrySourceRelationship::Managed
+                        })
+            });
+        entry.capabilities = resolve_entry_capabilities(
+            tree_access,
+            entry.is_dir,
+            entry.source.as_ref(),
+            has_managed_descendant,
+        );
+    }
+}
+
+fn hydrate_file_entries(
+    entries: &mut [KbFileEntry],
+    projected: &[KnowledgeEntryRow],
+    tree_access: KnowledgeTreeAccess,
+    source_by_entry: &SourceMetadataByEntry,
+) {
+    let by_path = projected
+        .iter()
+        .map(|entry| (entry.portable_rel_path.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    for entry in entries {
+        let portable_path = portable_writeback_path_identity(&entry.rel_path);
+        let Some(projected_entry) = by_path.get(portable_path.as_str()) else {
+            continue;
+        };
+        entry.entry_id = Some(projected_entry.knowledge_entry_id.clone());
+        entry.revision = Some(projected_entry.revision);
+        entry.origin = Some(projected_entry.origin.clone());
+        entry.source = source_by_entry
+            .get(&projected_entry.knowledge_entry_id)
+            .cloned();
+        entry.capabilities = resolve_entry_capabilities(
+            tree_access,
+            false,
+            entry.source.as_ref(),
+            false,
+        );
+    }
+}
+
+fn resolve_entry_capabilities(
+    tree_access: KnowledgeTreeAccess,
+    is_dir: bool,
+    source: Option<&KnowledgeEntrySourceInfo>,
+    has_managed_descendant: bool,
+) -> KnowledgeEntryCapabilities {
+    let tree_editable = tree_access == KnowledgeTreeAccess::Editable;
+    let managed = source.is_some_and(|source| {
+        source.relationship == KnowledgeEntrySourceRelationship::Managed
+    });
+    KnowledgeEntryCapabilities {
+        read_content: !is_dir,
+        edit_content: tree_editable && !is_dir && !managed,
+        rename: tree_editable,
+        relocate: tree_editable,
+        accept_children: tree_editable && is_dir,
+        delete_entry: tree_editable && !managed && !has_managed_descendant,
+        remove_source: tree_editable && managed,
+        refresh_source: tree_editable && managed,
+        detach_source: tree_editable && managed,
+        copy_as_editable: tree_editable && !is_dir && managed,
+        export_entry: true,
+        edit_metadata: tree_editable,
+        read_only_reason: if !tree_editable {
+            Some(
+                "This knowledge directory is read-only. Grant folder edit access to modify it."
+                    .into(),
+            )
+        } else if managed {
+            Some(
+                "This document body is managed by its web source. Move, rename, refresh, detach, or copy it instead."
+                    .into(),
+            )
+        } else if has_managed_descendant {
+            Some(
+                "This folder contains managed web documents; remove or detach those sources before deleting the folder."
+                    .into(),
+            )
+        } else {
+            None
+        },
+    }
+}
+
+fn non_negative_tree_revision(revision: i64) -> Result<u64, AppError> {
+    u64::try_from(revision).map_err(|_| {
+        AppError::Internal(format!(
+            "knowledge tree projection returned a negative revision: {revision}"
+        ))
+    })
+}
+
+fn list_tree_level(root: &Path, rel_path: &str) -> Result<Vec<KbTreeEntry>, AppError> {
+    validate_knowledge_root(root)?;
+    let dir = if rel_path.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(rel_path)
+    };
+    let meta = match std::fs::symlink_metadata(&dir) {
+        Ok(meta) => meta,
+        Err(_) => return Ok(Vec::new()),
+    };
+    if !meta.file_type().is_dir() {
+        return Err(AppError::NotFound(format!(
+            "directory not found: {rel_path}"
+        )));
+    }
+
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) => return Err(AppError::Internal(format!("failed to read directory: {e}"))),
+    };
+
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let metadata = match std::fs::symlink_metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if metadata_is_link_or_reparse(&entry.path(), &metadata) {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let child_rel = join_tree_rel_path(rel_path, &name);
+        if metadata.is_dir() {
+            if is_excluded_tree_dir_name(&name) {
+                continue;
+            }
+            out.push(KbTreeEntry {
+                entry_id: None,
+                revision: None,
+                parent_entry_id: None,
+                origin: None,
+                name,
+                rel_path: child_rel,
+                is_dir: true,
+                is_file: false,
+                size: None,
+                modified_at: None,
+                capabilities: KnowledgeEntryCapabilities::default(),
+                source: None,
+            });
+            continue;
+        }
+        if metadata.is_file() && is_md(&entry.path()) {
+            out.push(KbTreeEntry {
+                entry_id: None,
+                revision: None,
+                parent_entry_id: None,
+                origin: None,
+                name,
+                rel_path: child_rel,
+                is_dir: false,
+                is_file: true,
+                size: Some(metadata.len()),
+                modified_at: modified_ms(&metadata),
+                capabilities: KnowledgeEntryCapabilities::default(),
+                source: None,
+            });
+        }
+    }
+
+    out.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(out)
+}
+
+fn create_tree_folder(root: &Path, rel_path: &str) -> Result<KbTreeEntry, AppError> {
+    validate_knowledge_root(root)?;
+
+    let segments: Vec<&str> = rel_path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.is_empty() {
+        return Err(AppError::BadRequest("folder path must not be empty".into()));
+    }
+
+    let mut cursor = root.to_path_buf();
+    let mut actual_segments = Vec::with_capacity(segments.len());
+    for (idx, segment) in segments.iter().enumerate() {
+        let is_final = idx + 1 == segments.len();
+        match find_portable_tree_child(&cursor, segment)? {
+            Some(child) => {
+                if metadata_is_link_or_reparse(&child.path, &child.metadata) {
+                    return Err(AppError::BadRequest(format!("path crosses a symlink: {rel_path}")));
+                }
+                if !child.metadata.file_type().is_dir() {
+                    return Err(AppError::BadRequest(format!(
+                        "path is not a directory: {}",
+                        segments[..=idx].join("/")
+                    )));
+                }
+                if is_final {
+                    return Err(AppError::Conflict(format!("folder already exists: {rel_path}")));
+                }
+                actual_segments.push(child.name);
+                cursor = child.path;
+            }
+            None => {
+                let path = cursor.join(segment);
+                std::fs::create_dir(&path).map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        AppError::Conflict(format!(
+                            "a portable folder alias appeared while creating: {rel_path}"
+                        ))
+                    } else {
+                        AppError::Internal(format!(
+                            "failed to create folder: {error}"
+                        ))
+                    }
+                })?;
+                actual_segments.push((*segment).to_owned());
+                cursor = path;
+            }
+        }
+    }
+
+    let meta = std::fs::metadata(&cursor).ok();
+    Ok(KbTreeEntry {
+        entry_id: None,
+        revision: None,
+        parent_entry_id: None,
+        origin: None,
+        name: actual_segments
+            .last()
+            .cloned()
+            .unwrap_or_else(|| rel_path.to_owned()),
+        rel_path: actual_segments.join("/"),
+        is_dir: true,
+        is_file: false,
+        size: None,
+        modified_at: meta.as_ref().and_then(modified_ms),
+        capabilities: KnowledgeEntryCapabilities::default(),
+        source: None,
+    })
+}
+
+fn validate_tree_entry_name(name: &str) -> Result<String, AppError> {
+    let normalized = name.trim().replace('\\', "/");
+    if normalized.is_empty() || normalized.contains('/') || normalized == "." || normalized == ".." || looks_like_windows_drive_prefix(&normalized) {
+        return Err(AppError::BadRequest(format!("invalid name: {name}")));
+    }
+    validate_portable_path_component(&normalized)?;
+    if is_excluded_tree_dir_name(&normalized) {
+        return Err(AppError::BadRequest(format!(
+            "directory is excluded: {normalized}"
+        )));
+    }
+    Ok(normalized)
+}
+
+fn resolve_tree_existing_path(root: &Path, rel_path: &str) -> Result<(PathBuf, std::fs::Metadata), AppError> {
+    validate_knowledge_root(root)?;
+    let segments: Vec<&str> = rel_path.split('/').filter(|segment| !segment.is_empty()).collect();
+    if segments.is_empty() {
+        return Err(AppError::BadRequest("path must not be empty".into()));
+    }
+
+    let mut cursor = root.to_path_buf();
+    for (idx, segment) in segments.iter().enumerate() {
+        let child = find_portable_tree_child(&cursor, segment)?
+            .ok_or_else(|| AppError::NotFound(format!("path not found: {rel_path}")))?;
+        cursor = child.path;
+        let meta = child.metadata;
+        if metadata_is_link_or_reparse(&cursor, &meta) {
+            return Err(AppError::BadRequest(format!("path crosses a symlink: {rel_path}")));
+        }
+        if idx + 1 < segments.len() && !meta.file_type().is_dir() {
+            return Err(AppError::BadRequest(format!(
+                "path is not a directory: {}",
+                segments[..=idx].join("/")
+            )));
+        }
+        if idx + 1 == segments.len() {
+            return Ok((cursor, meta));
+        }
+    }
+    Err(AppError::BadRequest("path must not be empty".into()))
+}
+
+fn remove_tree_dir_no_follow(path: &Path) -> Result<(), AppError> {
+    let root_metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        AppError::Internal(format!(
+            "failed to inspect folder before delete: {error}"
+        ))
+    })?;
+    if metadata_is_link_or_reparse(path, &root_metadata) {
+        return Err(AppError::BadRequest(
+            "refusing to delete through a symlink, junction, or name-surrogate reparse point"
+                .into(),
+        ));
+    }
+    let entries = std::fs::read_dir(path)
+        .map_err(|e| AppError::Internal(format!("failed to read folder before delete: {e}")))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| AppError::Internal(format!("failed to read folder entry before delete: {e}")))?;
+        let child = entry.path();
+        let meta = std::fs::symlink_metadata(&child)
+            .map_err(|e| AppError::Internal(format!("failed to inspect folder entry before delete: {e}")))?;
+        if metadata_is_link_or_reparse(&child, &meta) {
+            return Err(AppError::BadRequest(format!(
+                "refusing to delete folder containing a symlink, junction, or name-surrogate reparse point: {}",
+                child.display()
+            )));
+        }
+        if meta.file_type().is_dir() {
+            remove_tree_dir_no_follow(&child)?;
+        } else {
+            std::fs::remove_file(&child)
+                .map_err(|e| AppError::Internal(format!("failed to delete folder entry: {e}")))?;
+        }
+    }
+    std::fs::remove_dir(path)
+        .map_err(|e| AppError::Internal(format!("failed to delete folder: {e}")))?;
+    Ok(())
+}
+
+fn delete_tree_folder(root: &Path, rel_path: &str) -> Result<(), AppError> {
+    let (path, meta) = resolve_tree_existing_path(root, rel_path)?;
+    if !meta.file_type().is_dir() {
+        return Err(AppError::BadRequest(format!("path is not a directory: {rel_path}")));
+    }
+    remove_tree_dir_no_follow(&path)
+}
+
+struct RelocatedTreeEntry {
+    old_path: String,
+    new_path: String,
+    kind: String,
+    moved_descendant_count: u64,
+    no_op: bool,
+    entry: KbTreeEntry,
+}
+
+fn relocate_tree_entry_on_disk(
+    root: &Path,
+    source_rel_path: &str,
+    destination_parent_rel_path: &str,
+    requested_new_name: Option<&str>,
+    durable_operation_id: Option<&KnowledgeTreeOperationId>,
+) -> Result<RelocatedTreeEntry, AppError> {
+    let (from, meta) = resolve_tree_existing_path(root, source_rel_path)?;
+    let file_type = meta.file_type();
+    let is_file = file_type.is_file();
+    let is_dir = file_type.is_dir();
+    if !is_file && !is_dir {
+        return Err(AppError::BadRequest(format!(
+            "unsupported path type: {source_rel_path}"
+        )));
+    }
+    if is_file && !is_md(&from) {
+        return Err(AppError::BadRequest(
+            "only markdown files and directories can be relocated".into(),
+        ));
+    }
+
+    let old_path = tree_relative_path(root, &from)?;
+    let old_name = from
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| AppError::BadRequest("path must be valid Unicode".into()))?;
+    let new_name = match requested_new_name {
+        Some(name) => validate_tree_entry_name(name)?,
+        None => old_name.to_owned(),
+    };
+    if is_file && !is_md(Path::new(&new_name)) {
+        return Err(AppError::BadRequest(
+            "markdown files must keep a .md extension".into(),
+        ));
+    }
+
+    let (destination_parent, destination_parent_meta) =
+        if destination_parent_rel_path.is_empty() {
+            validate_knowledge_root(root)?;
+            let metadata = std::fs::symlink_metadata(root).map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to inspect knowledge base root before relocation: {error}"
+                ))
+            })?;
+            (root.to_path_buf(), metadata)
+        } else {
+            resolve_tree_existing_path(root, destination_parent_rel_path)?
+        };
+    if !destination_parent_meta.file_type().is_dir() {
+        return Err(AppError::BadRequest(format!(
+            "relocation destination is not a directory: {destination_parent_rel_path}"
+        )));
+    }
+    if is_dir && destination_parent.starts_with(&from) {
+        return Err(AppError::BadRequest(
+            "a directory cannot be moved into itself or one of its descendants".into(),
+        ));
+    }
+
+    let destination_parent_rel = tree_relative_path_allow_root(root, &destination_parent)?;
+    let to = destination_parent.join(&new_name);
+    let new_path = join_tree_rel_path(&destination_parent_rel, &new_name);
+    if let Some(existing) = find_portable_tree_child(&destination_parent, &new_name)? {
+        if existing.path != from {
+            return Err(AppError::Conflict(format!(
+                "a portable path alias already exists: {}",
+                join_tree_rel_path(&destination_parent_rel, &existing.name)
+            )));
+        }
+    }
+
+    let moved_descendant_count = if is_dir {
+        count_tree_descendants_no_follow(&from)?
+    } else {
+        0
+    };
+    if to == from {
+        return Ok(RelocatedTreeEntry {
+            old_path,
+            new_path: new_path.clone(),
+            kind: if is_dir { "directory" } else { "file" }.into(),
+            moved_descendant_count,
+            no_op: true,
+            entry: tree_entry_from_metadata(new_name, new_path, is_dir, &meta),
+        });
+    }
+
+    let same_parent = from.parent() == Some(destination_parent.as_path());
+    if same_parent
+        && portable_path_component_identity(old_name)
+            == portable_path_component_identity(&new_name)
+    {
+        // A two-step rename makes case/normalization-only changes behave the
+        // same on case-insensitive Windows/macOS and case-sensitive Linux.
+        let temporary = destination_parent.join(match durable_operation_id {
+            Some(operation_id) => {
+                format!(".nomi-tree-rename-{operation_id}.tmp")
+            }
+            None => format!(
+                ".nomi-tree-rename-{}.tmp",
+                KnowledgeBaseId::new()
+            ),
+        });
+        rename_path_no_replace(&from, &temporary).map_err(|error| {
+            map_relocate_io_error(error, &from, &temporary)
+        })?;
+        if let Err(error) = rename_path_no_replace(&temporary, &to) {
+            let restore = rename_path_no_replace(&temporary, &from);
+            return match restore {
+                Ok(()) => Err(map_relocate_io_error(error, &from, &to)),
+                Err(restore_error) => Err(AppError::Internal(format!(
+                    "failed to finish portable tree rename: {error}; failed to restore the original path: {restore_error}; the entry remains recoverable at {}",
+                    temporary.display()
+                ))),
+            };
+        }
+    } else {
+        rename_path_no_replace(&from, &to)
+            .map_err(|error| map_relocate_io_error(error, &from, &to))?;
+    }
+
+    let target_meta = std::fs::symlink_metadata(&to).map_err(|error| {
+        AppError::Internal(format!(
+            "relocated entry could not be inspected at {}: {error}",
+            to.display()
+        ))
+    })?;
+    Ok(RelocatedTreeEntry {
+        old_path,
+        new_path: new_path.clone(),
+        kind: if is_dir { "directory" } else { "file" }.into(),
+        moved_descendant_count,
+        no_op: false,
+        entry: tree_entry_from_metadata(new_name, new_path, is_dir, &target_meta),
+    })
+}
+
+fn durable_relocation_temporary_path(
+    root: &Path,
+    destination_rel_path: &str,
+    operation_id: &KnowledgeTreeOperationId,
+) -> Result<PathBuf, AppError> {
+    let destination = Path::new(destination_rel_path);
+    let parent = destination.parent().unwrap_or_else(|| Path::new(""));
+    let mut resolved_parent = root.to_path_buf();
+    for component in parent.components() {
+        let Component::Normal(component) = component else {
+            return Err(AppError::Internal(format!(
+                "durable tree operation {operation_id} has an invalid destination path"
+            )));
+        };
+        resolved_parent.push(component);
+    }
+    Ok(resolved_parent.join(format!(
+        ".nomi-tree-rename-{operation_id}.tmp"
+    )))
+}
+
+/// Existence inspection for recovery uses the same portable, component-wise,
+/// no-follow resolver as normal tree mutation. Missing is data, while an
+/// unsafe or unreadable path remains an error.
+fn recovery_tree_path_exists(root: &Path, rel_path: &str) -> Result<bool, AppError> {
+    match resolve_tree_existing_path(root, rel_path) {
+        Ok(_) => Ok(true),
+        Err(AppError::NotFound(_)) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn recovery_tree_path_identity(
+    root: &Path,
+    rel_path: &str,
+) -> Result<Option<String>, AppError> {
+    let (path, metadata) = resolve_tree_existing_path(root, rel_path)?;
+    if metadata_is_link_or_reparse(&path, &metadata) {
+        return Err(AppError::Conflict(format!(
+            "durable relocation recovery refuses an unsafe destination: {rel_path}"
+        )));
+    }
+    Ok(filesystem_entry_identity(&path, &metadata))
+}
+
+fn recovery_absolute_path_exists(root: &Path, path: &Path) -> Result<bool, AppError> {
+    validate_knowledge_root(root)?;
+    let relative = path.strip_prefix(root).map_err(|_| {
+        AppError::Internal(format!(
+            "durable relocation temporary path escaped its knowledge root: {}",
+            path.display()
+        ))
+    })?;
+    let mut cursor = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(AppError::Internal(format!(
+                "durable relocation temporary path is invalid: {}",
+                path.display()
+            )));
+        };
+        cursor.push(component);
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(metadata) => {
+                if metadata_is_link_or_reparse(&cursor, &metadata) {
+                    return Err(AppError::Conflict(format!(
+                        "durable relocation recovery refuses a symlink, junction, or name-surrogate reparse point: {}",
+                        cursor.display()
+                    )));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(error) => {
+                return Err(AppError::Internal(format!(
+                    "failed to inspect durable relocation recovery path {}: {error}",
+                    cursor.display()
+                )));
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn inspect_committed_relocation(
+    root: &Path,
+    source_rel_path: &str,
+    destination_rel_path: &str,
+) -> Result<RelocatedTreeEntry, AppError> {
+    let (destination, metadata) = resolve_tree_existing_path(root, destination_rel_path)?;
+    let file_type = metadata.file_type();
+    let is_file = file_type.is_file();
+    let is_dir = file_type.is_dir();
+    if !is_file && !is_dir {
+        return Err(AppError::Conflict(format!(
+            "relocated destination has an unsupported filesystem type: {destination_rel_path}"
+        )));
+    }
+    if is_file && !is_md(&destination) {
+        return Err(AppError::Conflict(format!(
+            "relocated destination is not a markdown file: {destination_rel_path}"
+        )));
+    }
+    let actual_destination = tree_relative_path(root, &destination)?;
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| AppError::Conflict("relocated destination name is not Unicode".into()))?
+        .to_owned();
+    let moved_descendant_count = if is_dir {
+        count_tree_descendants_no_follow(&destination)?
+    } else {
+        0
+    };
+    Ok(RelocatedTreeEntry {
+        old_path: source_rel_path.to_owned(),
+        new_path: actual_destination.clone(),
+        kind: if is_dir { "directory" } else { "file" }.into(),
+        moved_descendant_count,
+        no_op: source_rel_path == actual_destination,
+        entry: tree_entry_from_metadata(name, actual_destination, is_dir, &metadata),
+    })
+}
+
+/// Resolve the exact portable paths that the filesystem mutation will use
+/// without crossing the rename boundary. The journal therefore records real
+/// on-disk casing/normalization even for path-only/degraded callers.
+fn plan_durable_relocation_paths(
+    root: &Path,
+    source_rel_path: &str,
+    destination_parent_rel_path: &str,
+    requested_new_name: Option<&str>,
+) -> Result<(String, String, Option<String>), AppError> {
+    let (source, source_metadata) = resolve_tree_existing_path(root, source_rel_path)?;
+    let source_type = source_metadata.file_type();
+    let source_is_file = source_type.is_file();
+    let source_is_directory = source_type.is_dir();
+    if !source_is_file && !source_is_directory {
+        return Err(AppError::BadRequest(format!(
+            "unsupported path type: {source_rel_path}"
+        )));
+    }
+    if source_is_file && !is_md(&source) {
+        return Err(AppError::BadRequest(
+            "only markdown files and directories can be relocated".into(),
+        ));
+    }
+    let source_path = tree_relative_path(root, &source)?;
+    let old_name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| AppError::BadRequest("path must be valid Unicode".into()))?;
+    let target_name = match requested_new_name {
+        Some(name) => validate_tree_entry_name(name)?,
+        None => old_name.to_owned(),
+    };
+    if source_is_file && !is_md(Path::new(&target_name)) {
+        return Err(AppError::BadRequest(
+            "markdown files must keep a .md extension".into(),
+        ));
+    }
+
+    let destination_parent = if destination_parent_rel_path.is_empty() {
+        validate_knowledge_root(root)?;
+        root.to_path_buf()
+    } else {
+        let (destination, metadata) =
+            resolve_tree_existing_path(root, destination_parent_rel_path)?;
+        if !metadata.file_type().is_dir() {
+            return Err(AppError::BadRequest(format!(
+                "relocation destination is not a directory: {destination_parent_rel_path}"
+            )));
+        }
+        destination
+    };
+    if source_is_directory && destination_parent.starts_with(&source) {
+        return Err(AppError::BadRequest(
+            "a directory cannot be moved into itself or one of its descendants".into(),
+        ));
+    }
+    let destination_parent_path =
+        tree_relative_path_allow_root(root, &destination_parent)?;
+    Ok((
+        source_path,
+        join_tree_rel_path(&destination_parent_path, &target_name),
+        filesystem_entry_identity(&source, &source_metadata),
+    ))
+}
+
+fn tree_entry_from_metadata(
+    name: String,
+    rel_path: String,
+    is_dir: bool,
+    metadata: &std::fs::Metadata,
+) -> KbTreeEntry {
+    KbTreeEntry {
+        entry_id: None,
+        revision: None,
+        parent_entry_id: None,
+        origin: None,
+        name,
+        rel_path,
+        is_dir,
+        is_file: !is_dir,
+        size: (!is_dir).then(|| metadata.len()),
+        modified_at: modified_ms(metadata),
+        capabilities: KnowledgeEntryCapabilities::default(),
+        source: None,
+    }
+}
+
+fn tree_relative_path(root: &Path, path: &Path) -> Result<String, AppError> {
+    let rel_path = tree_relative_path_allow_root(root, path)?;
+    if rel_path.is_empty() {
+        return Err(AppError::BadRequest(
+            "knowledge base root cannot be relocated".into(),
+        ));
+    }
+    Ok(rel_path)
+}
+
+fn tree_relative_path_allow_root(root: &Path, path: &Path) -> Result<String, AppError> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        AppError::BadRequest("relocation path escapes the knowledge base root".into())
+    })?;
+    let mut components = Vec::new();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(AppError::BadRequest(
+                "relocation path is not a portable relative path".into(),
+            ));
+        };
+        components.push(
+            component
+                .to_str()
+                .ok_or_else(|| AppError::BadRequest("path must be valid Unicode".into()))?,
+        );
+    }
+    Ok(components.join("/"))
+}
+
+fn count_tree_descendants_no_follow(path: &Path) -> Result<u64, AppError> {
+    let mut count = 0u64;
+    let entries = std::fs::read_dir(path).map_err(|error| {
+        AppError::Internal(format!(
+            "failed to inspect directory before relocation {}: {error}",
+            path.display()
+        ))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            AppError::Internal(format!(
+                "failed to inspect directory entry before relocation: {error}"
+            ))
+        })?;
+        let child = entry.path();
+        let metadata = std::fs::symlink_metadata(&child).map_err(|error| {
+            AppError::Internal(format!(
+                "failed to inspect descendant before relocation {}: {error}",
+                child.display()
+            ))
+        })?;
+        if metadata_is_link_or_reparse(&child, &metadata) {
+            return Err(AppError::BadRequest(format!(
+                "refusing to relocate a directory containing a symlink, junction, or name-surrogate reparse point: {}",
+                child.display()
+            )));
+        }
+        if metadata.file_type().is_dir() {
+            count = count
+                .saturating_add(1)
+                .saturating_add(count_tree_descendants_no_follow(&child)?);
+        } else if metadata.file_type().is_file() {
+            count = count.saturating_add(1);
+        } else {
+            return Err(AppError::BadRequest(format!(
+                "refusing to relocate an unsupported filesystem entry: {}",
+                child.display()
+            )));
+        }
+    }
+    Ok(count)
+}
+
+fn map_relocate_io_error(error: std::io::Error, source: &Path, target: &Path) -> AppError {
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        return AppError::Conflict(format!(
+            "relocation target already exists: {}",
+            target.display()
+        ));
+    }
+    if relocate_error_is_cross_device(&error) {
+        return AppError::Conflict(format!(
+            "cannot atomically relocate {} to {} across filesystems; no copy-and-delete fallback was attempted",
+            source.display(),
+            target.display()
+        ));
+    }
+    if error.kind() == std::io::ErrorKind::Unsupported {
+        return AppError::Conflict(format!(
+            "this filesystem does not provide atomic no-overwrite relocation; no files were changed: {error}"
+        ));
+    }
+    AppError::Internal(format!(
+        "failed to relocate tree entry from {} to {}: {error}",
+        source.display(),
+        target.display()
+    ))
+}
+
+#[cfg(unix)]
+fn relocate_error_is_cross_device(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EXDEV)
+}
+
+#[cfg(windows)]
+fn relocate_error_is_cross_device(error: &std::io::Error) -> bool {
+    use windows_sys::Win32::Foundation::ERROR_NOT_SAME_DEVICE;
+    error.raw_os_error() == Some(ERROR_NOT_SAME_DEVICE as i32)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn relocate_error_is_cross_device(_error: &std::io::Error) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn rename_path_no_replace(source: &Path, target: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "knowledge source path contains NUL",
+        )
+    })?;
+    let target = CString::new(target.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "knowledge target path contains NUL",
+        )
+    })?;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // SAFETY: both C strings remain alive for the synchronous syscall.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    // SAFETY: both C strings remain alive for the synchronous syscall.
+    let result = unsafe {
+        libc::renamex_np(source.as_ptr(), target.as_ptr(), libc::RENAME_EXCL)
+    } as libc::c_long;
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    let result = -1;
+
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let unsupported = matches!(
+        error.raw_os_error(),
+        Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
+    );
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let unsupported = matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOTSUP));
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    let unsupported = true;
+    if unsupported {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic no-replace rename is unavailable",
+        ))
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(windows)]
+fn rename_path_no_replace(source: &Path, target: &Path) -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    let source = windows_api_path(source);
+    let target = windows_api_path(target);
+    for &retry_delay_ms in WINDOWS_ATOMIC_RETRY_DELAYS_MS {
+        if retry_delay_ms != 0 {
+            std::thread::sleep(Duration::from_millis(retry_delay_ms));
+        }
+        // SAFETY: both buffers are NUL-terminated and live for this call.
+        if unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                target.as_ptr(),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        } != 0
+        {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        let retryable = error.raw_os_error().is_some_and(|code| {
+            code as u32 == ERROR_SHARING_VIOLATION || code as u32 == ERROR_LOCK_VIOLATION
+        });
+        if !retryable
+            || retry_delay_ms
+                == *WINDOWS_ATOMIC_RETRY_DELAYS_MS
+                    .last()
+                    .expect("retry schedule is non-empty")
+        {
+            return Err(error);
+        }
+    }
+    unreachable!("bounded MoveFileExW attempts always return")
+}
+
+#[cfg(not(any(unix, windows)))]
+fn rename_path_no_replace(_source: &Path, _target: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace rename is unavailable",
+    ))
+}
+
+struct PortableTreeChild {
+    name: String,
+    path: PathBuf,
+    metadata: std::fs::Metadata,
+}
+
+fn find_portable_tree_child(
+    parent: &Path,
+    requested: &str,
+) -> Result<Option<PortableTreeChild>, AppError> {
+    let requested_identity = portable_path_component_identity(requested);
+    let entries = std::fs::read_dir(parent).map_err(|error| {
+        AppError::Internal(format!(
+            "failed to inspect knowledge directory {}: {error}",
+            parent.display()
+        ))
+    })?;
+    let mut matches = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            AppError::Internal(format!(
+                "failed to inspect knowledge directory entry: {error}"
+            ))
+        })?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if portable_path_component_identity(&name) != requested_identity {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+            AppError::Internal(format!(
+                "failed to inspect knowledge path {}: {error}",
+                path.display()
+            ))
+        })?;
+        matches.push(PortableTreeChild {
+            name,
+            path,
+            metadata,
+        });
+    }
+    if matches.len() > 1 {
+        return Err(AppError::Conflict(format!(
+            "more than one knowledge path entry aliases \"{requested}\" across Windows, Linux and macOS; rename the duplicates outside the app before continuing"
+        )));
+    }
+    Ok(matches.pop())
+}
+
+/// Sanitize a base name into a directory-safe mount link name, deduplicating
+/// collisions (with other mounts AND with the platform-managed companion
+/// files inside the mount root, e.g. a base literally named `README.md`)
+/// via the complete canonical knowledge-base ID.
+fn unique_link_name(row: &KnowledgeBaseRow, used: &mut HashSet<String>) -> String {
+    let mut name: String = row
+        .name
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect::<String>()
+        .trim()
+        .trim_end_matches('.')
+        .to_owned();
+    if name.is_empty() {
+        name = row.knowledge_base_id.clone();
+    }
+
+    let identity = portable_path_component_identity(&name);
+    let reserved_by_mount = mount::MANAGED_KEEP.iter().any(|kept| {
+        portable_path_component_identity(kept) == identity
+    });
+    if validate_portable_path_component(&name).is_err()
+        || reserved_by_mount
+        || used.contains(&identity)
+    {
+        // Put the ID before any extension-like punctuation by replacing dots,
+        // otherwise `CON.md-{id}` is still a reserved Windows basename.
+        let suffix = format!("-{}", row.knowledge_base_id);
+        let readable = name.replace('.', "_");
+        let mut prefix = String::new();
+        let max_bytes = 255usize.saturating_sub(suffix.len());
+        let max_utf16 =
+            255usize.saturating_sub(suffix.encode_utf16().count());
+        let mut utf16_len = 0usize;
+        for character in readable.chars() {
+            let next_bytes = prefix.len() + character.len_utf8();
+            let next_utf16 = utf16_len + character.len_utf16();
+            if next_bytes > max_bytes || next_utf16 > max_utf16 {
+                break;
+            }
+            prefix.push(character);
+            utf16_len = next_utf16;
+        }
+        let prefix = prefix.trim().trim_end_matches('.').trim();
+        let prefix = if prefix.is_empty() { "kb" } else { prefix };
+        name = format!("{prefix}{suffix}");
+        if validate_portable_path_component(&name).is_err() {
+            name = format!("kb-{}", row.knowledge_base_id);
+        }
+    }
+
+    // IDs make the fallback unique; this loop also handles a corrupt binding
+    // that repeats the exact same base more than once.
+    let mut candidate = name;
+    let mut counter = 2usize;
+    while used.contains(&portable_path_component_identity(&candidate)) {
+        candidate = format!("kb-{}-{counter}", row.knowledge_base_id);
+        counter += 1;
+    }
+    used.insert(portable_path_component_identity(&candidate));
+    candidate
+}
+
+fn modified_ms(meta: &std::fs::Metadata) -> Option<TimestampMs> {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as TimestampMs)
+}
+
+fn list_md_files(root: &Path) -> Vec<KbFileEntry> {
+    list_md_files_strict(root).unwrap_or_default()
+}
+
+fn list_md_files_strict(root: &Path) -> Result<Vec<KbFileEntry>, AppError> {
+    validate_knowledge_root(root)?;
+
+    let mut entries = Vec::new();
+    let walker = walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .follow_root_links(false)
+        .into_iter()
+        .filter_entry(|entry| !is_machinery_dir(entry));
+    for entry in walker {
+        let entry = entry.map_err(|error| {
+            AppError::Internal(format!(
+                "failed to scan knowledge base {}: {error}",
+                root.display()
+            ))
+        })?;
+        if !entry.file_type().is_file() || !is_md(entry.path()) {
+            continue;
+        }
+        let rel = entry.path().strip_prefix(root).map_err(|error| {
+            AppError::Internal(format!("failed to resolve knowledge path: {error}"))
+        })?;
+        let Some(rel_str) = rel.to_str().map(|rel| rel.replace('\\', "/")) else {
+            tracing::warn!(
+                path = %entry.path().display(),
+                "skipping non-Unicode knowledge path during listing"
+            );
+            continue;
+        };
+        let meta = entry.metadata().map_err(|error| {
+            AppError::Internal(format!(
+                "failed to inspect knowledge document {}: {error}",
+                entry.path().display()
+            ))
+        })?;
+        entries.push(KbFileEntry {
+            entry_id: None,
+            revision: None,
+            parent_entry_id: None,
+            origin: None,
+            rel_path: rel_str,
+            size: meta.len(),
+            modified_at: modified_ms(&meta),
+            capabilities: KnowledgeEntryCapabilities::default(),
+            source: None,
+        });
+    }
+    entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    Ok(entries)
+}
+
+
+
+
+// ── Tag CRUD ─────────────────────────────────────────────────────────────
+
+impl KnowledgeService {
+    /// List all tag definitions (sorted by `sort_order` then `key`).
+    pub async fn list_tags(&self) -> Result<Vec<KnowledgeTag>, AppError> {
+        let rows = self.repo.list_knowledge_tags().await?;
+        Ok(rows.into_iter().map(|r| KnowledgeTag {
+            key: r.key,
+            label: r.label,
+            color: r.color,
+            sort_order: r.sort_order,
+        }).collect())
+    }
+
+    /// Create a new tag. The `key` is slug-ified from `label` (lowercase,
+    /// non-alphanumeric→`-`, collapsed, trimmed). Chinese-only labels produce a
+    /// pinyin-like short hash fallback (`tag-<8hex>`). Conflicts are
+    /// disambiguated by appending `-2`, `-3`, etc.
+    pub async fn create_tag(
+        &self,
+        label: &str,
+        color: Option<String>,
+    ) -> Result<KnowledgeTag, AppError> {
+        let label = label.trim();
+        if label.is_empty() {
+            return Err(AppError::BadRequest("tag label must not be empty".into()));
+        }
+
+        let base_slug = slugify(label);
+        let existing: HashSet<String> = self
+            .repo
+            .list_knowledge_tags()
+            .await?
+            .into_iter()
+            .map(|r| r.key)
+            .collect();
+
+        let key = deduplicate_slug(&base_slug, &existing);
+
+        let sort_order = existing.len() as i64;
+        let created_at = now_ms();
+
+        self.repo
+            .create_knowledge_tag(CreateKnowledgeTagParams {
+                key: key.clone(),
+                label: label.to_owned(),
+                color: color.clone(),
+                sort_order,
+                created_at,
+            })
+            .await?;
+
+        self.emitter.emit_tag_changed();
+        Ok(KnowledgeTag {
+            key,
+            label: label.to_owned(),
+            color,
+            sort_order,
+        })
+    }
+
+    /// Update mutable fields of an existing tag.
+    pub async fn update_tag(
+        &self,
+        key: &str,
+        req: UpdateKnowledgeTagRequest,
+    ) -> Result<KnowledgeTag, AppError> {
+        use nomifun_db::models::UpdateKnowledgeTagParams;
+
+        let params = UpdateKnowledgeTagParams {
+            label: req.label.clone(),
+            // API sends `Option<String>`:
+            //   absent/null (None) = don't change
+            //   Some("") = clear → mapped to Some(None) in the DB layer
+            //   Some("blue") = set → mapped to Some(Some("blue"))
+            color: req.color.as_ref().map(|c| {
+                let c = c.trim();
+                if c.is_empty() { None } else { Some(c.to_owned()) }
+            }),
+            sort_order: req.sort_order,
+        };
+        self.repo.update_knowledge_tag(key, params).await?;
+
+        // Re-read and return the updated tag.
+        let rows = self.repo.list_knowledge_tags().await?;
+        let row = rows
+            .into_iter()
+            .find(|r| r.key == key)
+            .ok_or_else(|| AppError::NotFound(format!("knowledge tag {key}")))?;
+        self.emitter.emit_tag_changed();
+        Ok(KnowledgeTag {
+            key: row.key,
+            label: row.label,
+            color: row.color,
+            sort_order: row.sort_order,
+        })
+    }
+
+    /// Delete a tag by key after explicitly removing every JSON reference.
+    ///
+    /// The repository boundary does not expose a cross-table transaction, so a
+    /// mid-operation failure can leave already-updated bases without the tag
+    /// while retaining the tag definition. That state is safe and retryable:
+    /// references are removed before the definition, never the reverse.
+    pub async fn delete_tag(&self, key: &str) -> Result<(), AppError> {
+        // 1. Strip the key from every base that references it.
+        let bases = self.repo.list_bases().await?;
+        for mut base in bases {
+            let tags = tags_from_row(&base)?;
+            if tags.iter().any(|tag| tag == key) {
+                let filtered: Vec<&String> = tags.iter().filter(|k| k.as_str() != key).collect();
+                base.tags = if filtered.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_string(&filtered).map_err(|error| {
+                        AppError::Internal(format!(
+                            "failed to serialize tags for knowledge base {}: {error}",
+                            base.knowledge_base_id
+                        ))
+                    })?)
+                };
+                base.updated_at = now_ms();
+                self.repo.update_base(&base).await?;
+                // The base's tag chips changed — refresh any base list/detail
+                // view (the tag-changed signal below only refreshes tag maps).
+                let info = self.row_to_info(base).await?;
+                self.emitter.emit_base_updated(&info);
+            }
+        }
+        // 2. Delete the tag row itself.
+        self.repo.delete_knowledge_tag(key).await?;
+        self.emitter.emit_tag_changed();
+        Ok(())
+    }
+}
+
+/// Convert a label to a URL-safe slug. Keeps ASCII alphanumeric characters;
+/// replaces everything else with `-`; collapses consecutive dashes; trims
+/// leading/trailing dashes. If the result is empty (e.g. purely CJK label),
+/// falls back to `tag-<8 hex chars from a content hash>`.
+fn slugify(label: &str) -> String {
+    let lower = label.to_lowercase();
+    let mut slug = String::with_capacity(lower.len());
+    for ch in lower.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+        } else {
+            // Replace non-ASCII-alphanumeric with dash (will be collapsed).
+            if !slug.ends_with('-') {
+                slug.push('-');
+            }
+        }
+    }
+    // Trim leading/trailing dashes.
+    let slug = slug.trim_matches('-').to_owned();
+    if slug.is_empty() {
+        // Fallback: deterministic short hash so the same label always gets
+        // the same key (before dedup).
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        label.hash(&mut hasher);
+        format!("tag-{:08x}", hasher.finish() as u32)
+    } else {
+        slug
+    }
+}
+
+/// Given a base slug and a set of existing keys, return a unique key by
+/// appending `-2`, `-3`, … if needed.
+fn deduplicate_slug(base: &str, existing: &HashSet<String>) -> String {
+    if !existing.contains(base) {
+        return base.to_owned();
+    }
+    for n in 2..=999 {
+        let candidate = format!("{base}-{n}");
+        if !existing.contains(&candidate) {
+            return candidate;
+        }
+    }
+    // Extremely unlikely: fall back to a unique suffix.
+    format!("{base}-{}", now_ms())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FailNextProjectionRelocate {
+        inner: Arc<nomifun_db::SqliteKnowledgeRepository>,
+        fail_next_relocate: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailNextProjectionRelocate {
+        fn new(inner: Arc<nomifun_db::SqliteKnowledgeRepository>) -> Self {
+            Self {
+                inner,
+                fail_next_relocate: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn fail_next_relocate(&self) {
+            self.fail_next_relocate
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IKnowledgeEntryRepository for FailNextProjectionRelocate {
+        async fn get_entry(
+            &self,
+            knowledge_base_id: &KnowledgeBaseId,
+            knowledge_entry_id: &KnowledgeEntryId,
+        ) -> Result<Option<KnowledgeEntryRow>, nomifun_db::DbError> {
+            self.inner
+                .get_entry(knowledge_base_id, knowledge_entry_id)
+                .await
+        }
+
+        async fn get_entry_by_path(
+            &self,
+            knowledge_base_id: &KnowledgeBaseId,
+            portable_rel_path: &str,
+        ) -> Result<Option<KnowledgeEntryRow>, nomifun_db::DbError> {
+            self.inner
+                .get_entry_by_path(knowledge_base_id, portable_rel_path)
+                .await
+        }
+
+        async fn list_entries_for_base(
+            &self,
+            knowledge_base_id: &KnowledgeBaseId,
+            include_deleted: bool,
+        ) -> Result<Vec<KnowledgeEntryRow>, nomifun_db::DbError> {
+            self.inner
+                .list_entries_for_base(knowledge_base_id, include_deleted)
+                .await
+        }
+
+        async fn tree_revision(
+            &self,
+            knowledge_base_id: &KnowledgeBaseId,
+        ) -> Result<i64, nomifun_db::DbError> {
+            self.inner.tree_revision(knowledge_base_id).await
+        }
+
+        async fn upsert_entry(
+            &self,
+            params: &UpsertKnowledgeEntryParams,
+        ) -> Result<nomifun_db::KnowledgeEntryMutation, nomifun_db::DbError> {
+            self.inner.upsert_entry(params).await
+        }
+
+        async fn replace_projection(
+            &self,
+            knowledge_base_id: &KnowledgeBaseId,
+            expected_tree_revision: Option<i64>,
+            entries: &[UpsertKnowledgeEntryParams],
+        ) -> Result<nomifun_db::KnowledgeProjectionReplacement, nomifun_db::DbError> {
+            self.inner
+                .replace_projection(knowledge_base_id, expected_tree_revision, entries)
+                .await
+        }
+
+        async fn relocate_entry(
+            &self,
+            params: &RelocateKnowledgeEntryProjectionParams,
+        ) -> Result<nomifun_db::KnowledgeEntryMutation, nomifun_db::DbError> {
+            if self
+                .fail_next_relocate
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(nomifun_db::DbError::Conflict(
+                    "injected projection relocate failure".into(),
+                ));
+            }
+            self.inner.relocate_entry(params).await
+        }
+
+        async fn soft_delete_entry_subtree(
+            &self,
+            knowledge_base_id: &KnowledgeBaseId,
+            knowledge_entry_id: &KnowledgeEntryId,
+            expected_revision: i64,
+            deleted_at: TimestampMs,
+        ) -> Result<nomifun_db::KnowledgeEntryMutation, nomifun_db::DbError> {
+            self.inner
+                .soft_delete_entry_subtree(
+                    knowledge_base_id,
+                    knowledge_entry_id,
+                    expected_revision,
+                    deleted_at,
+                )
+                .await
+        }
+    }
+
+    const TEST_OWNER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const TEST_CONVERSATION_ID: &str = "0190f5fe-7c00-7a00-8000-000000000011";
+    const TEST_CONVERSATION_ID_2: &str = "0190f5fe-7c00-7a00-8000-000000000012";
+    const TEST_CONVERSATION_ID_9: &str = "0190f5fe-7c00-7a00-8000-000000000019";
+    const TEST_TERMINAL_ID_2: &str = "0190f5fe-7c00-7a00-8000-000000000022";
+    const TEST_TERMINAL_ID_9: &str = "0190f5fe-7c00-7a00-8000-000000000029";
+    const TEST_PROVIDER_ID_2: &str = "0190f5fe-7c00-7a00-8000-000000000032";
+    const TEST_PROVIDER_ID_9: &str = "0190f5fe-7c00-7a00-8000-000000000039";
+    const TEST_KB_PENDING: &str = "0190f5fe-7c00-7a00-8000-000000000091";
+    const TEST_KB_LIVE: &str = "0190f5fe-7c00-7a00-8000-000000000092";
+    const TEST_KB_STAMPED: &str = "0190f5fe-7c00-7a00-8000-000000000093";
+
+    fn durable_sqlite_service(
+        database: &nomifun_db::Database,
+        data_dir: &Path,
+        events: Arc<dyn nomifun_realtime::UserEventSink>,
+    ) -> (
+        KnowledgeService,
+        Arc<nomifun_db::SqliteKnowledgeRepository>,
+        Arc<nomifun_db::SqliteKnowledgeTreeOperationRepository>,
+    ) {
+        let knowledge_repository = Arc::new(
+            nomifun_db::SqliteKnowledgeRepository::new(database.pool().clone()),
+        );
+        let operation_repository = Arc::new(
+            nomifun_db::SqliteKnowledgeTreeOperationRepository::new(
+                database.pool().clone(),
+            ),
+        );
+        let base_repository: Arc<dyn IKnowledgeRepository> =
+            knowledge_repository.clone();
+        let service = KnowledgeService::new(
+            base_repository,
+            data_dir,
+            KnowledgeEventEmitter::new(events, Arc::from(TEST_OWNER_ID)),
+        );
+        service.set_entry_repository(knowledge_repository.clone());
+        service.set_source_repository(knowledge_repository.clone());
+        service.set_tree_operation_repository(operation_repository.clone());
+        (service, knowledge_repository, operation_repository)
+    }
+
+    #[derive(Clone)]
+    struct MutableSourceFetcher {
+        body: Arc<StdMutex<String>>,
+    }
+
+    impl MutableSourceFetcher {
+        fn new(body: &str) -> (Self, Arc<StdMutex<String>>) {
+            let body = Arc::new(StdMutex::new(body.to_owned()));
+            (Self { body: body.clone() }, body)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PageFetcher for MutableSourceFetcher {
+        async fn fetch_page(
+            &self,
+            raw_url: &str,
+        ) -> Result<source_url::FetchedPage, AppError> {
+            Ok(source_url::FetchedPage {
+                final_url: raw_url.to_owned(),
+                title: Some("Managed page".into()),
+                markdown: self.body.lock().unwrap().clone(),
+                truncated: false,
+            })
+        }
+    }
+
+    fn managed_source_sqlite_service(
+        database: &nomifun_db::Database,
+        data_dir: &Path,
+        fetcher: MutableSourceFetcher,
+    ) -> KnowledgeService {
+        let repository = Arc::new(nomifun_db::SqliteKnowledgeRepository::new(
+            database.pool().clone(),
+        ));
+        let base_repository: Arc<dyn IKnowledgeRepository> = repository.clone();
+        let service = KnowledgeService::new(
+            base_repository,
+            data_dir,
+            KnowledgeEventEmitter::new(
+                Arc::new(RecordingBroadcaster::default()),
+                Arc::from(TEST_OWNER_ID),
+            ),
+        )
+        .with_url_fetcher(fetcher);
+        service.set_entry_repository(repository.clone());
+        service.set_source_repository(repository);
+        service.set_tree_operation_repository(Arc::new(
+            nomifun_db::SqliteKnowledgeTreeOperationRepository::new(
+                database.pool().clone(),
+            ),
+        ));
+        service
+    }
+
+    fn test_relocation_fingerprint(
+        request: &RelocateTreeEntryRequest,
+    ) -> String {
+        relocate_request_sha256(&RelocateRequestFingerprint {
+            source_path: normalize_tree_rel_path(&request.source_path).unwrap(),
+            destination_parent_path: normalize_tree_rel_path(
+                &request.destination_parent_path,
+            )
+            .unwrap(),
+            new_name: request
+                .new_name
+                .as_deref()
+                .map(validate_tree_entry_name)
+                .transpose()
+                .unwrap(),
+            conflict_policy: request.conflict_policy,
+            entry_id: request.entry_id.clone(),
+            destination_parent_id: request.destination_parent_id.clone(),
+            expected_revision: request.expected_revision,
+        })
+        .unwrap()
+    }
+
+    fn retrieval_document(index: usize, content: impl Into<Arc<str>>) -> RetrievalDocument {
+        RetrievalDocument {
+            kb_id: KnowledgeBaseId::new(),
+            kb_name: "docs".into(),
+            rel_path: format!("doc-{index}.md"),
+            heading: format!("Document {index}"),
+            content: content.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_embedding_rejects_document_count_before_any_invoke() {
+        let service = test_service();
+        let documents = (0..=REMOTE_RETRIEVAL_MAX_DOCUMENTS)
+            .map(|index| retrieval_document(index, "body"))
+            .collect();
+        let error = service
+            .remote_embedding_candidates(
+                documents,
+                "query",
+                10,
+                TEST_PROVIDER_ID_2,
+                "embedding-model",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AppError::BadRequest(ref message) if message.contains("at most 128")),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_embedding_rejects_total_summary_budget_before_any_invoke() {
+        let service = test_service();
+        let content = "x".repeat(REMOTE_RETRIEVAL_MAX_DOCUMENT_CHARS);
+        let documents = (0..65)
+            .map(|index| retrieval_document(index, Arc::<str>::from(content.clone())))
+            .collect();
+        let error = service
+            .remote_embedding_candidates(
+                documents,
+                "query",
+                10,
+                TEST_PROVIDER_ID_2,
+                "embedding-model",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AppError::BadRequest(ref message) if message.contains("character query-time document budget")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn embedding_vector_validation_and_cosine_are_strict() {
+        assert!(validate_embedding_vector(&[], None, "empty").is_err());
+        assert!(validate_embedding_vector(&[0.0, 0.0], None, "zero").is_err());
+        assert!(validate_embedding_vector(&[1.0, f32::NAN], None, "nan").is_err());
+        assert!(validate_embedding_vector(&[1.0], Some(2), "short").is_err());
+        assert_eq!(cosine_similarity(&[1.0, 0.0], &[1.0, 0.0]), Some(1.0));
+        assert_eq!(cosine_similarity(&[1.0], &[1.0, 0.0]), None);
+    }
+
+    #[test]
+    fn canonical_entity_target_id_accepts_bare_uuidv7_and_rejects_legacy_prefix() {
+        assert_eq!(
+            canonical_target_id("conversation", TEST_CONVERSATION_ID).unwrap(),
+            TEST_CONVERSATION_ID
+        );
+
+        let legacy = format!("conv_{TEST_CONVERSATION_ID}");
+        let error = canonical_target_id("conversation", &legacy).unwrap_err();
+        assert!(
+            matches!(error, AppError::BadRequest(ref message) if message.contains("invalid conversation target id")),
+            "{error}"
+        );
+    }
+
+    /// **P3-K2 seam**: the render fetcher is an OPTIONAL, late-wired backend. By
+    /// default it is absent (every source uses the HTTP `fetcher` — zero
+    /// regression); the app layer registers a `BrowserFetcher` via
+    /// [`KnowledgeService::set_render_fetcher`] when `browser-use` is on. K3 reads
+    /// it to route `rendered` sources; K2 only proves the seam wires.
+    #[tokio::test]
+    async fn render_fetcher_seam_is_optional_and_late_wired() {
+        use crate::source_url::FetchedPage;
+
+        struct CannedRenderFetcher;
+        #[async_trait::async_trait]
+        impl PageFetcher for CannedRenderFetcher {
+            async fn fetch_page(&self, _raw_url: &str) -> Result<FetchedPage, AppError> {
+                Ok(FetchedPage {
+                    final_url: "https://spa.example.com/app".into(),
+                    title: Some("Rendered".into()),
+                    markdown: "# Rendered\n\nonly a browser sees this".into(),
+                    truncated: false,
+                })
+            }
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = Arc::new(MemRepo::default());
+        let events = Arc::new(RecordingBroadcaster::default());
+        let service = Arc::new(KnowledgeService::new(
+            repo,
+            &dir.path().join("data"),
+            KnowledgeEventEmitter::new(events, Arc::from(TEST_OWNER_ID)),
+        ));
+
+        // Default: no render backend → HTTP fetcher is the only path (zero regression).
+        assert!(service.render_fetcher().is_none(), "render fetcher must default to None");
+
+        // Late-wire on the shared Arc (interior mutability, like set_completer).
+        service.set_render_fetcher(Arc::new(CannedRenderFetcher));
+        let rf = service.render_fetcher().expect("render fetcher wired");
+        let page = rf.fetch_page("https://spa.example.com/app").await.unwrap();
+        assert_eq!(page.title.as_deref(), Some("Rendered"));
+        assert!(page.markdown.contains("only a browser sees this"));
+    }
+
+    /// **P3-K3 backend selection** (pure logic over `fetcher_for`): each fetcher
+    /// reports a distinctive marker so we can prove *which* backend a given
+    /// `(rendered, render-wired?)` combination selects.
+    ///   • `rendered == false`            → HTTP (default), even with a browser wired
+    ///   • `rendered == true`, browser ✓  → render backend
+    ///   • `rendered == true`, browser ✗  → graceful HTTP fallback (no error)
+    #[tokio::test]
+    async fn fetcher_for_selects_backend_by_rendered_flag() {
+        use crate::source_url::FetchedPage;
+
+        fn marked(marker: &str) -> FetchedPage {
+            FetchedPage {
+                final_url: "https://x".into(),
+                title: Some(marker.into()),
+                markdown: format!("via:{marker}"),
+                truncated: false,
+            }
+        }
+
+        struct Canned(&'static str);
+        #[async_trait::async_trait]
+        impl PageFetcher for Canned {
+            async fn fetch_page(&self, _url: &str) -> Result<FetchedPage, AppError> {
+                Ok(marked(self.0))
+            }
+        }
+
+        async fn which(service: &KnowledgeService, rendered: bool) -> String {
+            service
+                .fetcher_for(rendered)
+                .fetch_page("https://x")
+                .await
+                .unwrap()
+                .title
+                .unwrap()
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = KnowledgeService::new(
+            Arc::new(MemRepo::default()),
+            &dir.path().join("data"),
+            KnowledgeEventEmitter::new(
+                Arc::new(NoopBroadcaster),
+                Arc::from(TEST_OWNER_ID),
+            ),
+        )
+        .with_url_fetcher(Canned("http"));
+
+        // No render backend wired: every flag value resolves to HTTP (graceful
+        // fallback for rendered=true — the flag is best-effort, never fails).
+        assert_eq!(which(&service, false).await, "http", "rendered=false → HTTP");
+        assert_eq!(
+            which(&service, true).await,
+            "http",
+            "rendered=true but no browser backend → graceful HTTP fallback"
+        );
+
+        // Wire a browser backend.
+        service.set_render_fetcher(Arc::new(Canned("browser")));
+        assert_eq!(which(&service, false).await, "http", "rendered=false → HTTP even with browser wired");
+        assert_eq!(which(&service, true).await, "browser", "rendered=true + browser wired → render backend");
+    }
+
+    #[test]
+    fn safe_md_path_rejects_traversal() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(safe_md_path(&root, "ok.md").is_ok());
+        assert!(safe_md_path(&root, "sub/dir/ok.md").is_ok());
+        assert!(safe_md_path(&root, "../escape.md").is_err());
+        assert!(safe_md_path(&root, "/abs.md").is_err());
+        assert!(safe_md_path(&root, "no_extension").is_err());
+        assert!(safe_md_path(&root, "script.exe").is_err());
+        assert!(safe_md_path(&root, "").is_err());
+        assert!(safe_md_path(&root, "C:\\evil.md").is_err());
+        assert!(safe_md_path(&root, "CON.md").is_err());
+        assert!(safe_md_path(&root, "nested/aux.notes.md").is_err());
+        assert!(safe_md_path(&root, "trailing-space /note.md").is_err());
+        assert!(safe_md_path(&root, "trailing-dot./note.md").is_err());
+        assert!(safe_md_path(&root, "contains:colon/note.md").is_err());
+        assert!(safe_md_path(&root, "contains*glob/note.md").is_err());
+    }
+
+    #[test]
+    fn direct_turn_writeback_append_preserves_bytes_and_is_retry_idempotent() {
+        let existing = "# Existing\r\n\r\nKeep CRLF bytes exactly.\r\n";
+        let proposal = "# New\n\nDurable lesson.";
+        let merged = merge_direct_turn_writeback(existing, proposal);
+
+        assert!(merged.starts_with(existing), "existing bytes were rewritten: {merged:?}");
+        assert!(merged.ends_with("# New\n\nDurable lesson.\n"), "{merged:?}");
+        assert_eq!(
+            merge_direct_turn_writeback(&merged, proposal),
+            merged,
+            "manual retry must not append the same proposal twice"
+        );
+    }
+
+    #[test]
+    fn direct_turn_writeback_absorbs_a_verbatim_restatement_instead_of_doubling() {
+        // The contract tells the model to send only new material, but a model
+        // that resends the document plus its addition must not end up with the
+        // document twice. Every original line is inside the proposal, so taking
+        // it wholesale is lossless.
+        let existing = "# 术语表\n\n市盈率 = PER\n";
+        let proposal = "# 术语表\n\n市盈率 = PER\nROE = 净资产收益率";
+        let merged = merge_direct_turn_writeback(existing, proposal);
+
+        assert_eq!(merged.matches("市盈率 = PER").count(), 1, "doubled: {merged:?}");
+        assert!(merged.contains("ROE = 净资产收益率"), "{merged:?}");
+        assert_eq!(merged.matches("# 术语表").count(), 1, "heading doubled: {merged:?}");
+    }
+
+    #[test]
+    fn direct_turn_writeback_appends_a_reworded_rewrite_rather_than_replacing() {
+        // A rewrite that does NOT contain the original verbatim must never win:
+        // appending is the only direction that cannot lose curated content.
+        let existing = "# 术语表\n\n市盈率 = PER\n";
+        let proposal = "# 术语表\n\n市盈率（PER）\nROE = 净资产收益率";
+        let merged = merge_direct_turn_writeback(existing, proposal);
+
+        assert!(merged.starts_with(existing), "existing bytes were rewritten: {merged:?}");
+        assert!(merged.contains("市盈率 = PER"), "the original wording must survive: {merged:?}");
+        assert!(merged.contains("ROE = 净资产收益率"), "{merged:?}");
+    }
+
+    #[test]
+    fn direct_turn_writeback_does_not_treat_plain_substrings_as_existing_blocks() {
+        let existing = "# Existing\n\nfoobar is already documented.\n";
+        let merged = merge_direct_turn_writeback(existing, "foo");
+
+        assert!(merged.starts_with(existing));
+        assert!(merged.ends_with("\nfoo\n"), "{merged:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_md_path_rejects_final_and_parent_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let physical_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let root = physical_dir.join("kb");
+        let outside = physical_dir.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("target.md"), "outside").unwrap();
+
+        symlink(outside.join("target.md"), root.join("final.md")).unwrap();
+        let final_error = safe_md_path(&root, "final.md").unwrap_err();
+        assert!(final_error.to_string().contains("symlinks"), "{final_error}");
+
+        symlink(&outside, root.join("linked-dir")).unwrap();
+        let parent_error = safe_md_path(&root, "linked-dir/new.md").unwrap_err();
+        assert!(parent_error.to_string().contains("symlinks"), "{parent_error}");
+
+        symlink(outside.join("missing.md"), root.join("dangling.md")).unwrap();
+        let dangling_error = safe_md_path(&root, "dangling.md").unwrap_err();
+        assert!(dangling_error.to_string().contains("symlinks"), "{dangling_error}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn safe_md_path_windows_reparse_attribute_is_always_fail_closed() {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        };
+
+        assert!(!windows_file_attributes_are_reparse_point(
+            FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_DIRECTORY
+        ));
+        assert!(windows_file_attributes_are_reparse_point(
+            FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT
+        ));
+    }
+
+    #[test]
+    fn first_atx_heading_is_strict_and_skips_noise() {
+        // Plain ATX heading.
+        assert_eq!(first_atx_heading("# 标题\n正文").as_deref(), Some("标题"));
+        assert_eq!(first_atx_heading("### Third level\n").as_deref(), Some("Third level"));
+        // Requires whitespace after the run: a shebang / hashtag is NOT a heading.
+        assert_eq!(first_atx_heading("#!/bin/sh\n# 真标题").as_deref(), Some("真标题"));
+        assert_eq!(first_atx_heading("#hashtag\nplain").as_deref(), None);
+        // 7+ hashes is not a heading.
+        assert_eq!(first_atx_heading("####### too deep\n").as_deref(), None);
+        // Fenced code blocks are skipped (the `# rm` inside is a comment).
+        assert_eq!(
+            first_atx_heading("```sh\n# rm -rf /\n```\n## 真标题\n").as_deref(),
+            Some("真标题")
+        );
+        // Leading YAML front-matter (incl. its `# comment`) is skipped.
+        assert_eq!(
+            first_atx_heading("---\ntitle: x\n# not a heading\n---\n# 文档标题\n").as_deref(),
+            Some("文档标题")
+        );
+        // No heading anywhere.
+        assert_eq!(first_atx_heading("just text\nmore text\n"), None);
+        // Closing-hash run trimmed via the leading-run + trim only when spaced.
+        assert_eq!(first_atx_heading("#  spaced  \n").as_deref(), Some("spaced"));
+    }
+
+    /// A document without a heading must still be listed — the TOC is the only
+    /// thing telling the model the document exists, so dropping the unheaded
+    /// ones would make them permanently unreachable.
+    #[tokio::test]
+    async fn toc_lists_every_document_with_or_without_a_heading() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("guide.md"), "# 使用指南\n正文").unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/notes.md"), "no heading here").unwrap();
+
+        let toc = build_toc(&root).await;
+        assert_eq!(toc.len(), 2, "{toc:?}");
+        assert!(toc.contains(&"guide.md — 使用指南".to_string()));
+        assert!(toc.contains(&"sub/notes.md".to_string()));
+    }
+
+    /// `build_toc` returns the FULL listing — budgeting/aggregation happens
+    /// later in `context::apply_toc_budgets` across all mounted bases, so a
+    /// per-base cap here would double-truncate.
+    #[tokio::test]
+    async fn build_toc_returns_full_listing_without_cap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        for i in 0..35 {
+            std::fs::write(root.join(format!("f{i:02}.md")), "x").unwrap();
+        }
+        let toc = build_toc(&root).await;
+        assert_eq!(toc.len(), 35, "{toc:?}");
+        assert!(!toc.iter().any(|l| l.contains("more files")), "{toc:?}");
+    }
+
+    #[tokio::test]
+    async fn build_toc_orders_index_and_shallow_first() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("aaa")).unwrap();
+        std::fs::write(root.join("aaa/early.md"), "# Early\n").unwrap();
+        std::fs::write(root.join("zzz.md"), "# Zzz\n").unwrap();
+        std::fs::write(root.join("overview.md"), "# Overview\n").unwrap();
+        let toc = build_toc(&root).await;
+        assert!(toc[0].starts_with("overview.md"), "index file first: {toc:?}");
+        let shallow = toc.iter().position(|l| l.starts_with("zzz.md")).unwrap();
+        let deep = toc.iter().position(|l| l.starts_with("aaa/early.md")).unwrap();
+        assert!(shallow < deep, "shallow zzz.md before deep aaa/early.md: {toc:?}");
+    }
+
+    /// build_toc (run at session mount) must prune machinery dirs (`.obsidian/`,
+    /// `.git/`): those files are not notes and, on a NAS vault, dominate the
+    /// mount-time walk that opens every file for its first heading.
+    #[tokio::test]
+    async fn build_toc_skips_machinery_dirs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join(".obsidian")).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join("note.md"), "# Note\n").unwrap();
+        std::fs::write(root.join(".obsidian/workspace.md"), "# machinery\n").unwrap();
+        std::fs::write(root.join(".git/COMMIT_EDITMSG.md"), "# machinery\n").unwrap();
+
+        let toc = build_toc(&root).await;
+        assert_eq!(toc.len(), 1, "only the real note belongs in the toc: {toc:?}");
+        assert!(toc[0].starts_with("note.md"), "{toc:?}");
+    }
+
+    /// search_bases must not index files under machinery dirs (`.obsidian/`,
+    /// `.git/`) — vault plumbing is never a knowledge document.
+    #[tokio::test]
+    async fn search_bases_skips_machinery_dirs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join(".obsidian")).unwrap();
+        std::fs::write(vault.join("real.md"), "# Real\n关于部署的说明").unwrap();
+        std::fs::write(vault.join(".obsidian/plugin.md"), "# 机器\n关于部署的说明").unwrap();
+        let kb = service
+            .create_base("v", "", Some(vault.to_str().unwrap()), None)
+            .await
+            .unwrap();
+
+        let hits = service.search_bases(&[kb.knowledge_base_id.clone()], "部署", 10).await.unwrap();
+        let rels: Vec<&str> = hits.iter().map(|h| h.rel_path.as_str()).collect();
+        assert_eq!(rels, vec!["real.md"], "machinery-dir files must not be searchable: {rels:?}");
+    }
+
+    #[test]
+    fn toc_rank_prioritizes_index_then_depth() {
+        assert!(toc_rank("README.md") < toc_rank("alpha.md"));
+        assert!(toc_rank("overview.md") < toc_rank("aaa/early.md"));
+        assert!(toc_rank("shallow.md") < toc_rank("a/deep.md"));
+        assert!(toc_rank("docs/readme.md") < toc_rank("docs/other.md"));
+    }
+
+    #[test]
+    fn readme_summary_takes_first_paragraph_and_truncates() {
+        // Headings (and blank lines) before the first paragraph are skipped;
+        // the paragraph's lines are joined; a following heading/paragraph is
+        // not included.
+        let text = "# 领域知识\n\nCovers deployment flows\nand on-call runbooks.\n\n## Layout\nmore text";
+        assert_eq!(
+            extract_readme_summary(text).as_deref(),
+            Some("Covers deployment flows and on-call runbooks.")
+        );
+
+        // Heading directly after the paragraph also terminates it.
+        let text = "Intro paragraph.\n# Heading\nbody";
+        assert_eq!(extract_readme_summary(text).as_deref(), Some("Intro paragraph."));
+
+        // No paragraph at all → None.
+        assert_eq!(extract_readme_summary("# Only a title\n\n## And a section\n"), None);
+        assert_eq!(extract_readme_summary(""), None);
+
+        // Truncated to SUMMARY_MAX_CHARS on a char boundary, with an explicit
+        // truncation marker appended.
+        let long = "知".repeat(500);
+        let summary = extract_readme_summary(&long).unwrap();
+        assert_eq!(summary.chars().count(), SUMMARY_MAX_CHARS + 1, "400 chars + ellipsis");
+        assert!(summary.ends_with('…'), "truncation must be marked: …{}", &summary[summary.len() - 9..]);
+
+        // Exactly at the cap → kept whole, no marker.
+        let exact = "k".repeat(SUMMARY_MAX_CHARS);
+        assert_eq!(extract_readme_summary(&exact).as_deref(), Some(exact.as_str()));
+    }
+
+    /// Badge rows (`[![…`) and raw HTML lines (`<…`) are README boilerplate,
+    /// not prose — they must not become the summary; the first REAL paragraph
+    /// after them wins.
+    #[test]
+    fn readme_summary_skips_badge_and_html_noise() {
+        let text = "# Repo\n\n\
+                    [![CI](https://img.shields.io/badge/ci-pass-green)](https://ci.example.com)\n\
+                    <p align=\"center\"><img src=\"logo.png\" /></p>\n\
+                    \n\
+                    The real first paragraph.\n\n## Next\n";
+        assert_eq!(extract_readme_summary(text).as_deref(), Some("The real first paragraph."));
+
+        // Noise directly glued to the paragraph (no blank line in between)
+        // still yields the prose only.
+        let glued = "[![badge](x)](y)\n<div>\n实际描述在这里。\n";
+        assert_eq!(extract_readme_summary(glued).as_deref(), Some("实际描述在这里。"));
+
+        // A README of nothing but badges/HTML has no summary.
+        assert_eq!(extract_readme_summary("[![CI](x)](y)\n<hr/>\n"), None);
+    }
+
+    #[tokio::test]
+    async fn base_summary_read_from_readme_first_paragraph() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // macOS exposes TempDir through `/var -> /private/var`. Production
+        // registrations persist the physical path, so the fixture must model
+        // the same invariant rather than feeding a lexical symlink root.
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        // No README yet (autogen lands later) → None.
+        assert_eq!(read_base_summary(&root).await, None);
+
+        std::fs::write(root.join("README.md"), "# 库\n\n这套库覆盖部署与运维流程。\n\n## 结构\n…").unwrap();
+        assert_eq!(
+            read_base_summary(&root).await.as_deref(),
+            Some("这套库覆盖部署与运维流程。")
+        );
+    }
+
+    /// README detection is case-insensitive: on case-sensitive filesystems a
+    /// `readme.md` (or any other casing) must be found and read.
+    #[tokio::test]
+    async fn base_summary_reads_lowercase_readme_variant() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("readme.md"), "# 库\n\n小写文件名也必须能读到。\n").unwrap();
+        assert_eq!(
+            read_base_summary(&root).await.as_deref(),
+            Some("小写文件名也必须能读到。")
+        );
+
+        let dir2 = tempfile::TempDir::new().unwrap();
+        let root2 = std::fs::canonicalize(dir2.path()).unwrap();
+        std::fs::write(root2.join("ReadMe.MD"), "混合大小写同样命中。\n").unwrap();
+        assert_eq!(
+            read_base_summary(&root2).await.as_deref(),
+            Some("混合大小写同样命中。")
+        );
+    }
+
+    #[tokio::test]
+    async fn readme_case_fallback_is_deterministic_when_variants_coexist() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("readme.md"), "lower").unwrap();
+        std::fs::write(root.join("ReadMe.MD"), "mixed").unwrap();
+
+        let mut variants = std::fs::read_dir(root)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_str()?.to_owned();
+                name.eq_ignore_ascii_case("README.md")
+                    .then_some((name, entry.path()))
+            })
+            .collect::<Vec<_>>();
+        variants.sort_by(|a, b| a.0.cmp(&b.0));
+        let expected = variants.first().unwrap().1.clone();
+
+        // Case-insensitive Windows/default-macOS volumes expose one entry;
+        // case-sensitive Linux/macOS volumes expose both. The selection rule
+        // is identical and independent of read_dir enumeration order.
+        for _ in 0..4 {
+            assert_eq!(find_readme_path(root).await.as_deref(), Some(expected.as_path()));
+        }
+    }
+
+    /// Autogen's "README already exists" check must also be case-insensitive:
+    /// an existing `readme.md` blocks the non-overwrite path, and the
+    /// overwrite path rewrites THAT file instead of creating a parallel
+    /// `README.md` next to it.
+    #[tokio::test]
+    async fn autogen_readme_detection_is_case_insensitive() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let kb = service.create_base("库", "", None, None).await.unwrap();
+        service.write_file(&kb.knowledge_base_id, "a.md", "# A").await.unwrap();
+        let root = PathBuf::from(&kb.root_path);
+        std::fs::write(root.join("readme.md"), "# 手写 readme\n保留我").unwrap();
+        service.set_completer(FakeCompleter::new(OVERVIEW_JSON, ""));
+
+        let readmes = |root: &Path| -> Vec<PathBuf> {
+            std::fs::read_dir(root)
+                .unwrap()
+                .flatten()
+                .filter(|e| {
+                    e.file_name().to_str().is_some_and(|n| n.eq_ignore_ascii_case("README.md"))
+                })
+                .map(|e| e.path())
+                .collect()
+        };
+
+        // overwrite=false: the lowercase README counts as existing → untouched.
+        let outcome = service.generate_overview(&kb.knowledge_base_id, false, None).await.unwrap();
+        assert!(!outcome.readme_written, "existing readme.md must block the non-overwrite write");
+        let found = readmes(&root);
+        assert_eq!(found.len(), 1, "no parallel README.md may appear: {found:?}");
+        assert_eq!(std::fs::read_to_string(&found[0]).unwrap(), "# 手写 readme\n保留我");
+
+        // overwrite=true: rewrites in place — still exactly one readme file.
+        let outcome = service.generate_overview(&kb.knowledge_base_id, true, None).await.unwrap();
+        assert!(outcome.readme_written);
+        let found = readmes(&root);
+        assert_eq!(found.len(), 1, "overwrite must hit the existing file: {found:?}");
+        assert!(std::fs::read_to_string(&found[0]).unwrap().starts_with("# 接口库"));
+    }
+
+    #[test]
+    fn portable_writeback_mount_link_names_sanitize_and_dedupe() {
+        let mut used = HashSet::new();
+        let knowledge_base_id_a = KnowledgeBaseId::new();
+        let row_a = KnowledgeBaseRow {
+            id: 1,
+            knowledge_base_id: knowledge_base_id_a.into_string(),
+            name: "领域/知识:v1".into(),
+            description: String::new(),
+            root_path: String::new(),
+            managed: true,
+            tree_access: "editable".into(),
+            extra: "{}".into(),
+            created_at: 0,
+            updated_at: 0,
+            tags: None,
+        };
+        let name_a = unique_link_name(&row_a, &mut used);
+        assert_eq!(name_a, "领域_知识_v1");
+
+        let row_b = KnowledgeBaseRow {
+            id: 2,
+            knowledge_base_id: KnowledgeBaseId::new().into_string(),
+            ..row_a.clone()
+        };
+        let name_b = unique_link_name(&row_b, &mut used);
+        assert_ne!(name_a, name_b);
+        assert!(name_b.starts_with("领域_知识_v1-"));
+
+        let row_c = KnowledgeBaseRow {
+            id: 3,
+            knowledge_base_id: KnowledgeBaseId::new().into_string(),
+            name: "领域_知识_V1".into(),
+            ..row_a.clone()
+        };
+        let name_c = unique_link_name(&row_c, &mut used);
+        assert_ne!(
+            portable_path_component_identity(&name_a),
+            portable_path_component_identity(&name_c)
+        );
+    }
+
+    /// A base named like a platform-managed companion file (`README.md`,
+    /// `.gitignore` — any casing on Windows) must not mount under that name:
+    /// the sweep exempts those names, so the link would collide with the
+    /// managed file.
+    #[test]
+    fn portable_writeback_mount_link_names_are_valid_on_every_platform() {
+        let long_name = "界".repeat(100);
+        for name in [
+            "README.md",
+            "readme.MD",
+            ".gitignore",
+            "CON",
+            "AUX.md",
+            "COM¹",
+            long_name.as_str(),
+        ] {
+            let mut used = HashSet::new();
+            let row = KnowledgeBaseRow {
+                id: 1,
+                knowledge_base_id: KnowledgeBaseId::new().into_string(),
+                name: name.into(),
+                description: String::new(),
+                root_path: String::new(),
+                managed: true,
+                tree_access: "editable".into(),
+                extra: "{}".into(),
+                created_at: 0,
+                updated_at: 0,
+                tags: None,
+            };
+            let link = unique_link_name(&row, &mut used);
+            assert!(
+                !mount::MANAGED_KEEP.iter().any(|kept| {
+                    portable_path_component_identity(kept)
+                        == portable_path_component_identity(&link)
+                }),
+                "{name} → {link}"
+            );
+            assert!(
+                validate_portable_path_component(&link).is_ok(),
+                "{name} → {link}"
+            );
+            assert!(link.ends_with(&row.knowledge_base_id));
+        }
+    }
+
+    // ── AI autogen ───────────────────────────────────────────────────
+
+    use crate::testutil::{MemRepo, NoopBroadcaster, make_service};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// `set_binding` must invoke the late-wired in-process hook AFTER
+    /// persistence (the observer re-reads the row), with the canonical key.
+    #[tokio::test]
+    async fn set_binding_fires_in_process_hook_with_canonical_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = Arc::new(make_service(&dir.path().join("data")));
+        let seen: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(Vec::new()));
+        let sink = seen.clone();
+        service.set_binding_changed_hook(Arc::new(move |kind, key| {
+            sink.lock().unwrap().push((kind.to_owned(), key.to_owned()));
+        }));
+        // Trailing slash must land on the canonical (stripped) key.
+        service
+            .set_binding("workpath", "/Users/a/proj/", KnowledgeBinding {
+                enabled: true,
+                writeback: true,
+                ..KnowledgeBinding::default()
+            })
+            .await
+            .unwrap();
+        let events = seen.lock().unwrap().clone();
+        assert_eq!(events, vec![("workpath".to_owned(), "/Users/a/proj".to_owned())]);
+        // The hook observed a persisted row.
+        let binding = service.get_binding("workpath", "/Users/a/proj").await.unwrap();
+        assert!(binding.enabled && binding.writeback);
+    }
+
+    /// The live cwd resolvers must map a cwd under a registered extra managed
+    /// root (the terminal work_dir) to the same `__default__` row the terminal
+    /// service binds against — the historic work_dir/data_dir divergence.
+    #[tokio::test]
+    async fn terminal_scope_resolution_honors_extra_managed_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = Arc::new(make_service(&dir.path().join("data")));
+        let kb = service.create_base("库", "", None, None).await.unwrap().knowledge_base_id;
+        let work_dir = dir.path().join("terminal-work");
+        service.add_managed_root(&work_dir);
+        service
+            .set_binding(
+                crate::workpath::WORKPATH_BINDING_KIND,
+                crate::workpath::DEFAULT_WORKPATH_KEY,
+                KnowledgeBinding {
+                    enabled: true,
+                    kb_ids: vec![kb.clone()],
+                    ..KnowledgeBinding::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let cwd = work_dir.join("session-1");
+        let (ids, binding, key) =
+            service.resolve_terminal_scope_for_cwd(&cwd.to_string_lossy()).await;
+        assert_eq!(key, crate::workpath::DEFAULT_WORKPATH_KEY);
+        assert_eq!(ids, vec![kb.clone()]);
+        assert!(binding.enabled);
+
+        // Custom cwd outside every managed root → literal key; nothing bound
+        // there yet → honest empty scope (no all-bases convenience).
+        let (ids, _, key) = service.resolve_terminal_scope_for_cwd("/Users/x/custom").await;
+        assert_eq!(key, "/Users/x/custom");
+        assert!(ids.is_empty(), "unbound terminal workspace must resolve empty, got {ids:?}");
+    }
+
+    /// With a terminal work root registered, TERMINAL live resolution must key
+    /// by that root alone: a custom terminal cwd that happens to live under
+    /// `data_dir` (work_dir ≠ data_dir) binds/mounts under its LITERAL key on
+    /// the terminal side, so live dispatch must read the same row — not the
+    /// `__default__` row the conversation-side data_dir mapping would pick.
+    #[tokio::test]
+    async fn terminal_scope_keys_by_registered_work_root_not_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let service = Arc::new(make_service(&data_dir));
+        let kb = service.create_base("库", "", None, None).await.unwrap().knowledge_base_id;
+        service.add_managed_root(&dir.path().join("terminal-work"));
+
+        // The terminal side derives session_workpath_key(cwd, work_dir) →
+        // literal key for this cwd, and persists the binding there.
+        let cwd = data_dir.join("user-picked-dir");
+        let literal_key = crate::workpath::workpath_key(&cwd.to_string_lossy());
+        service
+            .set_binding(
+                crate::workpath::WORKPATH_BINDING_KIND,
+                &literal_key,
+                KnowledgeBinding {
+                    enabled: true,
+                    kb_ids: vec![kb.clone()],
+                    ..KnowledgeBinding::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let (ids, _, key) =
+            service.resolve_terminal_scope_for_cwd(&cwd.to_string_lossy()).await;
+        assert_eq!(key, literal_key, "terminal resolution must not fall back to data_dir mapping");
+        assert_eq!(ids, vec![kb]);
+    }
+
+    /// `delete_binding` is a binding change like any other: the in-process
+    /// hook must fire so live terminal workspaces drop stale mounts + README
+    /// immediately instead of keeping them until the next relaunch.
+    #[tokio::test]
+    async fn delete_binding_fires_in_process_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = Arc::new(make_service(&dir.path().join("data")));
+        service
+            .set_binding("workpath", "/Users/a/proj", KnowledgeBinding {
+                enabled: true,
+                ..KnowledgeBinding::default()
+            })
+            .await
+            .unwrap();
+        let seen: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(Vec::new()));
+        let sink = seen.clone();
+        service.set_binding_changed_hook(Arc::new(move |kind, key| {
+            sink.lock().unwrap().push((kind.to_owned(), key.to_owned()));
+        }));
+        service.delete_binding("workpath", "/Users/a/proj/").await.unwrap();
+        let events = seen.lock().unwrap().clone();
+        assert_eq!(events, vec![("workpath".to_owned(), "/Users/a/proj".to_owned())]);
+        // Observer read-back sees the default (disabled) row.
+        let binding = service.get_binding("workpath", "/Users/a/proj").await.unwrap();
+        assert!(!binding.enabled);
+    }
+
+    /// Branches on the system prompt: overview calls get strict JSON,
+    /// snapshot-compression calls get plain markdown.
+    struct FakeCompleter {
+        overview_reply: String,
+        compress_reply: String,
+        calls: AtomicUsize,
+    }
+
+    impl FakeCompleter {
+        fn new(overview_reply: &str, compress_reply: &str) -> Arc<Self> {
+            Arc::new(Self {
+                overview_reply: overview_reply.to_owned(),
+                compress_reply: compress_reply.to_owned(),
+                calls: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    struct PausedOverviewCompleter {
+        entered: Arc<tokio::sync::Barrier>,
+        release: Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait::async_trait]
+    impl KnowledgeCompleter for PausedOverviewCompleter {
+        async fn complete(
+            &self,
+            _system: &str,
+            _user: &str,
+        ) -> Result<String, AppError> {
+            self.entered.wait().await;
+            self.release.wait().await;
+            Ok(OVERVIEW_JSON.into())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl KnowledgeCompleter for FakeCompleter {
+        async fn complete(&self, system: &str, _user: &str) -> Result<String, AppError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if system == autogen::OVERVIEW_SYSTEM {
+                Ok(self.overview_reply.clone())
+            } else {
+                Ok(self.compress_reply.clone())
+            }
+        }
+    }
+
+    const OVERVIEW_JSON: &str =
+        r##"{"description":"AI 生成的描述","readme_markdown":"# 接口库\n\n这套库覆盖外部接口文档。"}"##;
+
+    #[tokio::test]
+    async fn generate_overview_writes_description_and_readme() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let kb = service.create_base("接口库", "", None, None).await.unwrap();
+        service.write_file(&kb.knowledge_base_id, "api.md", "# API\n说明").await.unwrap();
+        service.set_completer(FakeCompleter::new(OVERVIEW_JSON, ""));
+
+        let outcome = service.generate_overview(&kb.knowledge_base_id, false, None).await.unwrap();
+        assert!(outcome.readme_written);
+        assert!(outcome.description_updated);
+        assert_eq!(outcome.description, "AI 生成的描述");
+        assert_eq!(outcome.base.description, "AI 生成的描述");
+        let readme = std::fs::read_to_string(PathBuf::from(&kb.root_path).join("README.md")).unwrap();
+        assert!(readme.starts_with("# 接口库"), "got: {readme}");
+
+        // Long descriptions are clamped to DESCRIPTION_MAX_CHARS.
+        let long = format!(r##"{{"description":"{}","readme_markdown":"# X"}}"##, "知".repeat(300));
+        service.set_completer(FakeCompleter::new(&long, ""));
+        let outcome = service.generate_overview(&kb.knowledge_base_id, true, None).await.unwrap();
+        assert_eq!(outcome.description.chars().count(), autogen::DESCRIPTION_MAX_CHARS);
+    }
+
+    /// Regression (NAS load-failure root cause): a base rooted on a real
+    /// Obsidian-style vault carries a `.obsidian/` (plugins/cache) tree and
+    /// often a `.git/` tree whose `.md` files are machinery, not knowledge
+    /// documents. row_to_info's file_count/total_size walk and list_files must
+    /// PRUNE dot-directories before stat'ing — otherwise a large `.obsidian/`
+    /// inflates the per-base directory walk (which, on a slow NAS mount, blows
+    /// past the client request timeout and surfaces as "加载失败") and pollutes
+    /// the counts/listing with non-notes.
+    #[tokio::test]
+    async fn dotdir_files_are_pruned_from_counts_and_listing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join("sub")).unwrap();
+        std::fs::create_dir_all(vault.join(".obsidian/plugins")).unwrap();
+        std::fs::create_dir_all(vault.join(".git")).unwrap();
+        std::fs::write(vault.join("note.md"), "# Note").unwrap();
+        std::fs::write(vault.join("sub/real.md"), "# Real").unwrap();
+        std::fs::write(vault.join(".obsidian/plugins/data.md"), "x").unwrap();
+        std::fs::write(vault.join(".git/COMMIT.md"), "x").unwrap();
+
+        let info = service
+            .create_base("vault", "", Some(vault.to_str().unwrap()), None)
+            .await
+            .unwrap();
+
+        // Only the two real notes are knowledge documents; the .obsidian/.git
+        // markdown must never be counted or walked.
+        assert_eq!(info.file_count, 2, "dot-dir markdown must not inflate file_count");
+
+        let files = service.list_files(&info.knowledge_base_id).await.unwrap();
+        let rels: Vec<&str> = files.iter().map(|f| f.rel_path.as_str()).collect();
+        assert_eq!(
+            rels,
+            vec!["note.md", "sub/real.md"],
+            "dot-dir files must not appear in the document listing"
+        );
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_walkers_hide_portable_machinery_aliases_and_links() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let vault = dir.path().join("vault");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(vault.join("Node_Modules/pkg")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(vault.join("visible.md"), "# Visible\npublic")
+            .unwrap();
+        std::fs::write(
+            vault.join("Node_Modules/pkg/hidden.md"),
+            "# Hidden\nmachinery-secret",
+        )
+        .unwrap();
+        std::fs::write(
+            outside.join("secret.md"),
+            "# Outside\njunction-secret",
+        )
+        .unwrap();
+        let linked = vault.join("linked");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &linked).unwrap();
+        #[cfg(windows)]
+        junction::create(&outside, &linked).unwrap();
+
+        let kb = service
+            .create_base(
+                "portable walk",
+                "",
+                Some(vault.to_str().unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let listed = service
+            .list_files(kb.knowledge_base_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|entry| entry.rel_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["visible.md"]
+        );
+        for query in ["machinery-secret", "junction-secret"] {
+            assert!(
+                service
+                    .search_bases(
+                        std::slice::from_ref(&kb.knowledge_base_id),
+                        query,
+                        10,
+                    )
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{query} leaked through search"
+            );
+        }
+        let toc = build_toc(Path::new(&kb.root_path)).await;
+        assert_eq!(toc, vec!["visible.md — Visible"]);
+        #[cfg(windows)]
+        junction::delete(&linked).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn portable_writeback_walkers_skip_non_unicode_markdown_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let invalid_name =
+            std::ffi::OsString::from_vec(vec![0xff, b'.', b'm', b'd']);
+        if let Err(error) = std::fs::write(
+            vault.join(invalid_name),
+            "# Invalid\nnon-unicode-secret",
+        ) {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                // Some macOS sandbox profiles reject non-Unicode path bytes
+                // before the filesystem sees them. Linux/unsandboxed Unix CI
+                // still exercises the actual walker contract.
+                return;
+            }
+            panic!("failed to create non-Unicode test path: {error}");
+        }
+        let kb = service
+            .create_base(
+                "invalid path",
+                "",
+                Some(vault.to_str().unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            service
+                .list_files(kb.knowledge_base_id.as_str())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            service
+                .search_bases(
+                    std::slice::from_ref(&kb.knowledge_base_id),
+                    "non-unicode-secret",
+                    10,
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(build_toc(Path::new(&kb.root_path)).await.is_empty());
+        assert!(!vault.join("�.md").exists());
+    }
+
+    #[tokio::test]
+    async fn tree_listing_shows_real_dirs_and_markdown_files_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join("raw")).unwrap();
+        std::fs::create_dir_all(vault.join("empty")).unwrap();
+        std::fs::create_dir_all(vault.join("assets")).unwrap();
+        std::fs::create_dir_all(vault.join(".obsidian")).unwrap();
+        std::fs::create_dir_all(vault.join("node_modules/pkg")).unwrap();
+        std::fs::write(vault.join("README.md"), "# Root").unwrap();
+        std::fs::write(vault.join("raw/python3-type-conversion.md"), "# Types").unwrap();
+        std::fs::write(vault.join("assets/logo.png"), "png").unwrap();
+        std::fs::write(vault.join(".obsidian/workspace.md"), "# Tooling").unwrap();
+        std::fs::write(vault.join("node_modules/pkg/readme.md"), "# Package").unwrap();
+
+        let info = service
+            .create_base("vault", "", Some(vault.to_str().unwrap()), None)
+            .await
+            .unwrap();
+
+        let root = service.list_tree(&info.knowledge_base_id, "").await.unwrap();
+        let root_names: Vec<(&str, bool, bool)> = root
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.is_dir, entry.is_file))
+            .collect();
+        assert_eq!(
+            root_names,
+            vec![
+                ("assets", true, false),
+                ("empty", true, false),
+                ("raw", true, false),
+                ("README.md", false, true),
+            ]
+        );
+
+        let raw = service.list_tree(&info.knowledge_base_id, "raw").await.unwrap();
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].rel_path, "raw/python3-type-conversion.md");
+        assert!(raw[0].is_file);
+
+        let empty = service.list_tree(&info.knowledge_base_id, "empty").await.unwrap();
+        assert!(
+            empty.is_empty(),
+            "empty folders should be expandable but list no children"
+        );
+        assert!(service.list_tree(&info.knowledge_base_id, "../escape").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn create_folder_creates_real_empty_folder_visible_in_tree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        std::fs::write(vault.join("README.md"), "# Root").unwrap();
+
+        let info = service
+            .create_base("vault", "", Some(vault.to_str().unwrap()), None)
+            .await
+            .unwrap();
+
+        service.create_folder(&info.knowledge_base_id, "raw/tutorials").await.unwrap();
+        assert!(vault.join("raw/tutorials").is_dir());
+
+        let raw = service.list_tree(&info.knowledge_base_id, "raw").await.unwrap();
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].rel_path, "raw/tutorials");
+        assert!(raw[0].is_dir);
+
+        assert!(service.create_folder(&info.knowledge_base_id, "").await.is_err());
+        assert!(service.create_folder(&info.knowledge_base_id, "../escape").await.is_err());
+        assert!(service.create_folder(&info.knowledge_base_id, "node_modules/pkg").await.is_err());
+        assert!(service.create_folder(&info.knowledge_base_id, "README.md/child").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_folder_removes_visible_markdown_tree_and_rejects_unsafe_targets() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join("docs/nested")).unwrap();
+        std::fs::write(vault.join("docs/README.md"), "# Docs").unwrap();
+        std::fs::write(vault.join("docs/nested/topic.md"), "# Topic").unwrap();
+        std::fs::write(vault.join("root.md"), "# Root").unwrap();
+
+        let info = service
+            .create_base("vault", "", Some(vault.to_str().unwrap()), None)
+            .await
+            .unwrap();
+
+        service.delete_folder(&info.knowledge_base_id, "docs").await.unwrap();
+        assert!(!vault.join("docs").exists());
+        assert!(vault.join("root.md").exists());
+
+        assert!(service.delete_folder(&info.knowledge_base_id, "").await.is_err());
+        assert!(service.delete_folder(&info.knowledge_base_id, "../escape").await.is_err());
+        assert!(service.delete_folder(&info.knowledge_base_id, "root.md").await.is_err());
+        assert!(service.delete_folder(&info.knowledge_base_id, "node_modules").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rename_tree_entry_renames_files_and_folders_within_the_same_parent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join("docs/nested")).unwrap();
+        std::fs::write(vault.join("docs/old.md"), "# Old").unwrap();
+        std::fs::write(vault.join("docs/nested/topic.md"), "# Topic").unwrap();
+        std::fs::write(vault.join("taken.md"), "# Taken").unwrap();
+        std::fs::write(vault.join("existing.md"), "# Existing").unwrap();
+
+        let info = service
+            .create_base("vault", "", Some(vault.to_str().unwrap()), None)
+            .await
+            .unwrap();
+
+        let file = service
+            .rename_tree_entry(&info.knowledge_base_id, "docs/old.md", "new.md")
+            .await
+            .unwrap();
+        assert_eq!(file.rel_path, "docs/new.md");
+        assert!(file.is_file);
+        assert!(vault.join("docs/new.md").is_file());
+        assert!(!vault.join("docs/old.md").exists());
+
+        let folder = service
+            .rename_tree_entry(&info.knowledge_base_id, "docs/nested", "renamed")
+            .await
+            .unwrap();
+        assert_eq!(folder.rel_path, "docs/renamed");
+        assert!(folder.is_dir);
+        assert!(vault.join("docs/renamed/topic.md").is_file());
+
+        assert!(service.rename_tree_entry(&info.knowledge_base_id, "", "root").await.is_err());
+        assert!(service.rename_tree_entry(&info.knowledge_base_id, "docs/new.md", "bad.txt").await.is_err());
+        assert!(service.rename_tree_entry(&info.knowledge_base_id, "docs/new.md", "../escape.md").await.is_err());
+        assert!(service.rename_tree_entry(&info.knowledge_base_id, "docs/new.md", "renamed").await.is_err());
+        assert!(service.rename_tree_entry(&info.knowledge_base_id, "taken.md", "existing.md").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn relocate_tree_entry_moves_a_complete_directory_and_replays_idempotently() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = Arc::new(MemRepo::default());
+        let events = Arc::new(RecordingBroadcaster::default());
+        let service = KnowledgeService::new(
+            repo,
+            &dir.path().join("data"),
+            KnowledgeEventEmitter::new(events.clone(), Arc::from(TEST_OWNER_ID)),
+        );
+
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join("source/nested")).unwrap();
+        std::fs::create_dir_all(vault.join("archive")).unwrap();
+        std::fs::write(vault.join("source/readme.md"), "# Readme").unwrap();
+        std::fs::write(vault.join("source/nested/topic.md"), "# Topic needle").unwrap();
+        std::fs::write(vault.join("source/asset.bin"), [1, 2, 3]).unwrap();
+
+        let info = service
+            .create_base("vault", "", Some(vault.to_str().unwrap()), None)
+            .await
+            .unwrap();
+        let original_updated_at = info.updated_at;
+        service
+            .search_bases(
+                std::slice::from_ref(&info.knowledge_base_id),
+                "needle",
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(service.search_cache_len() >= 1);
+
+        let request = RelocateTreeEntryRequest {
+            source_path: "source".into(),
+            destination_parent_path: "archive".into(),
+            new_name: Some("moved".into()),
+            request_id: "relocate-directory-once".into(),
+            conflict_policy: RelocateConflictPolicy::Reject,
+            entry_id: None,
+            destination_parent_id: None,
+            expected_revision: None,
+        };
+        let first = service
+            .relocate_tree_entry(&info.knowledge_base_id, request.clone())
+            .await
+            .unwrap();
+        assert_eq!(first.old_path, "source");
+        assert_eq!(first.new_path, "archive/moved");
+        assert_eq!(first.kind, KnowledgeEntryKind::Directory);
+        assert_eq!(first.moved_descendant_count, 4);
+        assert!(first.undo_token.is_none());
+        assert!(first.warnings.is_none());
+        assert!(first.tree_revision > u64::try_from(original_updated_at).unwrap());
+        assert!(!vault.join("source").exists());
+        assert!(vault.join("archive/moved/readme.md").is_file());
+        assert!(vault.join("archive/moved/nested/topic.md").is_file());
+        assert!(vault.join("archive/moved/asset.bin").is_file());
+        assert_eq!(service.search_cache_len(), 0);
+        let refreshed = service
+            .get_base_info(&info.knowledge_base_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            u64::try_from(refreshed.updated_at).unwrap(),
+            first.tree_revision
+        );
+
+        let replay = service
+            .relocate_tree_entry(&info.knowledge_base_id, request)
+            .await
+            .unwrap();
+        assert_eq!(replay.operation_id, first.operation_id);
+        assert_eq!(replay.tree_revision, first.tree_revision);
+        assert!(vault.join("archive/moved").is_dir());
+        let names = events.names.lock().unwrap();
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.as_str() == "knowledge.tree-changed")
+                .count(),
+            1
+        );
+        drop(names);
+
+        let mismatched_replay = service
+            .relocate_tree_entry(
+                &info.knowledge_base_id,
+                RelocateTreeEntryRequest {
+                    source_path: "archive/moved".into(),
+                    destination_parent_path: "".into(),
+                    new_name: None,
+                    request_id: "relocate-directory-once".into(),
+                    conflict_policy: RelocateConflictPolicy::Reject,
+                    entry_id: None,
+                    destination_parent_id: None,
+                    expected_revision: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(mismatched_replay, AppError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn sqlite_journal_recovers_post_rename_crash_replays_receipt_and_drains_outbox() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database_path = dir.path().join("knowledge-tree.db");
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join("docs")).unwrap();
+        std::fs::create_dir_all(vault.join("archive")).unwrap();
+        std::fs::write(vault.join("docs/note.md"), "# Durable").unwrap();
+
+        let database = nomifun_db::init_database(&database_path).await.unwrap();
+        let (service, knowledge_repository, operation_repository) =
+            durable_sqlite_service(
+                &database,
+                &dir.path().join("data"),
+                Arc::new(NoopBroadcaster),
+            );
+        let info = service
+            .create_base("durable", "", Some(vault.to_str().unwrap()), None)
+            .await
+            .unwrap();
+        let original_entry_id = service
+            .list_tree(info.knowledge_base_id.as_str(), "docs")
+            .await
+            .unwrap()[0]
+            .entry_id
+            .clone()
+            .unwrap();
+        let request = RelocateTreeEntryRequest {
+            request_id: "sqlite-crash-after-rename".into(),
+            source_path: "docs/note.md".into(),
+            destination_parent_path: "archive".into(),
+            new_name: None,
+            conflict_policy: RelocateConflictPolicy::Reject,
+            entry_id: None,
+            destination_parent_id: None,
+            expected_revision: None,
+        };
+        let prepared = operation_repository
+            .prepare_operation(&PrepareKnowledgeTreeOperationParams {
+                knowledge_base_id: info.knowledge_base_id.clone(),
+                request_id: request.request_id.clone(),
+                fingerprint: test_relocation_fingerprint(&request),
+                source_rel_path: "docs/note.md".into(),
+                destination_rel_path: "archive/note.md".into(),
+                source_fs_identity: filesystem_entry_identity(
+                    &vault.join("docs/note.md"),
+                    &std::fs::metadata(vault.join("docs/note.md")).unwrap(),
+                ),
+                created_at: now_ms(),
+            })
+            .await
+            .unwrap();
+        std::fs::rename(
+            vault.join("docs/note.md"),
+            vault.join("archive/note.md"),
+        )
+        .unwrap();
+        assert_eq!(prepared.operation.state, KnowledgeTreeOperationState::Prepared);
+        drop(service);
+        drop(knowledge_repository);
+        drop(operation_repository);
+        database.close().await;
+        drop(database);
+
+        let reopened = nomifun_db::init_database(&database_path).await.unwrap();
+        let recovery_events = Arc::new(RecordingBroadcaster::default());
+        let (recovered_service, recovered_knowledge, recovered_operations) =
+            durable_sqlite_service(
+                &reopened,
+                &dir.path().join("data"),
+                recovery_events.clone(),
+            );
+        assert_eq!(
+            recovered_service
+                .recover_pending_tree_operations()
+                .await
+                .unwrap(),
+            1
+        );
+        let recovered = recovered_operations
+            .load_by_request(&info.knowledge_base_id, &request.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.state, KnowledgeTreeOperationState::Committed);
+        assert_eq!(recovered.event_status, KnowledgeTreeEventStatus::Pending);
+        assert_eq!(
+            recovered_service.drain_pending_tree_events().await.unwrap(),
+            1
+        );
+        let committed = recovered_operations
+            .load_by_operation(&recovered.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.event_status, KnowledgeTreeEventStatus::Published);
+        let receipt = KnowledgeService::durable_relocation_receipt(&committed).unwrap();
+        assert_eq!(receipt.old_path, "docs/note.md");
+        assert_eq!(receipt.new_path, "archive/note.md");
+        assert_eq!(receipt.entry_id.as_ref(), Some(&original_entry_id));
+        let recovered_info = recovered_service
+            .get_base_info(info.knowledge_base_id.as_str())
+            .await
+            .unwrap();
+        assert!(
+            recovered_info.updated_at >= recovered_info.created_at,
+            "a logical tree revision must never replace the public epoch timestamp"
+        );
+
+        let replay = recovered_service
+            .relocate_tree_entry(info.knowledge_base_id.as_str(), request.clone())
+            .await
+            .unwrap();
+        assert_eq!(replay, receipt);
+        assert_eq!(
+            recovery_events
+                .names
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|name| name.as_str() == "knowledge.tree-changed")
+                .count(),
+            1,
+            "a published durable replay must not rebroadcast"
+        );
+
+        let undo_request = UndoKnowledgeEntryRelocationRequest {
+            request_id: "sqlite-undo-relocation".into(),
+            undo_token: receipt.undo_token.clone().unwrap(),
+        };
+        let undone = recovered_service
+            .undo_tree_relocation(info.knowledge_base_id.as_str(), undo_request.clone())
+            .await
+            .unwrap();
+        assert_eq!(undone.old_path, "archive/note.md");
+        assert_eq!(undone.new_path, "docs/note.md");
+        assert!(vault.join("docs/note.md").is_file());
+        assert!(!vault.join("archive/note.md").exists());
+        let undo_replay = recovered_service
+            .undo_tree_relocation(info.knowledge_base_id.as_str(), undo_request)
+            .await
+            .unwrap();
+        assert_eq!(undo_replay.operation_id, undone.operation_id);
+
+        // Commit another receipt/outbox directly and stop before publication,
+        // simulating the commit-before-emit crash window without mutating the
+        // repository's persisted state behind its contract.
+        let outbox_prepared = recovered_operations
+            .prepare_operation(&PrepareKnowledgeTreeOperationParams {
+                knowledge_base_id: info.knowledge_base_id.clone(),
+                request_id: "sqlite-pending-outbox".into(),
+                fingerprint: "b".repeat(64),
+                source_rel_path: "archive/note.md".into(),
+                destination_rel_path: "archive/note-2.md".into(),
+                source_fs_identity: None,
+                created_at: now_ms(),
+            })
+            .await
+            .unwrap();
+        let outbox_filesystem = recovered_operations
+            .mark_filesystem_committed(
+                &outbox_prepared.operation.operation_id,
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        let mut outbox_receipt = receipt.clone();
+        outbox_receipt.operation_id = outbox_filesystem.operation_id.to_string();
+        outbox_receipt.old_path = "archive/note.md".into();
+        outbox_receipt.new_path = "archive/note-2.md".into();
+        let outbox_event = KnowledgeTreeChangedEvent {
+            knowledge_base_id: info.knowledge_base_id.clone(),
+            operation_id: outbox_receipt.operation_id.clone(),
+            entry_id: outbox_receipt.entry_id.clone(),
+            old_prefix: outbox_receipt.old_path.clone(),
+            new_prefix: outbox_receipt.new_path.clone(),
+            kind: "file".into(),
+            moved_descendant_count: 0,
+            tree_revision: outbox_receipt.tree_revision,
+            revision: outbox_receipt.revision,
+        };
+        let pending_outbox = recovered_operations
+            .commit_operation(&CommitKnowledgeTreeOperationParams {
+                operation_id: outbox_filesystem.operation_id.clone(),
+                receipt: serde_json::to_value(&outbox_receipt).unwrap(),
+                event_payload: serde_json::to_value(&outbox_event).unwrap(),
+                committed_at: now_ms(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(pending_outbox.event_status, KnowledgeTreeEventStatus::Pending);
+        let pending_outbox_operation_id = pending_outbox.operation_id.clone();
+        drop(recovered_service);
+        drop(recovered_knowledge);
+        drop(recovered_operations);
+        reopened.close().await;
+        drop(reopened);
+
+        let reopened_again = nomifun_db::init_database(&database_path).await.unwrap();
+        let replay_events = Arc::new(RecordingBroadcaster::default());
+        let (outbox_service, _knowledge_repository, outbox_repository) =
+            durable_sqlite_service(
+                &reopened_again,
+                &dir.path().join("data"),
+                replay_events.clone(),
+            );
+        assert_eq!(outbox_service.drain_pending_tree_events().await.unwrap(), 1);
+        assert_eq!(
+            outbox_repository
+                .load_by_operation(&pending_outbox_operation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .event_status,
+            KnowledgeTreeEventStatus::Published
+        );
+        assert_eq!(
+            replay_events
+                .names
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|name| name.as_str() == "knowledge.tree-changed")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_journal_recovers_filesystem_marker_and_deterministic_case_rename_temp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database_path = dir.path().join("knowledge-tree-temp.db");
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        std::fs::write(vault.join("Note.md"), "# Case rename").unwrap();
+
+        let database = nomifun_db::init_database(&database_path).await.unwrap();
+        let (service, knowledge_repository, operation_repository) =
+            durable_sqlite_service(
+                &database,
+                &dir.path().join("data"),
+                Arc::new(NoopBroadcaster),
+            );
+        let info = service
+            .create_base("case", "", Some(vault.to_str().unwrap()), None)
+            .await
+            .unwrap();
+        let request = RelocateTreeEntryRequest {
+            request_id: "sqlite-case-temp-crash".into(),
+            source_path: "Note.md".into(),
+            destination_parent_path: "".into(),
+            new_name: Some("note.md".into()),
+            conflict_policy: RelocateConflictPolicy::Reject,
+            entry_id: None,
+            destination_parent_id: None,
+            expected_revision: None,
+        };
+        let prepared = operation_repository
+            .prepare_operation(&PrepareKnowledgeTreeOperationParams {
+                knowledge_base_id: info.knowledge_base_id.clone(),
+                request_id: request.request_id.clone(),
+                fingerprint: test_relocation_fingerprint(&request),
+                source_rel_path: "Note.md".into(),
+                destination_rel_path: "note.md".into(),
+                source_fs_identity: filesystem_entry_identity(
+                    &vault.join("Note.md"),
+                    &std::fs::metadata(vault.join("Note.md")).unwrap(),
+                ),
+                created_at: now_ms(),
+            })
+            .await
+            .unwrap();
+        let temporary = durable_relocation_temporary_path(
+            &vault,
+            "note.md",
+            &prepared.operation.operation_id,
+        )
+        .unwrap();
+        std::fs::rename(vault.join("Note.md"), &temporary).unwrap();
+        assert!(temporary.is_file());
+        drop(service);
+        drop(knowledge_repository);
+        drop(operation_repository);
+        database.close().await;
+        drop(database);
+
+        let reopened = nomifun_db::init_database(&database_path).await.unwrap();
+        let (recovered_service, _knowledge_repository, recovered_operations) =
+            durable_sqlite_service(
+                &reopened,
+                &dir.path().join("data"),
+                Arc::new(NoopBroadcaster),
+            );
+        assert_eq!(
+            recovered_service
+                .recover_pending_tree_operations()
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(vault.join("note.md").is_file());
+        assert!(!temporary.exists());
+        let committed = recovered_operations
+            .load_by_request(&info.knowledge_base_id, &request.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.state, KnowledgeTreeOperationState::Committed);
+
+        // A separate operation already carrying the filesystem marker skips
+        // rename and completes its projection/receipt after restart.
+        std::fs::write(vault.join("second.md"), "# Second").unwrap();
+        std::fs::create_dir_all(vault.join("archive")).unwrap();
+        recovered_service.mark_projection_dirty(
+            &recovered_service
+                .require_base(info.knowledge_base_id.as_str())
+                .await
+                .unwrap(),
+        );
+        recovered_service
+            .list_tree(info.knowledge_base_id.as_str(), "")
+            .await
+            .unwrap();
+        let marker_request = RelocateTreeEntryRequest {
+            request_id: "sqlite-filesystem-marker-crash".into(),
+            source_path: "second.md".into(),
+            destination_parent_path: "archive".into(),
+            new_name: None,
+            conflict_policy: RelocateConflictPolicy::Reject,
+            entry_id: None,
+            destination_parent_id: None,
+            expected_revision: None,
+        };
+        let marker = recovered_operations
+            .prepare_operation(&PrepareKnowledgeTreeOperationParams {
+                knowledge_base_id: info.knowledge_base_id.clone(),
+                request_id: marker_request.request_id.clone(),
+                fingerprint: test_relocation_fingerprint(&marker_request),
+                source_rel_path: "second.md".into(),
+                destination_rel_path: "archive/second.md".into(),
+                source_fs_identity: filesystem_entry_identity(
+                    &std::fs::metadata(vault.join("second.md")).unwrap(),
+                ),
+                created_at: now_ms(),
+            })
+            .await
+            .unwrap();
+        std::fs::rename(
+            vault.join("second.md"),
+            vault.join("archive/second.md"),
+        )
+        .unwrap();
+        recovered_operations
+            .mark_filesystem_committed(&marker.operation.operation_id, now_ms())
+            .await
+            .unwrap();
+        drop(recovered_service);
+        drop(recovered_operations);
+        reopened.close().await;
+        drop(reopened);
+
+        let final_database = nomifun_db::init_database(&database_path).await.unwrap();
+        let (final_service, _knowledge_repository, final_operations) =
+            durable_sqlite_service(
+                &final_database,
+                &dir.path().join("data"),
+                Arc::new(NoopBroadcaster),
+            );
+        assert_eq!(
+            final_service
+                .recover_pending_tree_operations()
+                .await
+                .unwrap(),
+            1
+        );
+        let marker_committed = final_operations
+            .load_by_request(&info.knowledge_base_id, &marker_request.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(marker_committed.state, KnowledgeTreeOperationState::Committed);
+        assert!(vault.join("archive/second.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn prepared_recovery_never_claims_an_unrelated_destination_identity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = nomifun_db::init_database_memory().await.unwrap();
+        let (service, _knowledge_repository, operations) = durable_sqlite_service(
+            &database,
+            &dir.path().join("data"),
+            Arc::new(NoopBroadcaster),
+        );
+        let vault = dir.path().join("identity-recovery-vault");
+        std::fs::create_dir_all(vault.join("archive")).unwrap();
+        std::fs::write(vault.join("note.md"), "# Original").unwrap();
+        let info = service
+            .create_base("identity", "", Some(vault.to_str().unwrap()), None)
+            .await
+            .unwrap();
+        let source_identity = filesystem_entry_identity(
+            &vault.join("note.md"),
+            &std::fs::metadata(vault.join("note.md")).unwrap(),
+        );
+        let prepared = operations
+            .prepare_operation(&PrepareKnowledgeTreeOperationParams {
+                knowledge_base_id: info.knowledge_base_id.clone(),
+                request_id: "unrelated-recovery-target".into(),
+                fingerprint: "c".repeat(64),
+                source_rel_path: "note.md".into(),
+                destination_rel_path: "archive/note.md".into(),
+                source_fs_identity: source_identity,
+                created_at: now_ms(),
+            })
+            .await
+            .unwrap();
+
+        // The prepared command never performed its rename. Another actor
+        // moved the source elsewhere and an unrelated file later occupied the
+        // intended destination.
+        std::fs::rename(vault.join("note.md"), vault.join("elsewhere.md")).unwrap();
+        std::fs::write(vault.join("archive/note.md"), "# Unrelated").unwrap();
+        assert_eq!(service.recover_pending_tree_operations().await.unwrap(), 0);
+        let retained = operations
+            .load_by_operation(&prepared.operation.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.state, KnowledgeTreeOperationState::NeedsRecovery);
+        assert_eq!(
+            std::fs::read_to_string(vault.join("archive/note.md")).unwrap(),
+            "# Unrelated"
+        );
+        assert!(vault.join("elsewhere.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn outbox_drain_crosses_keyset_pages_in_one_bounded_sweep() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = nomifun_db::init_database_memory().await.unwrap();
+        let events = Arc::new(RecordingBroadcaster::default());
+        let (service, _knowledge_repository, operations) = durable_sqlite_service(
+            &database,
+            &dir.path().join("data"),
+            events.clone(),
+        );
+        let info = service.create_base("events", "", None, None).await.unwrap();
+        let journal_clock = now_ms() - 100;
+
+        for index in 0..3_u64 {
+            let prepared = operations
+                .prepare_operation(&PrepareKnowledgeTreeOperationParams {
+                    knowledge_base_id: info.knowledge_base_id.clone(),
+                    request_id: format!("paged-event-{index}"),
+                    fingerprint: format!("{index:064x}"),
+                    source_rel_path: format!("old-{index}.md"),
+                    destination_rel_path: format!("new-{index}.md"),
+                    source_fs_identity: None,
+                    created_at: journal_clock + i64::try_from(index).unwrap(),
+                })
+                .await
+                .unwrap();
+            let filesystem = operations
+                .mark_filesystem_committed(
+                    &prepared.operation.operation_id,
+                    journal_clock + 10,
+                )
+                .await
+                .unwrap();
+            let operation_id = filesystem.operation_id.to_string();
+            let receipt = RelocateTreeEntryResult {
+                operation_id: operation_id.clone(),
+                entry_id: None,
+                old_path: format!("old-{index}.md"),
+                new_path: format!("new-{index}.md"),
+                kind: KnowledgeEntryKind::File,
+                moved_descendant_count: 0,
+                revision: None,
+                tree_revision: index + 1,
+                undo_token: None,
+                warnings: None,
+            };
+            let event = KnowledgeTreeChangedEvent {
+                knowledge_base_id: info.knowledge_base_id.clone(),
+                operation_id,
+                entry_id: None,
+                old_prefix: receipt.old_path.clone(),
+                new_prefix: receipt.new_path.clone(),
+                kind: "file".into(),
+                moved_descendant_count: 0,
+                tree_revision: receipt.tree_revision,
+                revision: None,
+            };
+            operations
+                .commit_operation(&CommitKnowledgeTreeOperationParams {
+                    operation_id: filesystem.operation_id,
+                    receipt: serde_json::to_value(receipt).unwrap(),
+                    event_payload: serde_json::to_value(event).unwrap(),
+                    committed_at: journal_clock + 20,
+                })
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(service.drain_pending_tree_events().await.unwrap(), 3);
+        assert_eq!(
+            events
+                .names
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|name| name.as_str() == "knowledge.tree-changed")
+                .count(),
+            3
+        );
+        assert!(operations.list_pending_events(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_no_replace_failure_keeps_the_same_request_safely_retryable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = nomifun_db::init_database_memory().await.unwrap();
+        let (service, _knowledge_repository, operation_repository) =
+            durable_sqlite_service(
+                &database,
+                &dir.path().join("data"),
+                Arc::new(NoopBroadcaster),
+            );
+        let vault = dir.path().join("retry-vault");
+        std::fs::create_dir_all(vault.join("archive")).unwrap();
+        std::fs::write(vault.join("note.md"), "# Source").unwrap();
+        std::fs::write(vault.join("archive/note.md"), "# Existing").unwrap();
+        let info = service
+            .create_base("retry", "", Some(vault.to_str().unwrap()), None)
+            .await
+            .unwrap();
+        let request = RelocateTreeEntryRequest {
+            request_id: "durable-safe-retry".into(),
+            source_path: "note.md".into(),
+            destination_parent_path: "archive".into(),
+            new_name: None,
+            conflict_policy: RelocateConflictPolicy::Reject,
+            entry_id: None,
+            destination_parent_id: None,
+            expected_revision: None,
+        };
+        let first_error = service
+            .relocate_tree_entry(info.knowledge_base_id.as_str(), request.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(first_error, AppError::Conflict(_)));
+        let prepared = operation_repository
+            .load_by_request(&info.knowledge_base_id, &request.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prepared.state, KnowledgeTreeOperationState::Prepared);
+        assert!(vault.join("note.md").is_file());
+
+        std::fs::remove_file(vault.join("archive/note.md")).unwrap();
+        let retried = service
+            .relocate_tree_entry(info.knowledge_base_id.as_str(), request)
+            .await
+            .unwrap();
+        assert_eq!(retried.operation_id, prepared.operation_id.to_string());
+        assert!(vault.join("archive/note.md").is_file());
+        assert!(!vault.join("note.md").exists());
+
+        let no_op_request = RelocateTreeEntryRequest {
+            request_id: "durable-exact-no-op".into(),
+            source_path: "archive/note.md".into(),
+            destination_parent_path: "archive".into(),
+            new_name: None,
+            conflict_policy: RelocateConflictPolicy::Reject,
+            entry_id: None,
+            destination_parent_id: None,
+            expected_revision: None,
+        };
+        let no_op = service
+            .relocate_tree_entry(
+                info.knowledge_base_id.as_str(),
+                no_op_request.clone(),
+            )
+            .await
+            .unwrap();
+        let no_op_replay = service
+            .relocate_tree_entry(info.knowledge_base_id.as_str(), no_op_request.clone())
+            .await
+            .unwrap();
+        assert_eq!(no_op_replay.operation_id, no_op.operation_id);
+        assert!(no_op.undo_token.is_none());
+        assert!(no_op.warnings.as_ref().is_some_and(|warnings| {
+            warnings.iter().any(|warning| warning.contains("already"))
+        }));
+        assert!(
+            operation_repository
+                .load_by_request(
+                    &info.knowledge_base_id,
+                    &no_op_request.request_id,
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "an exact no-op must not create a committed outbox event"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_entry_projection_reconciles_and_preserves_identity_across_moves() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = nomifun_db::init_database_memory().await.unwrap();
+        let sqlite_repository = Arc::new(nomifun_db::SqliteKnowledgeRepository::new(
+            database.pool().clone(),
+        ));
+        let base_repository: Arc<dyn IKnowledgeRepository> = sqlite_repository.clone();
+        let events = Arc::new(RecordingBroadcaster::default());
+        let service = KnowledgeService::new(
+            base_repository,
+            &dir.path().join("data"),
+            KnowledgeEventEmitter::new(events, Arc::from(TEST_OWNER_ID)),
+        );
+        let entry_repository: Arc<dyn IKnowledgeEntryRepository> =
+            sqlite_repository.clone();
+        service.set_entry_repository(entry_repository);
+        service.set_tree_operation_repository(Arc::new(
+            nomifun_db::SqliteKnowledgeTreeOperationRepository::new(
+                database.pool().clone(),
+            ),
+        ));
+
+        let vault = dir.path().join("projected-vault");
+        std::fs::create_dir_all(vault.join("docs/nested")).unwrap();
+        std::fs::create_dir_all(vault.join("archive")).unwrap();
+        std::fs::write(vault.join("docs/note.md"), "# Stable").unwrap();
+        std::fs::write(vault.join("docs/nested/child.md"), "# Child").unwrap();
+        std::fs::write(vault.join("docs/asset.bin"), [1_u8, 2, 3]).unwrap();
+        let info = service
+            .create_base("projected", "", Some(vault.to_str().unwrap()), None)
+            .await
+            .unwrap();
+
+        // The first real tree read builds the complete projection, not merely
+        // the requested root level, so descendants immediately have IDs.
+        let root_entries = service
+            .list_tree(info.knowledge_base_id.as_str(), "")
+            .await
+            .unwrap();
+        let docs = root_entries
+            .iter()
+            .find(|entry| entry.name == "docs")
+            .unwrap();
+        let docs_id = docs.entry_id.clone().expect("directory must be projected");
+        let docs_revision = docs.revision.expect("directory revision");
+        let archive_id = root_entries
+            .iter()
+            .find(|entry| entry.name == "archive")
+            .and_then(|entry| entry.entry_id.clone())
+            .expect("destination directory must be projected");
+        assert_eq!(docs.parent_entry_id, None);
+        assert_eq!(docs.origin.as_deref(), Some(KNOWLEDGE_ENTRY_ORIGIN_USER));
+
+        let docs_children = service
+            .list_tree(info.knowledge_base_id.as_str(), "docs")
+            .await
+            .unwrap();
+        let note_id = docs_children
+            .iter()
+            .find(|entry| entry.name == "note.md")
+            .and_then(|entry| entry.entry_id.clone())
+            .expect("file must be projected");
+        assert!(docs_children
+            .iter()
+            .all(|entry| entry.parent_entry_id.as_ref() == Some(&docs_id)));
+        let asset_id = sqlite_repository
+            .get_entry_by_path(
+                &info.knowledge_base_id,
+                &portable_writeback_path_identity("docs/asset.bin"),
+            )
+            .await
+            .unwrap()
+            .expect("non-Markdown attachments belong to the complete projection")
+            .knowledge_entry_id;
+
+        let moved = service
+            .relocate_tree_entry(
+                info.knowledge_base_id.as_str(),
+                RelocateTreeEntryRequest {
+                    // Stable identities win over stale path locators. Legacy
+                    // and projection-degraded callers continue using paths.
+                    source_path: "stale/docs".into(),
+                    destination_parent_path: "stale/archive".into(),
+                    new_name: Some("moved".into()),
+                    request_id: "projected-relocate".into(),
+                    conflict_policy: RelocateConflictPolicy::Reject,
+                    entry_id: Some(docs_id.clone()),
+                    destination_parent_id: Some(archive_id.clone()),
+                    expected_revision: Some(docs_revision),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(moved.entry_id.as_ref(), Some(&docs_id));
+        assert!(moved.revision.is_some_and(|revision| revision > docs_revision));
+        assert_eq!(
+            moved.tree_revision,
+            non_negative_tree_revision(
+                sqlite_repository
+                    .tree_revision(&info.knowledge_base_id)
+                    .await
+                    .unwrap()
+            )
+            .unwrap()
+        );
+
+        let archive_children = service
+            .list_tree(info.knowledge_base_id.as_str(), "archive")
+            .await
+            .unwrap();
+        let projected_moved = archive_children
+            .iter()
+            .find(|entry| entry.name == "moved")
+            .unwrap();
+        assert_eq!(projected_moved.entry_id.as_ref(), Some(&docs_id));
+        assert_eq!(projected_moved.parent_entry_id.as_ref(), Some(&archive_id));
+        let moved_revision = projected_moved.revision.unwrap();
+        let moved_children = service
+            .list_tree(info.knowledge_base_id.as_str(), "archive/moved")
+            .await
+            .unwrap();
+        assert_eq!(
+            moved_children
+                .iter()
+                .find(|entry| entry.name == "note.md")
+                .and_then(|entry| entry.entry_id.as_ref()),
+            Some(&note_id),
+            "a projected descendant keeps its stable ID when its directory moves"
+        );
+        assert_eq!(
+            sqlite_repository
+                .get_entry_by_path(
+                    &info.knowledge_base_id,
+                    &portable_writeback_path_identity("archive/moved/asset.bin"),
+                )
+                .await
+                .unwrap()
+                .map(|entry| entry.knowledge_entry_id)
+                .as_ref(),
+            Some(&asset_id),
+            "non-Markdown descendants move in the same projected subtree"
+        );
+
+        // Simulate Finder/Obsidian bypassing the service. The next listing of
+        // that exact level detects the path-set mismatch, performs a full
+        // reconcile, and preserves identity through the filesystem inode.
+        std::fs::rename(
+            vault.join("archive/moved"),
+            vault.join("archive/external-rename"),
+        )
+        .unwrap();
+        let after_external = service
+            .list_tree(info.knowledge_base_id.as_str(), "archive")
+            .await
+            .unwrap();
+        let externally_renamed = after_external
+            .iter()
+            .find(|entry| entry.name == "external-rename")
+            .unwrap();
+        assert_eq!(externally_renamed.entry_id.as_ref(), Some(&docs_id));
+        assert!(externally_renamed.revision.is_some_and(|revision| revision > moved_revision));
+
+        let stale_error = service
+            .relocate_tree_entry(
+                info.knowledge_base_id.as_str(),
+                RelocateTreeEntryRequest {
+                    source_path: "archive/external-rename".into(),
+                    destination_parent_path: "".into(),
+                    new_name: None,
+                    request_id: "projected-stale-revision".into(),
+                    conflict_policy: RelocateConflictPolicy::Reject,
+                    entry_id: Some(docs_id),
+                    destination_parent_id: None,
+                    expected_revision: Some(moved_revision),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(stale_error, AppError::Conflict(_)), "{stale_error:?}");
+        assert!(vault.join("archive/external-rename").is_dir());
+    }
+
+    #[tokio::test]
+    async fn deleting_and_recreating_the_same_path_mints_a_new_entry_identity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = nomifun_db::init_database_memory().await.unwrap();
+        let (service, _, _) = durable_sqlite_service(
+            &database,
+            &dir.path().join("data"),
+            Arc::new(NoopBroadcaster),
+        );
+        let info = service.create_base("identity", "", None, None).await.unwrap();
+        service
+            .create_document(info.knowledge_base_id.as_str(), "same.md", "first")
+            .await
+            .unwrap();
+        let first = service
+            .list_tree(info.knowledge_base_id.as_str(), "")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == "same.md")
+            .unwrap();
+        service
+            .delete_file_entry(
+                info.knowledge_base_id.as_str(),
+                &first.rel_path,
+                first.entry_id.as_ref(),
+                first.revision,
+            )
+            .await
+            .unwrap();
+        service
+            .create_document(info.knowledge_base_id.as_str(), "same.md", "second")
+            .await
+            .unwrap();
+        let second = service
+            .list_tree(info.knowledge_base_id.as_str(), "")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == "same.md")
+            .unwrap();
+        assert_ne!(first.entry_id, second.entry_id);
+    }
+
+    #[tokio::test]
+    async fn projection_reconcile_repairs_a_committed_move_after_cas_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = nomifun_db::init_database_memory().await.unwrap();
+        let sqlite_repository = Arc::new(nomifun_db::SqliteKnowledgeRepository::new(
+            database.pool().clone(),
+        ));
+        let base_repository: Arc<dyn IKnowledgeRepository> = sqlite_repository.clone();
+        let flaky_projection = Arc::new(FailNextProjectionRelocate::new(
+            sqlite_repository.clone(),
+        ));
+        let service = KnowledgeService::new(
+            base_repository,
+            &dir.path().join("data"),
+            KnowledgeEventEmitter::new(
+                Arc::new(NoopBroadcaster),
+                Arc::from(TEST_OWNER_ID),
+            ),
+        );
+        service.set_entry_repository(flaky_projection.clone());
+
+        let vault = dir.path().join("projection-recovery-vault");
+        std::fs::create_dir_all(vault.join("docs")).unwrap();
+        std::fs::create_dir_all(vault.join("archive")).unwrap();
+        std::fs::write(vault.join("docs/note.md"), "# Recoverable").unwrap();
+        let info = service
+            .create_base("recoverable", "", Some(vault.to_str().unwrap()), None)
+            .await
+            .unwrap();
+        let root_entries = service
+            .list_tree(info.knowledge_base_id.as_str(), "")
+            .await
+            .unwrap();
+        let docs = root_entries
+            .iter()
+            .find(|entry| entry.name == "docs")
+            .unwrap();
+        let docs_id = docs.entry_id.clone().unwrap();
+        let docs_revision = docs.revision.unwrap();
+
+        flaky_projection.fail_next_relocate();
+        let moved = service
+            .relocate_tree_entry(
+                info.knowledge_base_id.as_str(),
+                RelocateTreeEntryRequest {
+                    source_path: "docs".into(),
+                    destination_parent_path: "archive".into(),
+                    new_name: None,
+                    request_id: "projection-cas-recovery".into(),
+                    conflict_policy: RelocateConflictPolicy::Reject,
+                    entry_id: Some(docs_id.clone()),
+                    destination_parent_id: None,
+                    expected_revision: Some(docs_revision),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(vault.join("archive/docs/note.md").is_file());
+        assert_eq!(moved.entry_id.as_ref(), Some(&docs_id));
+        assert!(moved.warnings.as_ref().is_some_and(|warnings| {
+            warnings.iter().any(|warning| warning.contains("repaired"))
+        }));
+        let persisted = sqlite_repository
+            .get_entry_by_path(
+                &info.knowledge_base_id,
+                &portable_writeback_path_identity("archive/docs"),
+            )
+            .await
+            .unwrap()
+            .expect("reconcile must publish the committed filesystem location");
+        assert_eq!(persisted.knowledge_entry_id, docs_id);
+        assert_eq!(moved.revision, Some(persisted.revision));
+        assert_eq!(
+            moved.tree_revision,
+            non_negative_tree_revision(
+                sqlite_repository
+                    .tree_revision(&info.knowledge_base_id)
+                    .await
+                    .unwrap()
+            )
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_document_write_refreshes_file_identity_before_external_rename() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = nomifun_db::init_database_memory().await.unwrap();
+        let sqlite_repository = Arc::new(nomifun_db::SqliteKnowledgeRepository::new(
+            database.pool().clone(),
+        ));
+        let base_repository: Arc<dyn IKnowledgeRepository> = sqlite_repository.clone();
+        let service = KnowledgeService::new(
+            base_repository,
+            &dir.path().join("data"),
+            KnowledgeEventEmitter::new(Arc::new(NoopBroadcaster), Arc::from(TEST_OWNER_ID)),
+        );
+        service.set_entry_repository(sqlite_repository.clone());
+
+        let vault = dir.path().join("atomic-write-projection-vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        std::fs::write(vault.join("note.md"), "# Before").unwrap();
+        let info = service
+            .create_base("atomic-write", "", Some(vault.to_str().unwrap()), None)
+            .await
+            .unwrap();
+        let before = service
+            .list_tree(info.knowledge_base_id.as_str(), "")
+            .await
+            .unwrap();
+        let entry_id = before[0].entry_id.clone().unwrap();
+
+        // `write_file` publishes through an atomic replacement and therefore
+        // commonly changes the inode/file-index while keeping the path. The
+        // next list must refresh that physical identity even though the path
+        // set itself still matches the old projection.
+        service
+            .write_file(info.knowledge_base_id.as_str(), "note.md", "# After")
+            .await
+            .unwrap();
+        let after_write = service
+            .list_tree(info.knowledge_base_id.as_str(), "")
+            .await
+            .unwrap();
+        assert_eq!(after_write[0].entry_id.as_ref(), Some(&entry_id));
+
+        // Finder/Obsidian now renames the replacement inode. If the service
+        // had left the pre-write fs_identity cached, this reconciliation would
+        // allocate a new stable ID for the same logical document.
+        std::fs::rename(vault.join("note.md"), vault.join("renamed.md")).unwrap();
+        let after_external_rename = service
+            .list_tree(info.knowledge_base_id.as_str(), "")
+            .await
+            .unwrap();
+        assert_eq!(after_external_rename.len(), 1);
+        assert_eq!(after_external_rename[0].rel_path, "renamed.md");
+        assert_eq!(
+            after_external_rename[0].entry_id.as_ref(),
+            Some(&entry_id),
+            "service-owned atomic saves must not break identity on the next external rename"
+        );
+
+        // Simulate an editor doing another atomic save without going through
+        // KnowledgeService. A same-path tree listing must notice the changed
+        // physical identity even though names/kinds are identical.
+        write_text_atomic(&vault.join("renamed.md"), "# External replacement")
+            .await
+            .unwrap();
+        let after_external_write = service
+            .list_tree(info.knowledge_base_id.as_str(), "")
+            .await
+            .unwrap();
+        assert_eq!(after_external_write[0].entry_id.as_ref(), Some(&entry_id));
+        std::fs::rename(vault.join("renamed.md"), vault.join("final.md")).unwrap();
+        let final_listing = service
+            .list_tree(info.knowledge_base_id.as_str(), "")
+            .await
+            .unwrap();
+        assert_eq!(final_listing[0].rel_path, "final.md");
+        assert_eq!(
+            final_listing[0].entry_id.as_ref(),
+            Some(&entry_id),
+            "same-path external atomic saves must refresh identity before a later rename"
+        );
+    }
+
+    #[tokio::test]
+    async fn relocate_tree_entry_rejects_unsafe_destinations_and_never_overwrites() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join("docs/child")).unwrap();
+        std::fs::create_dir_all(vault.join("target")).unwrap();
+        std::fs::write(vault.join("docs/note.md"), "source").unwrap();
+        std::fs::write(vault.join("target/NOTE.md"), "target").unwrap();
+        std::fs::write(vault.join("not-a-directory.md"), "file").unwrap();
+        let info = service
+            .create_base("vault", "", Some(vault.to_str().unwrap()), None)
+            .await
+            .unwrap();
+
+        for (request_id, source, destination) in [
+            ("self", "docs", "docs"),
+            ("descendant", "docs", "docs/child"),
+            ("file-target", "docs/note.md", "not-a-directory.md"),
+            ("collision", "docs/note.md", "target"),
+        ] {
+            let error = service
+                .relocate_tree_entry(
+                    &info.knowledge_base_id,
+                    RelocateTreeEntryRequest {
+                        source_path: source.into(),
+                        destination_parent_path: destination.into(),
+                        new_name: None,
+                        request_id: request_id.into(),
+                        conflict_policy: RelocateConflictPolicy::Reject,
+                        entry_id: None,
+                        destination_parent_id: None,
+                        expected_revision: None,
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, AppError::BadRequest(_) | AppError::Conflict(_)),
+                "{request_id}: {error:?}"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(vault.join("docs/note.md")).unwrap(), "source");
+        assert_eq!(std::fs::read_to_string(vault.join("target/NOTE.md")).unwrap(), "target");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relocate_tree_entry_rejects_symlinks_anywhere_in_a_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join("docs")).unwrap();
+        std::fs::create_dir_all(vault.join("target")).unwrap();
+        std::fs::write(vault.join("outside.md"), "outside").unwrap();
+        symlink(vault.join("outside.md"), vault.join("docs/link.md")).unwrap();
+        let info = service
+            .create_base("vault", "", Some(vault.to_str().unwrap()), None)
+            .await
+            .unwrap();
+
+        let error = service
+            .relocate_tree_entry(
+                &info.knowledge_base_id,
+                RelocateTreeEntryRequest {
+                    source_path: "docs".into(),
+                    destination_parent_path: "target".into(),
+                    new_name: None,
+                    request_id: "reject-linked-tree".into(),
+                    conflict_policy: RelocateConflictPolicy::Reject,
+                    entry_id: None,
+                    destination_parent_id: None,
+                    expected_revision: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::BadRequest(_)), "{error:?}");
+        assert!(vault.join("docs/link.md").is_symlink());
+        assert!(!vault.join("target/docs").exists());
+    }
+
+    #[tokio::test]
+    async fn managed_snapshot_can_be_organized_but_body_remains_read_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let info = service
+            .create_base(
+                "source",
+                "",
+                None,
+                Some(url_source(
+                    KnowledgeSourceMode::Live,
+                    &["https://example.com/docs"],
+                )),
+            )
+            .await
+            .unwrap();
+        let root = PathBuf::from(&info.root_path);
+        std::fs::create_dir_all(root.join("snapshots")).unwrap();
+        std::fs::write(
+            root.join("snapshots/page.md"),
+            source_url::snapshot_markdown(
+                "https://example.com/docs",
+                "2026-01-01T00:00:00Z",
+                Some("Docs"),
+                "managed",
+            ),
+        )
+        .unwrap();
+
+        let moved = service
+            .relocate_tree_entry(
+                &info.knowledge_base_id,
+                RelocateTreeEntryRequest {
+                    source_path: "snapshots/page.md".into(),
+                    destination_parent_path: "".into(),
+                    new_name: None,
+                    request_id: "managed-snapshot".into(),
+                    conflict_policy: RelocateConflictPolicy::Reject,
+                    entry_id: None,
+                    destination_parent_id: None,
+                    expected_revision: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(moved.new_path, "page.md");
+
+        let overwrite = service
+            .write_file(&info.knowledge_base_id, "page.md", "replacement")
+            .await
+            .unwrap_err();
+        assert!(matches!(overwrite, AppError::Forbidden(_)), "{overwrite:?}");
+
+        let delete_file = service
+            .delete_file(&info.knowledge_base_id, "page.md")
+            .await
+            .unwrap_err();
+        assert!(matches!(delete_file, AppError::Forbidden(_)), "{delete_file:?}");
+
+        let create_folder = service
+            .create_folder(&info.knowledge_base_id, "snapshots/manual")
+            .await
+            .unwrap();
+        assert_eq!(create_folder.rel_path, "snapshots/manual");
+
+        let import_source = dir.path().join("import-source");
+        std::fs::create_dir_all(&import_source).unwrap();
+        std::fs::write(import_source.join("note.md"), "# Imported").unwrap();
+        let import = service
+            .import_markdown_folder_into(
+                &info.knowledge_base_id,
+                import_source.to_str().unwrap(),
+                "snapshots",
+            )
+            .await
+            .unwrap();
+        assert_eq!(import.imported, 1);
+        assert!(root.join("snapshots/import-source").exists());
+
+        service
+            .delete_folder(&info.knowledge_base_id, "snapshots")
+            .await
+            .unwrap();
+        let content = std::fs::read_to_string(root.join("page.md")).unwrap();
+        assert!(content.contains("managed"));
+        assert!(root.join("page.md").is_file());
+
+    }
+
+    /// The per-base walk must be bounded: a walk that finishes within budget
+    /// returns its real value, but one that exceeds it degrades to the fallback
+    /// (a slow/stale NAS mount must never hang the response past the client
+    /// timeout). The detached closure keeps running; its result is discarded.
+    #[tokio::test]
+    async fn bounded_root_blocking_returns_value_then_degrades_on_timeout() {
+        use std::time::Duration;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let v = bounded_root_blocking(root.path(), Duration::from_secs(5), 999u32, || 7u32).await;
+        assert_eq!(v, 7, "value must be returned when the walk finishes within budget");
+
+        let v = bounded_root_blocking(root.path(), Duration::from_millis(1), 999u32, || {
+            std::thread::sleep(Duration::from_millis(60));
+            7u32
+        })
+        .await;
+        assert_eq!(v, 999, "a walk that exceeds the budget must degrade to the fallback");
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_root_inspection_is_single_flight_after_timeout() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Condvar, Mutex};
+
+        let slow = tempfile::TempDir::new().unwrap();
+        let healthy = tempfile::TempDir::new().unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let entered_wait = entered.notified();
+        let first = {
+            let root = slow.path().to_path_buf();
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            let starts = Arc::clone(&starts);
+            tokio::spawn(async move {
+                bounded_root_blocking(
+                    &root,
+                    Duration::from_millis(30),
+                    99u32,
+                    move || {
+                        starts.fetch_add(1, Ordering::SeqCst);
+                        entered.notify_one();
+                        let (lock, condition) = &*release;
+                        let mut ready = lock.lock().unwrap();
+                        while !*ready {
+                            ready = condition.wait(ready).unwrap();
+                        }
+                        1
+                    },
+                )
+                .await
+            })
+        };
+        entered_wait.await;
+        assert_eq!(first.await.unwrap(), 99);
+
+        let slow_retry = bounded_root_blocking(
+            slow.path(),
+            Duration::from_millis(30),
+            88u32,
+            {
+                let starts = Arc::clone(&starts);
+                move || {
+                    starts.fetch_add(1, Ordering::SeqCst);
+                    2
+                }
+            },
+        )
+        .await;
+        assert_eq!(slow_retry, 88);
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "a retry for the same timed-out root must not start another blocker"
+        );
+
+        let healthy_value = bounded_root_blocking(
+            healthy.path(),
+            Duration::from_secs(1),
+            0u32,
+            || 7,
+        )
+        .await;
+        assert_eq!(healthy_value, 7);
+
+        let (lock, condition) = &*release;
+        *lock.lock().unwrap() = true;
+        condition.notify_all();
+    }
+
+    /// `list_base_ids` returns every registered base id straight from the DB,
+    /// with no directory walk — the disk-free path binding/ensure-known callers
+    /// must use instead of the walking `list_bases`.
+    #[tokio::test]
+    async fn list_base_ids_returns_all_ids_from_registry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let a = service.create_base("a", "", None, None).await.unwrap();
+        let b = service.create_base("b", "", None, None).await.unwrap();
+
+        let mut got = service.list_base_ids().await.unwrap();
+        got.sort();
+        let mut expected = vec![a.knowledge_base_id.into_string(), b.knowledge_base_id.into_string()];
+        expected.sort();
+        assert_eq!(got, expected);
+    }
+
+    /// The concurrent `list_bases` must still return EVERY base and preserve
+    /// registry order (guards the `.buffered` parallelization against dropping
+    /// or reordering rows).
+    #[tokio::test]
+    async fn list_bases_returns_every_base_in_registry_order() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let a = service.create_base("a", "", None, None).await.unwrap();
+        let b = service.create_base("b", "", None, None).await.unwrap();
+        let c = service.create_base("c", "", None, None).await.unwrap();
+
+        let infos = service.list_bases().await.unwrap();
+        let ids: Vec<&str> = infos.iter().map(|i| i.knowledge_base_id.as_str()).collect();
+        assert_eq!(ids, vec![a.knowledge_base_id.as_str(), b.knowledge_base_id.as_str(), c.knowledge_base_id.as_str()]);
+    }
+
+    #[tokio::test]
+    async fn generate_overview_preserves_readme_unless_overwrite() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let kb = service.create_base("库", "", None, None).await.unwrap();
+        service.write_file(&kb.knowledge_base_id, "a.md", "# A").await.unwrap();
+        let readme_path = PathBuf::from(&kb.root_path).join("README.md");
+        std::fs::write(&readme_path, "# 手写 README\n保留我").unwrap();
+        service.set_completer(FakeCompleter::new(OVERVIEW_JSON, ""));
+
+        // overwrite_readme=false: README untouched, description refreshed.
+        let outcome = service.generate_overview(&kb.knowledge_base_id, false, None).await.unwrap();
+        assert!(!outcome.readme_written);
+        assert!(outcome.description_updated);
+        assert_eq!(std::fs::read_to_string(&readme_path).unwrap(), "# 手写 README\n保留我");
+
+        // overwrite_readme=true replaces it.
+        let outcome = service.generate_overview(&kb.knowledge_base_id, true, None).await.unwrap();
+        assert!(outcome.readme_written);
+        assert!(std::fs::read_to_string(&readme_path).unwrap().starts_with("# 接口库"));
+
+        // preserve_existing_description (post-import mode) keeps a non-empty
+        // description but can still write a (missing) README.
+        std::fs::remove_file(&readme_path).unwrap();
+        service.update_base(&kb.knowledge_base_id, None, Some("人工描述"), None).await.unwrap();
+        let outcome = service.generate_overview_opts(&kb.knowledge_base_id, false, true, None).await.unwrap();
+        assert!(outcome.readme_written);
+        assert!(!outcome.description_updated);
+        assert_eq!(outcome.base.description, "人工描述");
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_autogen_preserves_readme_created_during_completion() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service =
+            Arc::new(make_service(&dir.path().join("data")));
+        let kb = service.create_base("库", "", None, None).await.unwrap();
+        service
+            .write_file(&kb.knowledge_base_id, "a.md", "# A")
+            .await
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        service.set_completer(Arc::new(PausedOverviewCompleter {
+            entered: entered.clone(),
+            release: release.clone(),
+        }));
+
+        let generation_service = service.clone();
+        let kb_id = kb.knowledge_base_id.clone();
+        let generation = tokio::spawn(async move {
+            generation_service
+                .generate_overview(kb_id.as_str(), false, None)
+                .await
+        });
+        entered.wait().await;
+        service
+            .write_file(
+                kb.knowledge_base_id.as_str(),
+                "readme.md",
+                "# User README\n",
+            )
+            .await
+            .unwrap();
+        release.wait().await;
+
+        let outcome = generation.await.unwrap().unwrap();
+        assert!(!outcome.readme_written);
+        assert_eq!(
+            std::fs::read_to_string(
+                PathBuf::from(&kb.root_path).join("readme.md")
+            )
+            .unwrap(),
+            "# User README\n"
+        );
+        let readme_names = std::fs::read_dir(&kb.root_path)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+            .filter(|name| name.eq_ignore_ascii_case("README.md"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            readme_names.len(),
+            1,
+            "autogen must not create a portable alias beside a user write: {readme_names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_overview_requires_completer_and_content() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let kb = service.create_base("空库", "", None, None).await.unwrap();
+
+        // No completer wired → explicit 409.
+        let err = service.generate_overview(&kb.knowledge_base_id, false, None).await.unwrap_err();
+        assert!(matches!(err, AppError::Conflict(_)), "{err:?}");
+        assert!(err.to_string().contains("no AI completer"), "{err}");
+
+        // Completer wired but the base has no documents → 400.
+        service.set_completer(FakeCompleter::new(OVERVIEW_JSON, ""));
+        let err = service.generate_overview(&kb.knowledge_base_id, false, None).await.unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)), "{err:?}");
+
+        // Garbage model output (twice) → BadGateway, nothing persisted.
+        service.write_file(&kb.knowledge_base_id, "a.md", "# A").await.unwrap();
+        service.set_completer(FakeCompleter::new("我不会输出 JSON", ""));
+        let err = service.generate_overview(&kb.knowledge_base_id, false, None).await.unwrap_err();
+        assert!(matches!(err, AppError::BadGateway(_)), "{err:?}");
+        assert!(!PathBuf::from(&kb.root_path).join("README.md").exists());
+        assert_eq!(service.get_base_info(&kb.knowledge_base_id).await.unwrap().description, "");
+    }
+
+    // ── Stateless description endpoints ──────────────────────────────
+
+    /// Replays scripted replies in order (last one repeats) and records the
+    /// prompts; for the stateless description generate/polish paths. Also
+    /// records the explicit `(provider_id, model)` of the most recent call:
+    /// `Some` when reached via `complete_with`, `None` via `complete`.
+    struct ScriptedCompleter {
+        replies: std::sync::Mutex<Vec<String>>,
+        calls: AtomicUsize,
+        last_system: std::sync::Mutex<String>,
+        last_user: std::sync::Mutex<String>,
+        last_override: std::sync::Mutex<Option<(String, String)>>,
+    }
+
+    impl ScriptedCompleter {
+        fn new(replies: &[&str]) -> Arc<Self> {
+            Arc::new(Self {
+                replies: std::sync::Mutex::new(replies.iter().rev().map(|r| (*r).to_owned()).collect()),
+                calls: AtomicUsize::new(0),
+                last_system: std::sync::Mutex::new(String::new()),
+                last_user: std::sync::Mutex::new(String::new()),
+                last_override: std::sync::Mutex::new(None),
+            })
+        }
+
+        fn next_reply(&self) -> String {
+            let mut replies = self.replies.lock().unwrap();
+            if replies.len() > 1 { replies.pop().unwrap() } else { replies.last().cloned().unwrap_or_default() }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl KnowledgeCompleter for ScriptedCompleter {
+        async fn complete(&self, system: &str, user: &str) -> Result<String, AppError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_system.lock().unwrap() = system.to_owned();
+            *self.last_user.lock().unwrap() = user.to_owned();
+            *self.last_override.lock().unwrap() = None;
+            Ok(self.next_reply())
+        }
+
+        async fn complete_with(
+            &self,
+            system: &str,
+            user: &str,
+            provider_id: &str,
+            model: &str,
+        ) -> Result<String, AppError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_system.lock().unwrap() = system.to_owned();
+            *self.last_user.lock().unwrap() = user.to_owned();
+            *self.last_override.lock().unwrap() = Some((provider_id.to_owned(), model.to_owned()));
+            Ok(self.next_reply())
+        }
+    }
+
+    struct ConcurrentDirectMergeCompleter {
+        kb_id: KnowledgeBaseId,
+    }
+
+    impl ConcurrentDirectMergeCompleter {
+        fn new(kb_id: KnowledgeBaseId) -> Arc<Self> {
+            Arc::new(Self { kb_id })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl KnowledgeCompleter for ConcurrentDirectMergeCompleter {
+        async fn complete(&self, system: &str, user: &str) -> Result<String, AppError> {
+            if system == crate::turn_writeback::TURN_WRITEBACK_SYSTEM {
+                let marker = if user.contains("alpha-user") { "Alpha" } else { "Beta" };
+                return Ok(format!(
+                    r##"{{"candidates":[{{"kb_id":"{}","rel_path":"patterns/shared.md","content":"# {marker}\n\n{marker} durable note."}}]}}"##,
+                    self.kb_id
+                ));
+            }
+
+            Ok(r#"{"candidates":[]}"#.into())
+        }
+    }
+
+    struct ConcurrentCaseAliasMergeCompleter {
+        kb_id: KnowledgeBaseId,
+        extracted: Arc<tokio::sync::Barrier>,
+    }
+
+    impl ConcurrentCaseAliasMergeCompleter {
+        fn new(kb_id: KnowledgeBaseId) -> Arc<Self> {
+            Arc::new(Self {
+                kb_id,
+                extracted: Arc::new(tokio::sync::Barrier::new(2)),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl KnowledgeCompleter for ConcurrentCaseAliasMergeCompleter {
+        async fn complete(&self, system: &str, user: &str) -> Result<String, AppError> {
+            if system == crate::turn_writeback::TURN_WRITEBACK_SYSTEM {
+                let (marker, rel_path) = if user.contains("alpha-user") {
+                    ("Alpha", "patterns/shared.md")
+                } else {
+                    ("Beta", "PATTERNS/SHARED.MD")
+                };
+                self.extracted.wait().await;
+                return Ok(format!(
+                    r##"{{"candidates":[{{"kb_id":"{}","rel_path":"{rel_path}","content":"# {marker}\n\n{marker} durable note."}}]}}"##,
+                    self.kb_id
+                ));
+            }
+            Ok(r#"{"candidates":[]}"#.into())
+        }
+    }
+
+    /// Explicit `Some((provider_id, model))` must reach the completer via
+    /// `complete_with` carrying exactly that pick — proving the UI's model
+    /// selection is threaded through the description/polish service methods
+    /// (it is NOT silently dropped or replaced by the default).
+    #[tokio::test]
+    async fn explicit_model_override_reaches_completer() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("a.md"), "# A\n正文").unwrap();
+
+        let completer = ScriptedCompleter::new(&[r#"{"description":"覆盖A，查阅时用。"}"#]);
+        service.set_completer(completer.clone());
+
+        let pick = Some((TEST_PROVIDER_ID_2.to_owned(), "model-x".to_owned()));
+        let description = service
+            .generate_description_for_path("库", &docs.to_string_lossy(), pick.clone())
+            .await
+            .unwrap();
+        assert_eq!(description, "覆盖A，查阅时用。");
+        assert_eq!(
+            *completer.last_override.lock().unwrap(),
+            Some((TEST_PROVIDER_ID_2.to_owned(), "model-x".to_owned())),
+            "the explicit (provider_id, model) must reach complete_with verbatim"
+        );
+
+        // polish_description threads it the same way.
+        let completer = ScriptedCompleter::new(&[r#"{"description":"润色结果。"}"#]);
+        service.set_completer(completer.clone());
+        service
+            .polish_description(
+                "库",
+                "草稿",
+                Some((TEST_PROVIDER_ID_9.to_owned(), "m-9".to_owned())),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            *completer.last_override.lock().unwrap(),
+            Some((TEST_PROVIDER_ID_9.to_owned(), "m-9".to_owned()))
+        );
+    }
+
+    /// `None` must fall back to the completer's default model: the call
+    /// arrives via `complete` (no recorded override) — confirming existing
+    /// behavior is byte-for-byte unchanged when no model is picked.
+    #[tokio::test]
+    async fn none_override_falls_back_to_default_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("a.md"), "# A\n正文").unwrap();
+
+        let completer = ScriptedCompleter::new(&[r#"{"description":"默认模型生成。"}"#]);
+        service.set_completer(completer.clone());
+
+        let description = service
+            .generate_description_for_path("库", &docs.to_string_lossy(), None)
+            .await
+            .unwrap();
+        assert_eq!(description, "默认模型生成。");
+        assert_eq!(
+            *completer.last_override.lock().unwrap(),
+            None,
+            "None must route through complete() — the default-model path"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_description_for_path_is_stateless() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("deploy.md"), "# 部署\n发布流程说明").unwrap();
+
+        let completer = ScriptedCompleter::new(&[r#"{"description":"覆盖部署与发布流程，上线/排障时查阅。"}"#]);
+        service.set_completer(completer.clone());
+
+        let description = service
+            .generate_description_for_path("发布手册", &docs.to_string_lossy(), None)
+            .await
+            .unwrap();
+        assert_eq!(description, "覆盖部署与发布流程，上线/排障时查阅。");
+        // Description-only contract: the dedicated system prompt is used and
+        // the user prompt carries the name and the sampled file.
+        assert_eq!(*completer.last_system.lock().unwrap(), autogen::DESCRIPTION_SYSTEM);
+        let user = completer.last_user.lock().unwrap().clone();
+        assert!(user.contains("发布手册") && user.contains("--- FILE: deploy.md ---"), "{user}");
+        // Stateless: no base row was created, nothing written to the dir.
+        assert!(service.list_bases().await.unwrap().is_empty());
+        assert!(!docs.join("README.md").exists());
+
+        // Clamp: an over-long model description is cut to the shared cap.
+        service.set_completer(ScriptedCompleter::new(&[&format!(
+            r#"{{"description":"{}"}}"#,
+            "知".repeat(300)
+        )]));
+        let description = service
+            .generate_description_for_path("", &docs.to_string_lossy(), None)
+            .await
+            .unwrap();
+        assert_eq!(description.chars().count(), autogen::DESCRIPTION_MAX_CHARS);
+    }
+
+    #[tokio::test]
+    async fn generate_description_for_path_validates_input() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+
+        // No completer wired → same 409 as the kb-bound autogen.
+        let err = service.generate_description_for_path("x", &docs.to_string_lossy(), None).await.unwrap_err();
+        assert!(matches!(err, AppError::Conflict(_)), "{err:?}");
+        assert!(err.to_string().contains("no AI completer"), "{err}");
+
+        service.set_completer(ScriptedCompleter::new(&[r#"{"description":"d"}"#]));
+        // Empty / relative / missing root paths → 400.
+        for bad in ["", "  ", "relative/path"] {
+            let err = service.generate_description_for_path("x", bad, None)
+            .await.unwrap_err();
+            assert!(matches!(err, AppError::BadRequest(_)), "{bad:?} → {err:?}");
+        }
+        let missing = dir.path().join("nope");
+        let err = service.generate_description_for_path("x", &missing.to_string_lossy(), None).await.unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)), "{err:?}");
+        // Existing dir without markdown → 400.
+        let err = service.generate_description_for_path("x", &docs.to_string_lossy(), None).await.unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn generate_description_retries_once_then_bad_gateway() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("a.md"), "# A").unwrap();
+
+        // First reply unparseable, second good → succeeds with two calls.
+        let completer = ScriptedCompleter::new(&["我不会输出 JSON", r#"{"description":"第二次成功"}"#]);
+        service.set_completer(completer.clone());
+        let description = service.generate_description_for_path("", &docs.to_string_lossy(), None)
+            .await.unwrap();
+        assert_eq!(description, "第二次成功");
+        assert_eq!(completer.calls.load(Ordering::SeqCst), 2);
+
+        // Garbage twice → 502, exactly two attempts.
+        let completer = ScriptedCompleter::new(&["nope"]);
+        service.set_completer(completer.clone());
+        let err = service.generate_description_for_path("", &docs.to_string_lossy(), None)
+            .await.unwrap_err();
+        assert!(matches!(err, AppError::BadGateway(_)), "{err:?}");
+        assert_eq!(completer.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn polish_description_rewrites_draft_statelessly() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+
+        // No completer wired → 409.
+        let err = service.polish_description("库", "草稿", None).await.unwrap_err();
+        assert!(matches!(err, AppError::Conflict(_)), "{err:?}");
+
+        let completer = ScriptedCompleter::new(&[r#"{"description":"覆盖部署流程与排障要点，发布前后查阅。"}"#]);
+        service.set_completer(completer.clone());
+
+        // Empty draft → 400 (completer never called).
+        let err = service.polish_description("库", "   ", None).await.unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)), "{err:?}");
+        assert_eq!(completer.calls.load(Ordering::SeqCst), 0);
+
+        let description = service.polish_description("运维库", "  记录部署和排障  ", None).await.unwrap();
+        assert_eq!(description, "覆盖部署流程与排障要点，发布前后查阅。");
+        assert_eq!(*completer.last_system.lock().unwrap(), autogen::POLISH_SYSTEM);
+        let user = completer.last_user.lock().unwrap().clone();
+        assert!(user.contains("运维库") && user.contains("记录部署和排障"), "{user}");
+        // Stateless: nothing registered.
+        assert!(service.list_bases().await.unwrap().is_empty());
+    }
+
+    // ── URL sources ──────────────────────────────────────────────────
+
+    fn url_source(mode: KnowledgeSourceMode, urls: &[&str]) -> KnowledgeSource {
+        KnowledgeSource {
+            kind: "url".into(),
+            mode,
+            entries: urls
+                .iter()
+                .map(|u| KnowledgeSourceEntry {
+                    url: (*u).to_owned(),
+                    title: None,
+                    rendered: false,
+                    ..Default::default()
+                })
+                .collect(),
+            // A client-sent value must be discarded by create.
+            last_fetched_at: Some(42),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn source_identity_ignores_url_fragments() {
+        assert_eq!(
+            normalize_source_url("https://example.com/docs#intro").unwrap(),
+            normalize_source_url("https://example.com/docs#api").unwrap()
+        );
+    }
+
+    #[test]
+    fn source_relationship_rewrite_preserves_legacy_yaml_frontmatter() {
+        let source_item_id = KnowledgeSourceItemId::new();
+        let legacy = "---\nsource_url: https://example.com/docs\nfetched_at: now\n---\n\nbody\n";
+        let detached = rewrite_snapshot_relationship(legacy, &source_item_id, "detached")
+            .unwrap();
+        assert!(detached.starts_with("---\nsource_url:"));
+        assert!(detached.contains(&format!(
+            "nomifun_source_item_id: {source_item_id}\nnomifun_source_relationship: detached\n---"
+        )));
+        assert_eq!(
+            source_url::snapshot_source_item_id(&detached).as_ref(),
+            Some(&source_item_id)
+        );
+        assert_eq!(
+            source_url::snapshot_source_relationship(&detached),
+            Some("detached")
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_web_document_moves_with_its_parent_and_refreshes_in_place() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = nomifun_db::init_database_memory().await.unwrap();
+        let (fetcher, body) = MutableSourceFetcher::new("# Version one");
+        let service = managed_source_sqlite_service(
+            &database,
+            &dir.path().join("data"),
+            fetcher,
+        );
+        let info = service
+            .create_base(
+                "managed-web",
+                "",
+                None,
+                Some(url_source(
+                    KnowledgeSourceMode::Snapshot,
+                    &["https://example.com/docs"],
+                )),
+            )
+            .await
+            .unwrap();
+        let snapshots = service
+            .list_tree(info.knowledge_base_id.as_str(), "snapshots")
+            .await
+            .unwrap();
+        let managed = snapshots.into_iter().find(|entry| entry.is_file).unwrap();
+        assert_eq!(
+            managed.source.as_ref().map(|source| source.relationship),
+            Some(KnowledgeEntrySourceRelationship::Managed)
+        );
+        assert!(!managed.capabilities.edit_content);
+        assert!(managed.capabilities.relocate);
+
+        service
+            .create_folder(info.knowledge_base_id.as_str(), "category")
+            .await
+            .unwrap();
+        let moved = service
+            .relocate_tree_entry(
+                info.knowledge_base_id.as_str(),
+                RelocateTreeEntryRequest {
+                    request_id: generate_id(),
+                    source_path: managed.rel_path.clone(),
+                    destination_parent_path: "category".into(),
+                    entry_id: managed.entry_id.clone(),
+                    destination_parent_id: None,
+                    new_name: None,
+                    expected_revision: managed.revision,
+                    conflict_policy: RelocateConflictPolicy::Reject,
+                },
+            )
+            .await
+            .unwrap();
+        service
+            .create_folder(info.knowledge_base_id.as_str(), "archive")
+            .await
+            .unwrap();
+        service
+            .relocate_tree_entry(
+                info.knowledge_base_id.as_str(),
+                RelocateTreeEntryRequest {
+                    request_id: generate_id(),
+                    source_path: "category".into(),
+                    destination_parent_path: "archive".into(),
+                    entry_id: None,
+                    destination_parent_id: None,
+                    new_name: None,
+                    expected_revision: None,
+                    conflict_policy: RelocateConflictPolicy::Reject,
+                },
+            )
+            .await
+            .unwrap();
+        let current = service
+            .list_tree(info.knowledge_base_id.as_str(), "archive/category")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.entry_id == managed.entry_id)
+            .unwrap();
+        *body.lock().unwrap() = "# Version two".into();
+        let refreshed = service
+            .refresh_entry_source(
+                info.knowledge_base_id.as_str(),
+                current.entry_id.as_ref().unwrap(),
+                current.revision.unwrap(),
+            )
+            .await
+            .unwrap();
+        let refreshed_entry = refreshed.entry.unwrap();
+        assert_eq!(refreshed_entry.rel_path, format!("archive/{}", moved.new_path));
+        let root = PathBuf::from(&info.root_path);
+        let content = std::fs::read_to_string(root.join(&refreshed_entry.rel_path)).unwrap();
+        assert!(content.contains("Version two"));
+        assert!(!root.join(&managed.rel_path).exists());
+        let write_error = service
+            .write_file(
+                info.knowledge_base_id.as_str(),
+                &refreshed_entry.rel_path,
+                "user overwrite",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(write_error, AppError::Forbidden(_)));
+
+        service
+            .write_file(
+                info.knowledge_base_id.as_str(),
+                "snapshots/manual.md",
+                "user note",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("snapshots/manual.md")).unwrap(),
+            "user note"
+        );
+        let manual = service
+            .list_tree(info.knowledge_base_id.as_str(), "snapshots")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == "manual.md")
+            .unwrap();
+        assert_eq!(manual.origin.as_deref(), Some(KNOWLEDGE_ENTRY_ORIGIN_USER));
+        assert!(manual.source.is_none());
+        assert!(manual.capabilities.edit_content);
+    }
+
+    #[tokio::test]
+    async fn managed_web_copy_and_detach_are_editable_and_independent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = nomifun_db::init_database_memory().await.unwrap();
+        let (fetcher, body) = MutableSourceFetcher::new("original body");
+        let service = managed_source_sqlite_service(
+            &database,
+            &dir.path().join("data"),
+            fetcher,
+        );
+        let info = service
+            .create_base(
+                "copy-detach",
+                "",
+                None,
+                Some(url_source(
+                    KnowledgeSourceMode::Snapshot,
+                    &["https://example.com/copy"],
+                )),
+            )
+            .await
+            .unwrap();
+        let managed = service
+            .list_tree(info.knowledge_base_id.as_str(), "snapshots")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.is_file)
+            .unwrap();
+        let copied = service
+            .copy_entry_as_editable(
+                info.knowledge_base_id.as_str(),
+                managed.entry_id.as_ref().unwrap(),
+                managed.revision.unwrap(),
+                "",
+                None,
+                Some("editable-copy.md"),
+            )
+            .await
+            .unwrap()
+            .entry
+            .unwrap();
+        assert!(copied.capabilities.edit_content);
+        assert_eq!(
+            copied.source.as_ref().map(|source| source.relationship),
+            Some(KnowledgeEntrySourceRelationship::Copy)
+        );
+        service
+            .write_file(
+                info.knowledge_base_id.as_str(),
+                &copied.rel_path,
+                "my independent edits",
+            )
+            .await
+            .unwrap();
+        *body.lock().unwrap() = "refreshed original".into();
+        let refreshed = service
+            .refresh_entry_source(
+                info.knowledge_base_id.as_str(),
+                managed.entry_id.as_ref().unwrap(),
+                managed.revision.unwrap(),
+            )
+            .await
+            .unwrap()
+            .entry
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(PathBuf::from(&info.root_path).join(&copied.rel_path))
+                .unwrap(),
+            "my independent edits"
+        );
+        let detached = service
+            .detach_entry_source(
+                info.knowledge_base_id.as_str(),
+                refreshed.entry_id.as_ref().unwrap(),
+                refreshed.revision.unwrap(),
+            )
+            .await
+            .unwrap()
+            .entry
+            .unwrap();
+        assert!(detached.capabilities.edit_content);
+        assert_eq!(
+            detached.source.as_ref().map(|source| source.relationship),
+            Some(KnowledgeEntrySourceRelationship::Detached)
+        );
+        service
+            .write_file(
+                info.knowledge_base_id.as_str(),
+                &detached.rel_path,
+                "detached edits",
+            )
+            .await
+            .unwrap();
+        let refresh_error = service
+            .refresh_entry_source(
+                info.knowledge_base_id.as_str(),
+                detached.entry_id.as_ref().unwrap(),
+                detached.revision.unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(refresh_error, AppError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn managed_web_refresh_preserves_external_edits_as_a_conflict() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = nomifun_db::init_database_memory().await.unwrap();
+        let (fetcher, body) = MutableSourceFetcher::new("baseline");
+        let service = managed_source_sqlite_service(
+            &database,
+            &dir.path().join("data"),
+            fetcher,
+        );
+        let info = service
+            .create_base(
+                "conflict",
+                "",
+                None,
+                Some(url_source(
+                    KnowledgeSourceMode::Snapshot,
+                    &["https://example.com/conflict"],
+                )),
+            )
+            .await
+            .unwrap();
+        let managed = service
+            .list_tree(info.knowledge_base_id.as_str(), "snapshots")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.is_file)
+            .unwrap();
+        let path = PathBuf::from(&info.root_path).join(&managed.rel_path);
+        let mut edited = std::fs::read_to_string(&path).unwrap();
+        edited.push_str("\nUSER EXTERNAL EDIT\n");
+        std::fs::write(&path, &edited).unwrap();
+        *body.lock().unwrap() = "network changed".into();
+        let result = service
+            .refresh_entry_source(
+                info.knowledge_base_id.as_str(),
+                managed.entry_id.as_ref().unwrap(),
+                managed.revision.unwrap(),
+            )
+            .await
+            .unwrap();
+        let summary = result.source_fetch.unwrap();
+        assert_eq!(summary.fetched, 0);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+        assert_eq!(
+            result
+                .entry
+                .unwrap()
+                .source
+                .unwrap()
+                .sync_status,
+            KnowledgeSourceSyncStatus::Conflicted
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_managed_source_markers_fail_closed_without_overwriting_either_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = nomifun_db::init_database_memory().await.unwrap();
+        let (fetcher, body) = MutableSourceFetcher::new("baseline");
+        let service = managed_source_sqlite_service(
+            &database,
+            &dir.path().join("data"),
+            fetcher,
+        );
+        let info = service
+            .create_base(
+                "duplicate-marker",
+                "",
+                None,
+                Some(url_source(
+                    KnowledgeSourceMode::Snapshot,
+                    &["https://example.com/duplicate"],
+                )),
+            )
+            .await
+            .unwrap();
+        let managed = service
+            .list_tree(info.knowledge_base_id.as_str(), "snapshots")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.is_file)
+            .unwrap();
+        let root = PathBuf::from(&info.root_path);
+        std::fs::copy(root.join(&managed.rel_path), root.join("duplicate.md")).unwrap();
+        service.mark_projection_dirty(&service.require_base(info.knowledge_base_id.as_str()).await.unwrap());
+        let _ = service
+            .list_tree(info.knowledge_base_id.as_str(), "")
+            .await
+            .unwrap();
+        let current = service
+            .list_entry_by_id(
+                info.knowledge_base_id.as_str(),
+                managed.entry_id.as_ref().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            current.source.as_ref().unwrap().sync_status,
+            KnowledgeSourceSyncStatus::Conflicted
+        );
+        let original_before = std::fs::read_to_string(root.join(&current.rel_path)).unwrap();
+        let duplicate_before = std::fs::read_to_string(root.join("duplicate.md")).unwrap();
+        *body.lock().unwrap() = "network replacement".into();
+        let result = service
+            .refresh_entry_source(
+                info.knowledge_base_id.as_str(),
+                current.entry_id.as_ref().unwrap(),
+                current.revision.unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.source_fetch.unwrap().fetched, 0);
+        assert_eq!(
+            std::fs::read_to_string(root.join(&current.rel_path)).unwrap(),
+            original_before
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("duplicate.md")).unwrap(),
+            duplicate_before
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_source_hash_recovers_crash_after_file_write_without_false_conflict() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = nomifun_db::init_database_memory().await.unwrap();
+        let (fetcher, _) = MutableSourceFetcher::new("baseline");
+        let service = managed_source_sqlite_service(
+            &database,
+            &dir.path().join("data"),
+            fetcher,
+        );
+        let info = service
+            .create_base(
+                "pending-hash",
+                "",
+                None,
+                Some(url_source(
+                    KnowledgeSourceMode::Snapshot,
+                    &["https://example.com/pending"],
+                )),
+            )
+            .await
+            .unwrap();
+        let managed = service
+            .list_tree(info.knowledge_base_id.as_str(), "snapshots")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.is_file)
+            .unwrap();
+        let source = managed.source.as_ref().unwrap();
+        let repository = nomifun_db::SqliteKnowledgeRepository::new(database.pool().clone());
+        let item = repository
+            .get_source_item(&source.source_item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let attempted = repository
+            .record_sync_attempt(&item.knowledge_source_item_id, item.revision, now_ms())
+            .await
+            .unwrap();
+        let content = source_url::managed_snapshot_markdown(
+            &item.knowledge_source_item_id,
+            &item.requested_url,
+            Some(&item.requested_url),
+            "2026-01-01T00:00:00Z",
+            Some("Recovered"),
+            false,
+            "body published before crash",
+        );
+        let pending_hash = sha256_text(&content);
+        let staged = repository
+            .stage_sync_publication(&StageKnowledgeSourcePublicationParams {
+                knowledge_source_item_id: item.knowledge_source_item_id.clone(),
+                expected_revision: attempted.revision,
+                pending_published_hash: pending_hash.clone(),
+                pending_final_url: Some(item.requested_url.clone()),
+                pending_title: Some("Recovered".into()),
+                staged_at: now_ms(),
+            })
+            .await
+            .unwrap();
+        let path = PathBuf::from(&info.root_path).join(&managed.rel_path);
+        write_text_atomic(&path, &content).await.unwrap();
+
+        assert_eq!(service.recover_pending_source_publications(
+            &service.require_base(info.knowledge_base_id.as_str()).await.unwrap()
+        ).await.unwrap(), 1);
+        let recovered = repository
+            .get_source_item(&item.knowledge_source_item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.revision, staged.revision + 1);
+        assert_eq!(recovered.sync_status, KnowledgeSourceItemSyncStatus::Synced);
+        assert_eq!(recovered.last_published_hash.as_deref(), Some(pending_hash.as_str()));
+        assert!(recovered.pending_published_hash.is_none());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn removing_last_managed_web_source_trashes_document_and_clears_web_kind() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = nomifun_db::init_database_memory().await.unwrap();
+        let (fetcher, _) = MutableSourceFetcher::new("remove me");
+        let service = managed_source_sqlite_service(
+            &database,
+            &dir.path().join("data"),
+            fetcher,
+        );
+        let info = service
+            .create_base(
+                "remove-source",
+                "",
+                None,
+                Some(url_source(
+                    KnowledgeSourceMode::Snapshot,
+                    &["https://example.com/remove"],
+                )),
+            )
+            .await
+            .unwrap();
+        let managed = service
+            .list_tree(info.knowledge_base_id.as_str(), "snapshots")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.is_file)
+            .unwrap();
+        let copy = service
+            .copy_entry_as_editable(
+                info.knowledge_base_id.as_str(),
+                managed.entry_id.as_ref().unwrap(),
+                managed.revision.unwrap(),
+                "",
+                None,
+                Some("kept-copy.md"),
+            )
+            .await
+            .unwrap()
+            .entry
+            .unwrap();
+        let result = service
+            .remove_entry_source(
+                info.knowledge_base_id.as_str(),
+                managed.entry_id.as_ref().unwrap(),
+                managed.revision.unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(result.removed);
+        assert!(!PathBuf::from(&info.root_path).join(&managed.rel_path).exists());
+        let updated = service
+            .get_base_info(info.knowledge_base_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(updated.kind, "blank");
+        assert!(updated.source.is_none());
+        assert!(PathBuf::from(&info.root_path).join(".nomifun-trash").is_dir());
+        let retained_copy = service
+            .list_entry_by_id(
+                info.knowledge_base_id.as_str(),
+                copy.entry_id.as_ref().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(retained_copy.capabilities.edit_content);
+        assert_eq!(
+            retained_copy.source.unwrap().relationship,
+            KnowledgeEntrySourceRelationship::Copy
+        );
+    }
+
+    #[tokio::test]
+    async fn adding_web_content_reuses_the_selected_destination_folder() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = nomifun_db::init_database_memory().await.unwrap();
+        let (fetcher, _) = MutableSourceFetcher::new("captured in category");
+        let service = managed_source_sqlite_service(
+            &database,
+            &dir.path().join("data"),
+            fetcher,
+        );
+        let info = service.create_base("blank", "", None, None).await.unwrap();
+        service
+            .create_folder(info.knowledge_base_id.as_str(), "research")
+            .await
+            .unwrap();
+        let folder = service
+            .list_tree(info.knowledge_base_id.as_str(), "")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.rel_path == "research")
+            .unwrap();
+        let summary = service
+            .append_url_entries_into(
+                info.knowledge_base_id.as_str(),
+                vec![KnowledgeSourceEntry {
+                    url: "https://example.com/research".into(),
+                    ..Default::default()
+                }],
+                "research",
+                folder.entry_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary.fetched, 1);
+        assert!(
+            summary
+                .first_file
+                .as_deref()
+                .is_some_and(|path| path.starts_with("research/"))
+        );
+        let captured = service
+            .list_tree(info.knowledge_base_id.as_str(), "research")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.is_file)
+            .unwrap();
+        assert_eq!(
+            captured.source.unwrap().relationship,
+            KnowledgeEntrySourceRelationship::Managed
+        );
+    }
+
+    #[tokio::test]
+    async fn explicitly_readding_a_removed_url_creates_a_fresh_source_item() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = nomifun_db::init_database_memory().await.unwrap();
+        let (fetcher, _) = MutableSourceFetcher::new("captured");
+        let service = managed_source_sqlite_service(
+            &database,
+            &dir.path().join("data"),
+            fetcher,
+        );
+        let removed_url = "https://example.com/readd";
+        let info = service
+            .create_base(
+                "readd",
+                "",
+                None,
+                Some(url_source(
+                    KnowledgeSourceMode::Snapshot,
+                    &[removed_url, "https://example.com/keep"],
+                )),
+            )
+            .await
+            .unwrap();
+        let removed_entry = service
+            .list_tree(info.knowledge_base_id.as_str(), "snapshots")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.source.as_ref().is_some_and(|source| source.source_url == removed_url))
+            .unwrap();
+        let old_source_item_id = removed_entry.source.as_ref().unwrap().source_item_id.clone();
+        service
+            .remove_entry_source(
+                info.knowledge_base_id.as_str(),
+                removed_entry.entry_id.as_ref().unwrap(),
+                removed_entry.revision.unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let summary = service
+            .append_url_entries_into(
+                info.knowledge_base_id.as_str(),
+                vec![KnowledgeSourceEntry {
+                    url: removed_url.into(),
+                    ..Default::default()
+                }],
+                "",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary.added, 1);
+        assert_eq!(summary.fetched, 1);
+        let readded = service
+            .list_tree(info.knowledge_base_id.as_str(), "snapshots")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.source.as_ref().is_some_and(|source| source.source_url == removed_url))
+            .unwrap();
+        assert_ne!(readded.source.unwrap().source_item_id, old_source_item_id);
+    }
+
+    #[tokio::test]
+    async fn root_web_add_clears_a_deleted_default_parent_from_db_and_extra() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = nomifun_db::init_database_memory().await.unwrap();
+        let (fetcher, _) = MutableSourceFetcher::new("captured");
+        let service = managed_source_sqlite_service(
+            &database,
+            &dir.path().join("data"),
+            fetcher,
+        );
+        let info = service.create_base("default-parent", "", None, None).await.unwrap();
+        service
+            .create_folder(info.knowledge_base_id.as_str(), "destination")
+            .await
+            .unwrap();
+        let destination = service
+            .list_tree(info.knowledge_base_id.as_str(), "")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.rel_path == "destination")
+            .unwrap();
+        service
+            .append_url_entries_into(
+                info.knowledge_base_id.as_str(),
+                vec![KnowledgeSourceEntry {
+                    url: "https://example.com/first".into(),
+                    ..Default::default()
+                }],
+                "destination",
+                destination.entry_id.clone(),
+            )
+            .await
+            .unwrap();
+        let captured = service
+            .list_tree(info.knowledge_base_id.as_str(), "destination")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.is_file)
+            .unwrap();
+        service
+            .relocate_tree_entry(
+                info.knowledge_base_id.as_str(),
+                RelocateTreeEntryRequest {
+                    request_id: generate_id(),
+                    source_path: captured.rel_path,
+                    destination_parent_path: String::new(),
+                    entry_id: captured.entry_id,
+                    destination_parent_id: None,
+                    new_name: None,
+                    expected_revision: captured.revision,
+                    conflict_policy: RelocateConflictPolicy::Reject,
+                },
+            )
+            .await
+            .unwrap();
+        let destination = service
+            .list_tree(info.knowledge_base_id.as_str(), "")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.rel_path == "destination")
+            .unwrap();
+        service
+            .delete_folder_entry(
+                info.knowledge_base_id.as_str(),
+                "destination",
+                destination.entry_id.as_ref(),
+                destination.revision,
+            )
+            .await
+            .unwrap();
+        let summary = service
+            .append_url_entries_into(
+                info.knowledge_base_id.as_str(),
+                vec![KnowledgeSourceEntry {
+                    url: "https://example.com/second".into(),
+                    ..Default::default()
+                }],
+                "",
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(summary.first_file.as_deref().is_some_and(|path| path.starts_with("snapshots/")));
+        let repository = nomifun_db::SqliteKnowledgeRepository::new(database.pool().clone());
+        let normalized = repository
+            .list_sources_for_base(&info.knowledge_base_id, false)
+            .await
+            .unwrap()
+            .remove(0);
+        assert!(normalized.default_parent_entry_id.is_none());
+        let cached = source_from_extra(
+            &service
+                .require_base(info.knowledge_base_id.as_str())
+                .await
+                .unwrap()
+                .extra,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(cached.default_parent_entry_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn boot_repairs_ghost_extra_after_source_item_removal_commit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = nomifun_db::init_database_memory().await.unwrap();
+        let (fetcher, _) = MutableSourceFetcher::new("captured");
+        let service = Arc::new(managed_source_sqlite_service(
+            &database,
+            &dir.path().join("data"),
+            fetcher,
+        ));
+        let info = service
+            .create_base(
+                "ghost-cache",
+                "",
+                None,
+                Some(url_source(
+                    KnowledgeSourceMode::Snapshot,
+                    &["https://example.com/ghost"],
+                )),
+            )
+            .await
+            .unwrap();
+        let managed = service
+            .list_tree(info.knowledge_base_id.as_str(), "snapshots")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.is_file)
+            .unwrap();
+        let repository = nomifun_db::SqliteKnowledgeRepository::new(database.pool().clone());
+        let provenance = repository
+            .get_entry_provenance(managed.entry_id.as_ref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let item = repository
+            .get_source_item(&provenance.knowledge_source_item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        repository
+            .remove_managed_source_item(
+                managed.entry_id.as_ref().unwrap(),
+                provenance.revision,
+                item.revision,
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            source_from_extra(
+                &service
+                    .require_base(info.knowledge_base_id.as_str())
+                    .await
+                    .unwrap()
+                    .extra,
+            )
+            .unwrap()
+            .is_some()
+        );
+        service.clone().resume_pending_source_fetches().await;
+        let repaired = service
+            .get_base_info(info.knowledge_base_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(repaired.kind, "blank");
+        assert!(repaired.source.is_none());
+        let detached = service
+            .list_entry_by_id(
+                info.knowledge_base_id.as_str(),
+                managed.entry_id.as_ref().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(detached.capabilities.edit_content);
+        assert_eq!(
+            detached.source.unwrap().relationship,
+            KnowledgeEntrySourceRelationship::Detached
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_resume_recovers_normalized_syncing_items_even_with_an_old_global_stamp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = nomifun_db::init_database_memory().await.unwrap();
+        let (fetcher, body) = MutableSourceFetcher::new("before restart");
+        let service = Arc::new(managed_source_sqlite_service(
+            &database,
+            &dir.path().join("data"),
+            fetcher,
+        ));
+        let info = service
+            .create_base(
+                "resume-normalized",
+                "",
+                None,
+                Some(url_source(
+                    KnowledgeSourceMode::Snapshot,
+                    &["https://example.com/resume"],
+                )),
+            )
+            .await
+            .unwrap();
+        let repository = nomifun_db::SqliteKnowledgeRepository::new(database.pool().clone());
+        let source = repository
+            .list_sources_for_base(&info.knowledge_base_id, false)
+            .await
+            .unwrap()
+            .remove(0);
+        let item = repository
+            .list_source_items(&source.knowledge_source_id, false)
+            .await
+            .unwrap()
+            .remove(0);
+        repository
+            .record_sync_attempt(
+                &item.knowledge_source_item_id,
+                item.revision,
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        *body.lock().unwrap() = "after restart".into();
+        service.clone().resume_pending_source_fetches().await;
+
+        let refreshed_item = repository
+            .get_source_item(&item.knowledge_source_item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            refreshed_item.sync_status,
+            KnowledgeSourceItemSyncStatus::Synced
+        );
+        let managed = service
+            .list_tree(info.knowledge_base_id.as_str(), "snapshots")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.is_file)
+            .unwrap();
+        assert!(
+            std::fs::read_to_string(PathBuf::from(info.root_path).join(managed.rel_path))
+                .unwrap()
+                .contains("after restart")
+        );
+    }
+
+    fn service_with_repo(dir: &Path) -> (KnowledgeService, Arc<MemRepo>) {
+        let repo = Arc::new(MemRepo::default());
+        let service = KnowledgeService::new(
+            repo.clone(),
+            dir,
+            KnowledgeEventEmitter::new(
+                Arc::new(NoopBroadcaster),
+                Arc::from(TEST_OWNER_ID),
+            ),
+        )
+        .with_url_fetcher(HttpFetcher::new().allow_private_for_tests());
+        (service, repo)
+    }
+
+    fn extra_source(repo: &MemRepo, kb_id: &str) -> Option<KnowledgeSource> {
+        let row = repo
+            .bases
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.knowledge_base_id == kb_id)
+            .cloned()
+            .unwrap();
+        source_from_extra(&row.extra).expect("test fixture extra must be canonical JSON")
+    }
+
+    #[tokio::test]
+    async fn folder_import_preserves_tree_and_allocates_without_overwrite() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let kb = service.create_base("notes", "", None, None).await.unwrap();
+        let source = dir.path().join("team-notes");
+        std::fs::create_dir_all(source.join("guides")).unwrap();
+        std::fs::write(source.join("README.md"), "# Team notes\n").unwrap();
+        std::fs::write(source.join("guides/setup.md"), "# Setup\n").unwrap();
+        std::fs::write(source.join("ignored.txt"), "not knowledge").unwrap();
+
+        let first = service
+            .import_markdown_folder(kb.knowledge_base_id.as_str(), source.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(first.target_directory, "team-notes");
+        assert_eq!(first.imported, 2);
+        assert_eq!(first.skipped, 1);
+        assert_eq!(first.first_file.as_deref(), Some("team-notes/README.md"));
+        assert_eq!(
+            std::fs::read_to_string(PathBuf::from(&kb.root_path).join("team-notes/guides/setup.md")).unwrap(),
+            "# Setup\n"
+        );
+
+        let second = service
+            .import_markdown_folder(kb.knowledge_base_id.as_str(), source.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(second.target_directory, "team-notes (2)");
+        assert_eq!(std::fs::read_to_string(source.join("README.md")).unwrap(), "# Team notes\n");
+
+        service
+            .create_folder(kb.knowledge_base_id.as_str(), "archive")
+            .await
+            .unwrap();
+        let nested = service
+            .import_markdown_folder_into(
+                kb.knowledge_base_id.as_str(),
+                source.to_str().unwrap(),
+                "archive",
+            )
+            .await
+            .unwrap();
+        assert_eq!(nested.target_directory, "archive/team-notes");
+        assert_eq!(
+            nested.first_file.as_deref(),
+            Some("archive/team-notes/README.md")
+        );
+        assert!(PathBuf::from(&kb.root_path)
+            .join("archive/team-notes/guides/setup.md")
+            .is_file());
+
+        let overlap = service
+            .import_markdown_folder(kb.knowledge_base_id.as_str(), &kb.root_path)
+            .await
+            .unwrap_err();
+        assert!(matches!(overlap, AppError::BadRequest(_)), "{overlap:?}");
+    }
+
+    #[tokio::test]
+    async fn external_knowledge_tree_requires_explicit_edit_consent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+
+        let read_only_root = dir.path().join("external-read-only");
+        std::fs::create_dir_all(&read_only_root).unwrap();
+        std::fs::write(read_only_root.join("existing.md"), "# Existing\n").unwrap();
+        let read_only = service
+            .create_base_with_access(
+                "external",
+                "",
+                Some(read_only_root.to_str().unwrap()),
+                None,
+                Some(KnowledgeTreeAccess::ReadOnly),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_only.tree_access, KnowledgeTreeAccess::ReadOnly);
+        assert!(matches!(
+            service
+                .create_folder(read_only.knowledge_base_id.as_str(), "blocked")
+                .await,
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            service
+                .write_file(
+                    read_only.knowledge_base_id.as_str(),
+                    "existing.md",
+                    "# Changed\n",
+                )
+                .await,
+            Err(AppError::Forbidden(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(read_only_root.join("existing.md")).unwrap(),
+            "# Existing\n"
+        );
+
+        let editable_root = dir.path().join("external-editable");
+        std::fs::create_dir_all(&editable_root).unwrap();
+        let editable = service
+            .create_base_with_access(
+                "editable external",
+                "",
+                Some(editable_root.to_str().unwrap()),
+                None,
+                Some(KnowledgeTreeAccess::Editable),
+            )
+            .await
+            .unwrap();
+        assert_eq!(editable.tree_access, KnowledgeTreeAccess::Editable);
+        service
+            .create_folder(editable.knowledge_base_id.as_str(), "allowed")
+            .await
+            .unwrap();
+        assert!(editable_root.join("allowed").is_dir());
+    }
+
+    #[tokio::test]
+    async fn create_document_never_clobbers_an_existing_note() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let kb = service.create_base("notes", "", None, None).await.unwrap();
+        let created = service
+            .create_document(kb.knowledge_base_id.as_str(), "Guide.md", "# First\n")
+            .await
+            .unwrap();
+        assert_eq!(created, "Guide.md");
+        let duplicate = service
+            .create_document(kb.knowledge_base_id.as_str(), "guide.MD", "# Replacement\n")
+            .await
+            .unwrap_err();
+        assert!(matches!(duplicate, AppError::Conflict(_)), "{duplicate:?}");
+        assert_eq!(
+            std::fs::read_to_string(PathBuf::from(&kb.root_path).join("Guide.md")).unwrap(),
+            "# First\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn editor_update_is_existing_only_and_compare_and_swap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let kb = service.create_base("notes", "", None, None).await.unwrap();
+        service
+            .create_document(kb.knowledge_base_id.as_str(), "draft.md", "# One\n")
+            .await
+            .unwrap();
+
+        service
+            .update_file_if_unchanged(
+                kb.knowledge_base_id.as_str(),
+                "draft.md",
+                "# One\n",
+                "# Two\n",
+            )
+            .await
+            .unwrap();
+        let path = PathBuf::from(&kb.root_path).join("draft.md");
+        std::fs::write(&path, "# External\n").unwrap();
+        assert!(matches!(
+            service
+                .update_file_if_unchanged(
+                    kb.knowledge_base_id.as_str(),
+                    "draft.md",
+                    "# Two\n",
+                    "# Stale overwrite\n",
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# External\n");
+
+        std::fs::rename(&path, PathBuf::from(&kb.root_path).join("moved.md")).unwrap();
+        assert!(matches!(
+            service
+                .update_file_if_unchanged(
+                    kb.knowledge_base_id.as_str(),
+                    "draft.md",
+                    "# External\n",
+                    "# Must not recreate\n",
+                )
+                .await,
+            Err(AppError::NotFound(_))
+        ));
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn editor_identity_cas_follows_a_move_and_never_overwrites_a_same_content_impostor() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = nomifun_db::init_database_memory().await.unwrap();
+        let (service, _knowledge_repository, _operation_repository) = durable_sqlite_service(
+            &database,
+            &dir.path().join("data"),
+            Arc::new(NoopBroadcaster),
+        );
+        let kb = service.create_base("notes", "", None, None).await.unwrap();
+        service
+            .create_folder(kb.knowledge_base_id.as_str(), "archive")
+            .await
+            .unwrap();
+        service
+            .create_document(kb.knowledge_base_id.as_str(), "draft.md", "# Same\n")
+            .await
+            .unwrap();
+        let root_entries = service
+            .list_tree(kb.knowledge_base_id.as_str(), "")
+            .await
+            .unwrap();
+        let draft = root_entries
+            .iter()
+            .find(|entry| entry.rel_path == "draft.md")
+            .unwrap();
+        let archive = root_entries
+            .iter()
+            .find(|entry| entry.rel_path == "archive")
+            .unwrap();
+        let opened = service
+            .read_file(kb.knowledge_base_id.as_str(), "draft.md")
+            .await
+            .unwrap();
+        assert_eq!(opened.entry_id.as_ref(), draft.entry_id.as_ref());
+        assert_eq!(opened.revision, draft.revision);
+        let moved = service
+            .relocate_tree_entry(
+                kb.knowledge_base_id.as_str(),
+                RelocateTreeEntryRequest {
+                    request_id: "editor-identity-move".into(),
+                    source_path: "draft.md".into(),
+                    destination_parent_path: "archive".into(),
+                    entry_id: draft.entry_id.clone(),
+                    destination_parent_id: archive.entry_id.clone(),
+                    new_name: None,
+                    expected_revision: draft.revision,
+                    conflict_policy: RelocateConflictPolicy::Reject,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Reuse the old path with byte-identical content. Path+content CAS
+        // alone would overwrite this different document.
+        service
+            .create_document(kb.knowledge_base_id.as_str(), "draft.md", "# Same\n")
+            .await
+            .unwrap();
+        let result = service
+            .update_file_by_identity_if_unchanged(
+                kb.knowledge_base_id.as_str(),
+                "draft.md",
+                moved.entry_id.as_ref(),
+                moved.revision,
+                "# Same\n",
+                "# Updated original\n",
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.rel_path, "archive/draft.md");
+        let root = PathBuf::from(&kb.root_path);
+        assert_eq!(
+            std::fs::read_to_string(root.join("archive/draft.md")).unwrap(),
+            "# Updated original\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("draft.md")).unwrap(),
+            "# Same\n"
+        );
+
+        let stale = service
+            .update_file_by_identity_if_unchanged(
+                kb.knowledge_base_id.as_str(),
+                "archive/draft.md",
+                moved.entry_id.as_ref(),
+                moved.revision,
+                "# Updated original\n",
+                "# Stale revision\n",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(stale, AppError::Conflict(_)), "{stale:?}");
+
+        let current = service
+            .list_tree(kb.knowledge_base_id.as_str(), "archive")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.rel_path == "archive/draft.md")
+            .unwrap();
+        std::fs::remove_file(root.join("archive/draft.md")).unwrap();
+        std::fs::write(root.join("archive/draft.md"), "# Updated original\n").unwrap();
+        let replaced = service
+            .update_file_by_identity_if_unchanged(
+                kb.knowledge_base_id.as_str(),
+                "archive/draft.md",
+                current.entry_id.as_ref(),
+                current.revision,
+                "# Updated original\n",
+                "# Must not overwrite replacement\n",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(replaced, AppError::Conflict(_)), "{replaced:?}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("archive/draft.md")).unwrap(),
+            "# Updated original\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_validates_source_config() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (service, _repo) = service_with_repo(&dir.path().join("data"));
+
+        let mut bad_kind = url_source(KnowledgeSourceMode::Live, &["https://e.com"]);
+        bad_kind.kind = "carrier-pigeon".into();
+        assert!(service.create_base("x", "", None, Some(bad_kind)).await.is_err());
+
+        let empty = url_source(KnowledgeSourceMode::Live, &[]);
+        assert!(service.create_base("x", "", None, Some(empty)).await.is_err());
+
+        let ftp = url_source(KnowledgeSourceMode::Live, &["ftp://e.com/x"]);
+        assert!(service.create_base("x", "", None, Some(ftp)).await.is_err());
+
+        let credentials = url_source(
+            KnowledgeSourceMode::Live,
+            &["https://user:secret@example.com/docs"],
+        );
+        assert!(
+            service
+                .create_base("x", "", None, Some(credentials))
+                .await
+                .is_err()
+        );
+
+        let duplicate = url_source(
+            KnowledgeSourceMode::Live,
+            &[
+                "https://example.com/docs#intro",
+                "https://example.com/docs#api",
+            ],
+        );
+        assert!(
+            service
+                .create_base("x", "", None, Some(duplicate))
+                .await
+                .is_err()
+        );
+
+        assert!(service.list_bases().await.unwrap().is_empty(), "rejected creates must not register");
+    }
+
+    #[tokio::test]
+    async fn create_live_source_stores_extra_and_fills_mounts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (service, repo) = service_with_repo(&dir.path().join("data"));
+
+        let mut source = url_source(KnowledgeSourceMode::Live, &["https://example.com/api-docs"]);
+        source.entries[0].title = Some("API docs".into());
+        let kb = service.create_base("接口库", "", None, Some(source)).await.unwrap();
+
+        // Live mode never fetches: no snapshots, no fetch stamp, no
+        // create-time fetch summary.
+        assert!(!PathBuf::from(&kb.root_path).join(source_url::SNAPSHOT_REL_DIR).exists());
+        assert!(kb.source_fetch.is_none(), "live create must not report a fetch");
+        let stored = extra_source(&repo, kb.knowledge_base_id.as_str()).expect("source stored in extra");
+        assert_eq!(stored.mode, KnowledgeSourceMode::Live);
+        assert_eq!(stored.last_fetched_at, None, "client-sent stamp must be discarded");
+
+        // extra.source(live) → mounts.live_sources.
+        service
+            .set_binding(
+                "conversation",
+                TEST_CONVERSATION_ID,
+                KnowledgeBinding {
+                    enabled: true,
+                    kb_ids: vec![kb.knowledge_base_id.clone()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let outcome = service
+            .ensure_mounts_for_target("conversation", TEST_CONVERSATION_ID, &ws)
+            .await;
+        assert_eq!(outcome.mounts.len(), 1);
+        let live = &outcome.mounts[0].live_sources;
+        assert_eq!(live.len(), 1, "{live:?}");
+        assert_eq!(live[0].url, "https://example.com/api-docs");
+        assert_eq!(live[0].title.as_deref(), Some("API docs"));
+    }
+
+    #[tokio::test]
+    async fn append_url_entries_fetches_only_new_urls_and_reports_duplicates() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/new"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("new snapshot body"))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (service, repo) = service_with_repo(&dir.path().join("data"));
+        let old_url = format!("{}/old", server.uri());
+        let new_url = format!("{}/new", server.uri());
+        let kb = service
+            .create_base(
+                "mixed source",
+                "",
+                None,
+                Some(url_source(KnowledgeSourceMode::Live, &[&old_url])),
+            )
+            .await
+            .unwrap();
+
+        let summary = service
+            .append_url_entries(
+                kb.knowledge_base_id.as_str(),
+                vec![
+                    KnowledgeSourceEntry {
+                        url: old_url.clone(),
+                        title: None,
+                        rendered: false,
+                        ..Default::default()
+                    },
+                    KnowledgeSourceEntry {
+                        url: new_url.clone(),
+                        title: Some("New page".into()),
+                        rendered: false,
+                        ..Default::default()
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(summary.added, 1);
+        assert_eq!(summary.duplicates, 1);
+        assert_eq!(summary.fetched, 1);
+        assert_eq!(summary.failed, 0, "{:?}", summary.errors);
+        assert!(summary.first_file.as_deref().is_some_and(|path| path.starts_with("snapshots/")));
+        let stored = extra_source(&repo, kb.knowledge_base_id.as_str()).unwrap();
+        assert_eq!(stored.mode, KnowledgeSourceMode::Live, "append must preserve existing realtime semantics");
+        assert_eq!(stored.entries.len(), 2);
+        assert_eq!(stored.entries[1].url, new_url);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "existing live URL must not be re-fetched");
+        assert_eq!(requests[0].url.path(), "/new");
+    }
+
+    #[tokio::test]
+    async fn append_url_entries_bootstraps_a_snapshot_source_on_blank_base() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("captured page"))
+            .mount(&server)
+            .await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let (service, repo) = service_with_repo(&dir.path().join("data"));
+        let kb = service.create_base("blank", "", None, None).await.unwrap();
+        let url = format!("{}/docs", server.uri());
+
+        let summary = service
+            .append_url_entries(
+                kb.knowledge_base_id.as_str(),
+                vec![KnowledgeSourceEntry {
+                    url: url.clone(),
+                    title: None,
+                    rendered: false,
+                    ..Default::default()
+                }],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(summary.added, 1);
+        assert_eq!(summary.fetched, 1);
+        let stored = extra_source(&repo, kb.knowledge_base_id.as_str()).unwrap();
+        assert_eq!(stored.mode, KnowledgeSourceMode::Snapshot);
+        assert_eq!(stored.entries.len(), 1);
+        assert_eq!(stored.entries[0].url, url);
+    }
+
+    /// `KnowledgeBaseInfo` must carry `extra.source` on get/list — the
+    /// frontend detail page renders mode / URL count / lastFetchedAt from
+    /// it (it probes `base.source`, so the key must be present).
+    #[tokio::test]
+    async fn base_info_carries_source_on_get_and_list() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("snapshot body"))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (service, repo) = service_with_repo(&dir.path().join("data"));
+        let url = format!("{}/doc", server.uri());
+        let kb = service
+            .create_base("有源库", "", None, Some(url_source(KnowledgeSourceMode::Snapshot, &[&url])))
+            .await
+            .unwrap();
+        let stamp = extra_source(&repo, kb.knowledge_base_id.as_str())
+            .unwrap()
+            .last_fetched_at
+            .expect("snapshot create stamps last_fetched_at");
+
+        // The create response is built from the re-read row → already stamped.
+        assert_eq!(kb.source.as_ref().expect("create carries source").last_fetched_at, Some(stamp));
+
+        let got = service.get_base_info(&kb.knowledge_base_id).await.unwrap();
+        let src = got.source.as_ref().expect("get carries source");
+        assert_eq!(src.mode, KnowledgeSourceMode::Snapshot);
+        assert_eq!(src.entries.len(), 1);
+        assert_eq!(src.entries[0].url, url);
+        assert_eq!(src.last_fetched_at, Some(stamp));
+
+        let listed = service.list_bases().await.unwrap();
+        let src = listed
+            .iter()
+            .find(|b| b.knowledge_base_id == kb.knowledge_base_id)
+            .and_then(|b| b.source.as_ref())
+            .expect("list carries source");
+        assert_eq!(src.mode, KnowledgeSourceMode::Snapshot);
+        assert_eq!(src.entries.len(), 1);
+        assert_eq!(src.last_fetched_at, Some(stamp));
+
+        // Wire shape: nested source keeps its camelCase contract.
+        let v = serde_json::to_value(&got).unwrap();
+        assert_eq!(v["source"]["mode"], "snapshot");
+        assert_eq!(v["source"]["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(v["source"]["lastFetchedAt"], stamp);
+    }
+
+    /// A plain directory base has no URL source — the `source` key must
+    /// stay off the wire entirely, not serialize as `null`.
+    #[tokio::test]
+    async fn base_info_without_source_keeps_key_off_the_wire() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (service, _repo) = service_with_repo(&dir.path().join("data"));
+        let kb = service.create_base("无源库", "", None, None).await.unwrap();
+
+        let got = service.get_base_info(&kb.knowledge_base_id).await.unwrap();
+        assert!(got.source.is_none());
+        let v = serde_json::to_value(&got).unwrap();
+        assert!(v.get("source").is_none(), "no-source base must not serialize the key: {v}");
+    }
+
+    #[tokio::test]
+    async fn create_snapshot_source_fetches_and_chains_autogen() {
+        use wiremock::matchers::{method, path as urlpath};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(urlpath("/docs/guide"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "<html><head><title>接口文档</title></head><body><h1>API</h1><p>说明文字</p></body></html>",
+                "text/html; charset=utf-8",
+            ))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (service, repo) = service_with_repo(&dir.path().join("data"));
+        service.set_completer(FakeCompleter::new(OVERVIEW_JSON, ""));
+
+        let url = format!("{}/docs/guide", server.uri());
+        let kb = service
+            .create_base("接口库", "", None, Some(url_source(KnowledgeSourceMode::Snapshot, &[&url])))
+            .await
+            .unwrap();
+
+        // Snapshot landed with its readable metadata header.
+        let snap_dir = PathBuf::from(&kb.root_path).join(source_url::SNAPSHOT_REL_DIR);
+        let snaps: Vec<_> = std::fs::read_dir(&snap_dir).unwrap().flatten().collect();
+        assert_eq!(snaps.len(), 1, "{snaps:?}");
+        let content = std::fs::read_to_string(snaps[0].path()).unwrap();
+        assert!(
+            content.starts_with(&format!("> **source_url**: {url}\n> **fetched_at**: ")),
+            "got: {content}"
+        );
+        assert!(content.contains("# API"), "got: {content}");
+
+        // Source stamped + entry title backfilled from <title>.
+        let stored = extra_source(&repo, kb.knowledge_base_id.as_str()).unwrap();
+        assert!(stored.last_fetched_at.is_some());
+        assert_eq!(stored.entries[0].title.as_deref(), Some("接口文档"));
+
+        // Chained autogen: description + README, returned info is final.
+        assert_eq!(kb.description, "AI 生成的描述");
+        let readme = std::fs::read_to_string(PathBuf::from(&kb.root_path).join("README.md")).unwrap();
+        assert!(readme.starts_with("# 接口库"), "got: {readme}");
+    }
+
+    #[tokio::test]
+    async fn create_snapshot_without_completer_is_silent_and_dedupes_same_slug_urls() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("plain body"))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (service, repo) = service_with_repo(&dir.path().join("data"));
+        // No completer wired: snapshots still land, autogen silently skipped.
+        let url = format!("{}/page", server.uri());
+        let same_slug_url = format!("{url}?view=2");
+        let kb = service
+            .create_base(
+                "双份库",
+                "",
+                None,
+                Some(url_source(
+                    KnowledgeSourceMode::Snapshot,
+                    &[&url, &same_slug_url],
+                )),
+            )
+            .await
+            .unwrap();
+
+        let snap_dir = PathBuf::from(&kb.root_path).join(source_url::SNAPSHOT_REL_DIR);
+        let mut names: Vec<String> = std::fs::read_dir(&snap_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 2, "different same-slug URLs must suffix, not overwrite: {names:?}");
+        assert!(names.iter().any(|n| n.ends_with("-2.md")), "{names:?}");
+        assert!(!PathBuf::from(&kb.root_path).join("README.md").exists(), "no completer → no README");
+        assert_eq!(kb.description, "");
+        assert!(extra_source(&repo, kb.knowledge_base_id.as_str()).unwrap().last_fetched_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn oversized_snapshot_compressed_via_completer() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/plain")
+                    .set_body_string("x".repeat(autogen::SNAPSHOT_COMPRESS_THRESHOLD + 1024)),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (service, _repo) = service_with_repo(&dir.path().join("data"));
+        // Overview reply is garbage on purpose: the chained autogen failing
+        // must not fail the create.
+        service.set_completer(FakeCompleter::new("not json", "## 要点\n- 已压缩"));
+
+        let url = format!("{}/big", server.uri());
+        let kb = service
+            .create_base("大页库", "", None, Some(url_source(KnowledgeSourceMode::Snapshot, &[&url])))
+            .await
+            .unwrap();
+
+        let snap_dir = PathBuf::from(&kb.root_path).join(source_url::SNAPSHOT_REL_DIR);
+        let snap = std::fs::read_dir(&snap_dir).unwrap().flatten().next().unwrap();
+        let content = std::fs::read_to_string(snap.path()).unwrap();
+        assert!(content.contains("## 要点"), "oversized page must be condensed: {}", &content[..200.min(content.len())]);
+        assert!(!content.contains("xxxxxxxxxx"), "raw body must be replaced");
+    }
+
+    /// **P3-K3 end-to-end routing**: a snapshot source with one `rendered`
+    /// entry and one plain entry must write the browser-backed body for the
+    /// rendered URL and the HTTP body for the plain one — proving the
+    /// `entry.rendered → fetcher_for → snapshot` chain selects per-entry.
+    /// Deterministic (canned render fetcher, mock HTTP server) — no real Chrome.
+    #[tokio::test]
+    async fn rendered_entry_uses_render_backend_per_source() {
+        use crate::source_url::FetchedPage;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Render backend stamps a marker no HTTP fetch could produce.
+        struct MarkerRenderFetcher;
+        #[async_trait::async_trait]
+        impl PageFetcher for MarkerRenderFetcher {
+            async fn fetch_page(&self, raw_url: &str) -> Result<FetchedPage, AppError> {
+                Ok(FetchedPage {
+                    final_url: raw_url.to_owned(),
+                    title: Some("Rendered".into()),
+                    markdown: "RENDERED-BY-BROWSER only a headless browser sees this".into(),
+                    truncated: false,
+                })
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-type", "text/plain").set_body_string("PLAIN-HTTP-BODY"))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (service, _repo) = service_with_repo(&dir.path().join("data"));
+        service.set_render_fetcher(Arc::new(MarkerRenderFetcher));
+
+        let plain_url = format!("{}/plain", server.uri());
+        let rendered_url = format!("{}/spa", server.uri());
+        let source = KnowledgeSource {
+            kind: "url".into(),
+            mode: KnowledgeSourceMode::Snapshot,
+            entries: vec![
+                KnowledgeSourceEntry { url: plain_url.clone(), title: None, rendered: false, ..Default::default() },
+                KnowledgeSourceEntry { url: rendered_url.clone(), title: None, rendered: true, ..Default::default() },
+            ],
+            last_fetched_at: None,
+            ..Default::default()
+        };
+        let kb = service.create_base("混合库", "", None, Some(source)).await.unwrap();
+
+        let snap_dir = PathBuf::from(&kb.root_path).join(source_url::SNAPSHOT_REL_DIR);
+        let mut bodies: Vec<String> = std::fs::read_dir(&snap_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| std::fs::read_to_string(e.path()).unwrap())
+            .collect();
+        bodies.sort();
+        assert_eq!(bodies.len(), 2, "both entries snapshot");
+        let plain_snap = bodies.iter().find(|b| b.contains(&plain_url)).expect("plain snapshot present");
+        let rendered_snap = bodies.iter().find(|b| b.contains(&rendered_url)).expect("rendered snapshot present");
+        assert!(plain_snap.contains("PLAIN-HTTP-BODY"), "rendered=false entry must use HTTP: {plain_snap}");
+        assert!(!plain_snap.contains("RENDERED-BY-BROWSER"), "rendered=false must NOT use browser backend");
+        assert!(
+            rendered_snap.contains("RENDERED-BY-BROWSER"),
+            "rendered=true entry must use the wired browser backend: {rendered_snap}"
+        );
+    }
+
+    /// **P3-K3 graceful fallback**: a `rendered` entry with NO render backend
+    /// wired must silently fall back to HTTP and still snapshot — the flag is
+    /// best-effort, never a hard failure that blocks the fetch.
+    #[tokio::test]
+    async fn rendered_entry_without_render_backend_falls_back_to_http() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-type", "text/plain").set_body_string("HTTP-FALLBACK-BODY"))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (service, _repo) = service_with_repo(&dir.path().join("data"));
+        // No set_render_fetcher → render backend absent.
+
+        let url = format!("{}/spa", server.uri());
+        let source = KnowledgeSource {
+            kind: "url".into(),
+            mode: KnowledgeSourceMode::Snapshot,
+            entries: vec![KnowledgeSourceEntry { url: url.clone(), title: None, rendered: true, ..Default::default() }],
+            last_fetched_at: None,
+            ..Default::default()
+        };
+        let kb = service.create_base("回退库", "", None, Some(source)).await.unwrap();
+
+        let snap_dir = PathBuf::from(&kb.root_path).join(source_url::SNAPSHOT_REL_DIR);
+        let snap = std::fs::read_dir(&snap_dir).unwrap().flatten().next().expect("snapshot written despite no browser backend");
+        let content = std::fs::read_to_string(snap.path()).unwrap();
+        assert!(content.contains("HTTP-FALLBACK-BODY"), "rendered=true with no browser backend must degrade to HTTP: {content}");
+    }
+
+    #[tokio::test]
+    async fn refresh_source_overwrites_snapshots_and_stamps_time() {
+        use wiremock::matchers::{method, path as urlpath};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // First fetch sees v1, all later fetches see v2.
+        Mock::given(method("GET"))
+            .and(urlpath("/doc"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("version-one"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(urlpath("/doc"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("version-two"))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (service, repo) = service_with_repo(&dir.path().join("data"));
+        let url = format!("{}/doc", server.uri());
+        let kb = service
+            .create_base("刷新库", "", None, Some(url_source(KnowledgeSourceMode::Snapshot, &[&url])))
+            .await
+            .unwrap();
+        let first_stamp = extra_source(&repo, kb.knowledge_base_id.as_str()).unwrap().last_fetched_at.unwrap();
+        let snap_dir = PathBuf::from(&kb.root_path).join(source_url::SNAPSHOT_REL_DIR);
+        let snap_path = std::fs::read_dir(&snap_dir).unwrap().flatten().next().unwrap().path();
+        assert!(std::fs::read_to_string(&snap_path).unwrap().contains("version-one"));
+
+        let summary = service.refresh_source(&kb.knowledge_base_id).await.unwrap();
+        assert_eq!(summary.fetched, 1);
+        assert_eq!(summary.failed, 0, "{:?}", summary.errors);
+        let stamp = summary.last_fetched_at.expect("successful refresh must stamp");
+        assert!(stamp >= first_stamp);
+        // Same slug → overwritten in place, not duplicated.
+        assert_eq!(std::fs::read_dir(&snap_dir).unwrap().flatten().count(), 1);
+        assert!(std::fs::read_to_string(&snap_path).unwrap().contains("version-two"));
+        assert_eq!(extra_source(&repo, kb.knowledge_base_id.as_str()).unwrap().last_fetched_at, Some(stamp));
+
+        // A base without a source refuses to refresh.
+        let plain = service.create_base("无源库", "", None, None).await.unwrap();
+        let err = service.refresh_source(&plain.knowledge_base_id).await.unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)), "{err:?}");
+    }
+
+    /// A refresh in which every entry fails must NOT pretend freshness: the
+    /// old `extra.source.last_fetched_at` is kept (the snapshots on disk are
+    /// still the old ones) and the summary reports that old value.
+    #[tokio::test]
+    async fn refresh_source_all_failed_keeps_old_stamp() {
+        use wiremock::matchers::{method, path as urlpath};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // The create-time fetch succeeds once; every later fetch fails.
+        Mock::given(method("GET"))
+            .and(urlpath("/doc"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("original"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(urlpath("/doc"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (service, repo) = service_with_repo(&dir.path().join("data"));
+        let url = format!("{}/doc", server.uri());
+        let kb = service
+            .create_base("失败刷新库", "", None, Some(url_source(KnowledgeSourceMode::Snapshot, &[&url])))
+            .await
+            .unwrap();
+        let first_stamp = extra_source(&repo, kb.knowledge_base_id.as_str()).unwrap().last_fetched_at.expect("create stamped");
+
+        let summary = service.refresh_source(&kb.knowledge_base_id).await.unwrap();
+        assert_eq!((summary.fetched, summary.failed), (0, 1), "{:?}", summary.errors);
+        assert_eq!(summary.last_fetched_at, Some(first_stamp), "summary must report the old stamp");
+        assert_eq!(
+            extra_source(&repo, kb.knowledge_base_id.as_str()).unwrap().last_fetched_at,
+            Some(first_stamp),
+            "extra.source.lastFetchedAt must keep the old value"
+        );
+        // The old snapshot is untouched.
+        let snap_dir = PathBuf::from(&kb.root_path).join(source_url::SNAPSHOT_REL_DIR);
+        let snap = std::fs::read_dir(&snap_dir).unwrap().flatten().next().unwrap();
+        assert!(std::fs::read_to_string(snap.path()).unwrap().contains("original"));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_source_with_too_many_entries() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (service, _repo) = service_with_repo(&dir.path().join("data"));
+
+        let urls: Vec<String> = (0..=MAX_SOURCE_ENTRIES).map(|i| format!("https://example.com/{i}")).collect();
+        let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let err = service
+            .create_base("超限库", "", None, Some(url_source(KnowledgeSourceMode::Live, &refs)))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)), "{err:?}");
+        assert!(
+            err.to_string().contains(&MAX_SOURCE_ENTRIES.to_string()),
+            "message must state the limit: {err}"
+        );
+        assert!(service.list_bases().await.unwrap().is_empty(), "rejected create must not register");
+
+        // Exactly at the limit passes (live mode: nothing is fetched).
+        let at_limit: Vec<&str> = urls.iter().take(MAX_SOURCE_ENTRIES).map(String::as_str).collect();
+        service
+            .create_base("满额库", "", None, Some(url_source(KnowledgeSourceMode::Live, &at_limit)))
+            .await
+            .unwrap();
+    }
+
+    /// Fetches run concurrently, but slug numbering must follow entry order:
+    /// three URLs sharing one slug (same host+path, different query) land as
+    /// `{slug}.md` / `{slug}-2.md` / `{slug}-3.md` matching entries 0/1/2 no
+    /// matter which fetch completes first.
+    #[tokio::test]
+    async fn concurrent_fetch_keeps_slug_numbering_deterministic() {
+        use wiremock::matchers::{method, path as urlpath};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(urlpath("/page"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("body"))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (service, _repo) = service_with_repo(&dir.path().join("data"));
+        let urls: Vec<String> = (1..=3).map(|i| format!("{}/page?v={i}", server.uri())).collect();
+        let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let kb = service
+            .create_base("并发库", "", None, Some(url_source(KnowledgeSourceMode::Snapshot, &refs)))
+            .await
+            .unwrap();
+        let summary = kb.source_fetch.as_ref().expect("snapshot create reports the fetch");
+        assert_eq!((summary.fetched, summary.failed), (3, 0), "{:?}", summary.errors);
+
+        let slug = source_url::slug_for_url(&Url::parse(&urls[0]).unwrap());
+        let snap_dir = PathBuf::from(&kb.root_path).join(source_url::SNAPSHOT_REL_DIR);
+        let expected = [format!("{slug}.md"), format!("{slug}-2.md"), format!("{slug}-3.md")];
+        for (i, name) in expected.iter().enumerate() {
+            let content = std::fs::read_to_string(snap_dir.join(name))
+                .unwrap_or_else(|e| panic!("{name} must exist: {e}"));
+            // Read the managed header back through its own parser so this
+            // ordering guard cannot drift on a header-format change.
+            assert_eq!(
+                source_url::snapshot_source_url(&content),
+                Some(urls[i].as_str()),
+                "{name} must hold entry #{i}: {content}"
+            );
+        }
+    }
+
+    /// Create-time chained autogen only backfills an EMPTY description — a
+    /// user-supplied one survives (the README is still generated).
+    #[tokio::test]
+    async fn create_autogen_preserves_user_description() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("body"))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (service, _repo) = service_with_repo(&dir.path().join("data"));
+        service.set_completer(FakeCompleter::new(OVERVIEW_JSON, ""));
+
+        let url = format!("{}/page", server.uri());
+        let kb = service
+            .create_base("手填库", "手填的描述", None, Some(url_source(KnowledgeSourceMode::Snapshot, &[&url])))
+            .await
+            .unwrap();
+        assert_eq!(kb.description, "手填的描述", "user description must survive chained autogen");
+        let readme = std::fs::read_to_string(PathBuf::from(&kb.root_path).join("README.md")).unwrap();
+        assert!(readme.starts_with("# 接口库"), "README still generated: {readme}");
+    }
+
+    /// The create response surfaces the per-entry fetch outcome via the
+    /// additive `source_fetch` field; list/get (and source-less creates)
+    /// keep it off the wire.
+    #[tokio::test]
+    async fn create_response_carries_source_fetch_summary() {
+        use wiremock::matchers::{method, path as urlpath};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(urlpath("/ok"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("body"))
+            .mount(&server)
+            .await;
+        // `/missing` has no mock → wiremock answers 404 → per-entry failure.
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (service, _repo) = service_with_repo(&dir.path().join("data"));
+        let good = format!("{}/ok", server.uri());
+        let missing = format!("{}/missing", server.uri());
+        let kb = service
+            .create_base(
+                "源响应库",
+                "",
+                None,
+                Some(url_source(KnowledgeSourceMode::Snapshot, &[&good, &missing])),
+            )
+            .await
+            .unwrap();
+
+        let summary = kb.source_fetch.as_ref().expect("snapshot create reports the fetch");
+        assert_eq!((summary.fetched, summary.failed), (1, 1), "{:?}", summary.errors);
+        assert!(summary.errors[0].contains("/missing"), "{:?}", summary.errors);
+        let v = serde_json::to_value(&kb).unwrap();
+        assert_eq!(v["source_fetch"]["fetched"], 1);
+        assert_eq!(v["source_fetch"]["failed"], 1);
+        assert!(v["source_fetch"]["last_fetched_at"].is_i64(), "{v}");
+
+        // get/list re-reads never carry it (and None stays off the wire).
+        let info = service.get_base_info(&kb.knowledge_base_id).await.unwrap();
+        assert!(info.source_fetch.is_none());
+        let v = serde_json::to_value(&info).unwrap();
+        assert!(v.get("source_fetch").is_none(), "None must stay off the wire: {v}");
+
+        // A source-less create reports nothing either.
+        let plain = service.create_base("无源库", "", None, None).await.unwrap();
+        assert!(plain.source_fetch.is_none());
+    }
+
+    /// After the entry list shrinks, a refresh must sweep snapshots whose
+    /// managed-header `source_url` no longer matches any configured entry —
+    /// while user-authored files in `snapshots/` (no managed source header)
+    /// stay untouched.
+    #[tokio::test]
+    async fn refresh_source_prunes_orphan_snapshots_but_keeps_user_files() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("body"))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (service, repo) = service_with_repo(&dir.path().join("data"));
+        let url_a = format!("{}/keep", server.uri());
+        let url_b = format!("{}/drop", server.uri());
+        let kb = service
+            .create_base("缩减库", "", None, Some(url_source(KnowledgeSourceMode::Snapshot, &[&url_a, &url_b])))
+            .await
+            .unwrap();
+        let snap_dir = PathBuf::from(&kb.root_path).join(source_url::SNAPSHOT_REL_DIR);
+        assert_eq!(std::fs::read_dir(&snap_dir).unwrap().flatten().count(), 2);
+
+        // The user drops their own notes into snapshots/ (no frontmatter) —
+        // plus one with frontmatter but no source_url. Both must survive.
+        std::fs::write(snap_dir.join("my-notes.md"), "# 自留笔记\n手写内容").unwrap();
+        std::fs::write(snap_dir.join("fm-no-url.md"), "---\ntitle: x\n---\n\n正文").unwrap();
+
+        // Shrink the configured entries to url_a only (out-of-band config
+        // change, as the routes/gateway source-update path would do).
+        {
+            let mut bases = repo.bases.lock().unwrap();
+            let row = bases
+                .iter_mut()
+                .find(|r| r.knowledge_base_id == kb.knowledge_base_id.as_str())
+                .unwrap();
+            let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+            extra["source"]["entries"] = serde_json::json!([{ "url": url_a }]);
+            row.extra = extra.to_string();
+        }
+
+        let summary = service.refresh_source(&kb.knowledge_base_id).await.unwrap();
+        assert_eq!((summary.fetched, summary.failed), (1, 0), "{:?}", summary.errors);
+
+        let names: Vec<String> = std::fs::read_dir(&snap_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"my-notes.md".to_owned()), "user file must survive: {names:?}");
+        assert!(names.contains(&"fm-no-url.md".to_owned()), "no-source_url file must survive: {names:?}");
+        let slug_a = source_url::slug_for_url(&Url::parse(&url_a).unwrap());
+        assert!(names.contains(&format!("{slug_a}.md")), "kept entry's snapshot must remain: {names:?}");
+        let slug_b = source_url::slug_for_url(&Url::parse(&url_b).unwrap());
+        assert!(
+            !names.contains(&format!("{slug_b}.md")),
+            "orphan snapshot for the removed entry must leave the live set: {names:?}"
+        );
+        assert!(names.contains(&"_trash".to_owned()), "{names:?}");
+        assert_eq!(names.len(), 4, "{names:?}");
+        let quarantined = std::fs::read_dir(snap_dir.join("_trash"))
+            .unwrap()
+            .flatten()
+            .map(|entry| std::fs::read_to_string(entry.path()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(quarantined.len(), 1);
+        assert!(quarantined[0].contains(&url_b));
+    }
+
+    /// `MemRepo` whose `update_base` always fails — simulates the registry
+    /// going unwritable between the snapshot fetch and the source stamping.
+    struct FailingUpdateRepo(MemRepo);
+
+    #[async_trait::async_trait]
+    impl nomifun_db::IKnowledgeRepository for FailingUpdateRepo {
+        async fn insert_base(&self, row: &KnowledgeBaseRow) -> Result<(), nomifun_db::DbError> {
+            self.0.insert_base(row).await
+        }
+        async fn update_base(&self, row: &KnowledgeBaseRow) -> Result<(), nomifun_db::DbError> {
+            Err(nomifun_db::DbError::NotFound(format!(
+                "simulated persist failure for {}",
+                row.knowledge_base_id
+            )))
+        }
+        async fn delete_base(&self, id: &str) -> Result<(), nomifun_db::DbError> {
+            self.0.delete_base(id).await
+        }
+        async fn get_base(&self, id: &str) -> Result<Option<KnowledgeBaseRow>, nomifun_db::DbError> {
+            self.0.get_base(id).await
+        }
+        async fn list_bases(&self) -> Result<Vec<KnowledgeBaseRow>, nomifun_db::DbError> {
+            self.0.list_bases().await
+        }
+        async fn get_binding(
+            &self,
+            kind: &str,
+            id: &str,
+        ) -> Result<Option<(KnowledgeBindingRow, Vec<String>)>, nomifun_db::DbError> {
+            self.0.get_binding(kind, id).await
+        }
+        #[allow(clippy::too_many_arguments)]
+        async fn set_binding(
+            &self,
+            kind: &str,
+            id: &str,
+            kb_ids: &[String],
+            enabled: bool,
+            writeback: bool,
+            writeback_eagerness: &str,
+            channel_write_enabled: bool,
+            updated_at: nomifun_common::TimestampMs,
+        ) -> Result<String, nomifun_db::DbError> {
+            self.0
+                .set_binding(kind, id, kb_ids, enabled, writeback, writeback_eagerness, channel_write_enabled, updated_at)
+                .await
+        }
+        async fn delete_binding(&self, kind: &str, id: &str) -> Result<(), nomifun_db::DbError> {
+            self.0.delete_binding(kind, id).await
+        }
+        async fn list_bindings_using_kb(&self, kb_id: &str) -> Result<Vec<KnowledgeBindingRow>, nomifun_db::DbError> {
+            self.0.list_bindings_using_kb(kb_id).await
+        }
+        async fn list_knowledge_tags(&self) -> Result<Vec<nomifun_db::models::KnowledgeTagRow>, nomifun_db::DbError> {
+            self.0.list_knowledge_tags().await
+        }
+        async fn create_knowledge_tag(&self, params: nomifun_db::models::CreateKnowledgeTagParams) -> Result<(), nomifun_db::DbError> {
+            self.0.create_knowledge_tag(params).await
+        }
+        async fn update_knowledge_tag(&self, key: &str, params: nomifun_db::models::UpdateKnowledgeTagParams) -> Result<(), nomifun_db::DbError> {
+            self.0.update_knowledge_tag(key, params).await
+        }
+        async fn delete_knowledge_tag(&self, key: &str) -> Result<(), nomifun_db::DbError> {
+            self.0.delete_knowledge_tag(key).await
+        }
+    }
+
+    /// When persisting the fetched source state fails (warn-only path), the
+    /// create response must NOT claim the new stamp: the registry still holds
+    /// the old value (`None` at create), so `source_fetch.last_fetched_at`
+    /// reports that — never the aspirational fresh stamp.
+    #[tokio::test]
+    async fn create_summary_reports_no_stamp_when_persist_fails() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("body"))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = Arc::new(FailingUpdateRepo(MemRepo::default()));
+        let service = KnowledgeService::new(
+            repo.clone(),
+            &dir.path().join("data"),
+            KnowledgeEventEmitter::new(
+                Arc::new(NoopBroadcaster),
+                Arc::from(TEST_OWNER_ID),
+            ),
+        )
+        .with_url_fetcher(HttpFetcher::new().allow_private_for_tests());
+
+        let url = format!("{}/doc", server.uri());
+        let kb = service
+            .create_base("失忆库", "", None, Some(url_source(KnowledgeSourceMode::Snapshot, &[&url])))
+            .await
+            .unwrap();
+
+        // The snapshot itself landed (fetch succeeded)…
+        let summary = kb.source_fetch.as_ref().expect("snapshot create reports the fetch");
+        assert_eq!((summary.fetched, summary.failed), (1, 0), "{:?}", summary.errors);
+        // …but the stamp was never persisted, so the summary must not claim it.
+        assert_eq!(
+            summary.last_fetched_at, None,
+            "unpersisted stamp must not be reported as fresh"
+        );
+        // The registry row agrees: still unstamped.
+        assert_eq!(extra_source(&repo.0, &kb.knowledge_base_id).unwrap().last_fetched_at, None);
+    }
+
+    /// Boot-resume re-runs the fetch pipeline for snapshot-mode sources whose
+    /// stamp is missing (registered but never fetched — e.g. the app exited
+    /// while a background create-fetch was in flight). Live-mode sources and
+    /// already-stamped bases are never touched.
+    #[tokio::test]
+    async fn boot_resume_fetches_only_unstamped_snapshot_sources() {
+        use std::time::{Duration, Instant};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("resumed body"))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        let (service, repo) = service_with_repo(&data_dir);
+        let service = Arc::new(service);
+        let url = format!("{}/doc", server.uri());
+
+        // Seed rows directly (the persisted-but-unfetched shape a background
+        // create leaves behind when the process dies mid-run).
+        let seed = |id: &str, mode: KnowledgeSourceMode, stamp: Option<i64>| -> PathBuf {
+            let lexical_root = data_dir.join(KB_MANAGED_REL_DIR).join(id);
+            std::fs::create_dir_all(&lexical_root).unwrap();
+            // `register_base` stores a physical root. This fixture seeds the
+            // repository directly, so canonicalize explicitly to preserve
+            // the same no-retargeting contract on macOS (`/var` is a link).
+            let root = std::fs::canonicalize(&lexical_root).unwrap();
+            let source = KnowledgeSource {
+                kind: "url".into(),
+                mode,
+                entries: vec![KnowledgeSourceEntry {
+                    url: url.clone(),
+                    title: None,
+                    rendered: false,
+                    ..Default::default()
+                }],
+                last_fetched_at: stamp,
+                ..Default::default()
+            };
+            repo.bases.lock().unwrap().push(KnowledgeBaseRow {
+                id: 0,
+                knowledge_base_id: id.to_owned(),
+                name: id.into(),
+                description: String::new(),
+                root_path: root.to_string_lossy().into_owned(),
+                managed: true,
+                tree_access: "editable".into(),
+                extra: serde_json::json!({ "source": source }).to_string(),
+                created_at: 0,
+                updated_at: 0,
+                tags: None,
+            });
+            root
+        };
+        let pending_root = seed(TEST_KB_PENDING, KnowledgeSourceMode::Snapshot, None);
+        let live_root = seed(TEST_KB_LIVE, KnowledgeSourceMode::Live, None);
+        let stamped_root = seed(TEST_KB_STAMPED, KnowledgeSourceMode::Snapshot, Some(123));
+
+        // Spawned exactly like the production wiring (boot must not block).
+        tokio::spawn(Arc::clone(&service).resume_pending_source_fetches());
+
+        // Deadline poll: the pending base gains its snapshot + stamp.
+        let snap_dir = pending_root.join(source_url::SNAPSHOT_REL_DIR);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let stamped = extra_source(&repo, TEST_KB_PENDING)
+                .unwrap()
+                .last_fetched_at
+                .is_some();
+            let snapshots = std::fs::read_dir(&snap_dir).map(|d| d.flatten().count()).unwrap_or(0);
+            if stamped && snapshots == 1 {
+                let snap = std::fs::read_dir(&snap_dir).unwrap().flatten().next().unwrap();
+                assert!(std::fs::read_to_string(snap.path()).unwrap().contains("resumed body"));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "boot-resume did not land: stamped={stamped} snapshots={snapshots}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // Live-mode and already-stamped bases were never touched.
+        assert!(
+            !live_root.join(source_url::SNAPSHOT_REL_DIR).exists(),
+            "live source must not be fetched by boot-resume"
+        );
+        assert_eq!(extra_source(&repo, TEST_KB_LIVE).unwrap().last_fetched_at, None);
+        assert!(
+            !stamped_root.join(source_url::SNAPSHOT_REL_DIR).exists(),
+            "stamped source must not be re-fetched by boot-resume"
+        );
+        assert_eq!(
+            extra_source(&repo, TEST_KB_STAMPED)
+                .unwrap()
+                .last_fetched_at,
+            Some(123)
+        );
+    }
+
+    // ── background-dispatch create (gateway path) ────────────────────
+
+    /// Event-name recorder — lets tests assert `knowledge.base-updated`
+    /// is emitted when the background pipeline completes.
+    #[derive(Default)]
+    struct RecordingBroadcaster {
+        names: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl nomifun_realtime::UserEventSink for RecordingBroadcaster {
+        fn send_to_user(
+            &self,
+            _user_id: &str,
+            event: nomifun_api_types::WebSocketMessage<serde_json::Value>,
+        ) {
+            self.names.lock().unwrap().push(event.name);
+        }
+    }
+
+    /// Gateway-mode create (`create_base_with_background_fetch`): the call
+    /// returns before any URL is fetched — no sync `source_fetch` summary,
+    /// `extra.source` persisted unstamped — then the background task lands
+    /// the snapshot, stamps `lastFetchedAt`, backfills the description via
+    /// the chained autogen, and emits `knowledge.base-updated`.
+    #[tokio::test]
+    async fn background_create_returns_immediately_then_fetches_and_autogens() {
+        use std::time::{Duration, Instant};
+        use wiremock::matchers::{method, path as urlpath};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // The response delay guarantees the fetch cannot have finished when
+        // create returns, making the immediate-return assertions race-free.
+        Mock::given(method("GET"))
+            .and(urlpath("/docs/guide"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(400))
+                    .set_body_raw(
+                        "<html><head><title>接口文档</title></head><body><h1>API</h1><p>说明</p></body></html>",
+                        "text/html; charset=utf-8",
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = Arc::new(MemRepo::default());
+        let events = Arc::new(RecordingBroadcaster::default());
+        let service = Arc::new(
+            KnowledgeService::new(
+                repo.clone(),
+                &dir.path().join("data"),
+                KnowledgeEventEmitter::new(events.clone(), Arc::from(TEST_OWNER_ID)),
+            )
+            .with_url_fetcher(HttpFetcher::new().allow_private_for_tests()),
+        );
+        service.set_completer(FakeCompleter::new(OVERVIEW_JSON, ""));
+
+        let url = format!("{}/docs/guide", server.uri());
+        let kb = Arc::clone(&service)
+            .create_base_with_background_fetch(
+                "后台库",
+                "",
+                None,
+                Some(url_source(KnowledgeSourceMode::Snapshot, &[&url])),
+            )
+            .await
+            .unwrap();
+
+        // Immediate return: source persisted (unstamped), nothing fetched
+        // yet, description still the (empty) user-supplied one.
+        assert!(kb.source_fetch.is_none(), "background create must not report a sync fetch");
+        assert_eq!(kb.description, "");
+        let stored = extra_source(&repo, kb.knowledge_base_id.as_str()).expect("extra.source persisted before the fetch");
+        assert_eq!(stored.entries[0].url, url);
+        assert_eq!(stored.last_fetched_at, None, "stamp belongs to the background fetch");
+        let snap_dir = PathBuf::from(&kb.root_path).join(source_url::SNAPSHOT_REL_DIR);
+        assert!(!snap_dir.exists(), "create must not wait for the fetch");
+
+        // Deadline poll (no fixed sleep): snapshot on disk, stamp set,
+        // description backfilled, completion event emitted.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let stored = extra_source(&repo, kb.knowledge_base_id.as_str()).unwrap();
+            let described = repo
+                .bases
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.knowledge_base_id == kb.knowledge_base_id.as_str())
+                .is_some_and(|r| r.description == "AI 生成的描述");
+            let snapshots = std::fs::read_dir(&snap_dir).map(|d| d.flatten().count()).unwrap_or(0);
+            let updated_emitted =
+                events.names.lock().unwrap().iter().any(|n| n == "knowledge.base-updated");
+            if stored.last_fetched_at.is_some() && described && snapshots == 1 && updated_emitted {
+                assert_eq!(stored.entries[0].title.as_deref(), Some("接口文档"), "title backfill persisted");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "background fetch did not complete: stamped={} described={described} snapshots={snapshots} updated_emitted={updated_emitted}",
+                stored.last_fetched_at.is_some()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    // ── workspace / data-root overlap guard ──────────────────────────
+
+    #[tokio::test]
+    async fn mounts_skipped_when_workspace_overlaps_data_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        let service = make_service(&data_dir);
+        let kb = service.create_base("库", "", None, None).await.unwrap();
+        service.write_file(&kb.knowledge_base_id, "a.md", "# A").await.unwrap();
+        service
+            .set_binding(
+                "conversation",
+                TEST_CONVERSATION_ID,
+                KnowledgeBinding {
+                    enabled: true,
+                    kb_ids: vec![kb.knowledge_base_id.clone()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Workspace == data root → skipped, no scaffolding created.
+        let outcome = service
+            .ensure_mounts_for_target("conversation", TEST_CONVERSATION_ID, &data_dir)
+            .await;
+        assert!(outcome.mounts.is_empty());
+        assert!(!data_dir.join(".nomi").exists());
+
+        // Workspace is an ancestor of the data root → skipped too.
+        let outcome = service
+            .ensure_mounts_for_target("conversation", TEST_CONVERSATION_ID, dir.path())
+            .await;
+        assert!(outcome.mounts.is_empty());
+        assert!(!dir.path().join(".nomi").exists());
+
+        // Reverse direction: a workspace INSIDE the managed knowledge root
+        // (here: the base's own directory) must be skipped as well — the
+        // mount sweep would otherwise run inside a knowledge base's files.
+        let kb_root = PathBuf::from(&kb.root_path);
+        let outcome = service
+            .ensure_mounts_for_target("conversation", TEST_CONVERSATION_ID, &kb_root)
+            .await;
+        assert!(outcome.mounts.is_empty());
+        assert!(!kb_root.join(".nomi").exists());
+
+        // A sibling workspace mounts normally (guard must not overfire).
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let outcome = service
+            .ensure_mounts_for_target("conversation", TEST_CONVERSATION_ID, &ws)
+            .await;
+        assert_eq!(outcome.mounts.len(), 1);
+    }
+
+    // ── workpath-level bindings (session-list unification §7) ────────
+
+    use crate::workpath::DEFAULT_WORKPATH_KEY;
+
+    /// Create a base with one document and bind it (enabled) to the given
+    /// target. Returns the kb id.
+    async fn bind_new_base(service: &KnowledgeService, name: &str, kind: &str, target: &str) -> String {
+        let kb = service.create_base(name, "", None, None).await.unwrap();
+        service.write_file(&kb.knowledge_base_id, "a.md", "# A").await.unwrap();
+        service
+            .set_binding(
+                kind,
+                target,
+                KnowledgeBinding {
+                    enabled: true,
+                    kb_ids: vec![kb.knowledge_base_id.clone()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        kb.knowledge_base_id.into_string()
+    }
+
+    #[tokio::test]
+    async fn prepared_workspace_authority_blocks_conflicts_shares_exact_binding_and_allows_takeover() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let workspace = dir.path().join("shared-workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let kb_a = bind_new_base(
+            &service,
+            "binding-a",
+            "conversation",
+            TEST_CONVERSATION_ID,
+        )
+        .await;
+        let _kb_b = bind_new_base(
+            &service,
+            "binding-b",
+            "conversation",
+            TEST_CONVERSATION_ID_2,
+        )
+        .await;
+
+        let plan_a = service
+            .prepare_mounts_for_target("conversation", TEST_CONVERSATION_ID, &workspace)
+            .await
+            .unwrap();
+        assert!(
+            !workspace.join(".nomi").exists(),
+            "preparation must be read-only"
+        );
+        let signature_a = plan_a.binding_signature().to_owned();
+        let (_, lease_a) = plan_a.activate(TEST_CONVERSATION_ID).await.unwrap();
+
+        let same_plan = service
+            .prepare_mounts_for_target("conversation", TEST_CONVERSATION_ID, &workspace)
+            .await
+            .unwrap();
+        assert_eq!(same_plan.binding_signature(), signature_a);
+        let (_, same_lease) = same_plan
+            .activate(TEST_CONVERSATION_ID_9)
+            .await
+            .expect("the exact same ordered binding can share a workspace");
+
+        let conflicting_plan = service
+            .prepare_mounts_for_target("conversation", TEST_CONVERSATION_ID_2, &workspace)
+            .await
+            .unwrap();
+        assert!(
+            conflicting_plan
+                .activate(TEST_CONVERSATION_ID_2)
+                .await
+                .is_err(),
+            "a second active runtime must not replace different mounts"
+        );
+
+        drop(same_lease);
+        drop(lease_a);
+        service
+            .prepare_mounts_for_target("conversation", TEST_CONVERSATION_ID_2, &workspace)
+            .await
+            .unwrap()
+            .activate(TEST_CONVERSATION_ID_2)
+            .await
+            .expect("the next binding can take over after every old runtime releases");
+
+        // Mutable knowledge content changes the prompt metadata but not the
+        // physical/logical mount binding authority.
+        let before = service
+            .prepare_mounts_for_target("conversation", TEST_CONVERSATION_ID, &workspace)
+            .await
+            .unwrap();
+        service
+            .write_file(&kb_a, "README.md", "# Updated summary")
+            .await
+            .unwrap();
+        let after = service
+            .prepare_mounts_for_target("conversation", TEST_CONVERSATION_ID, &workspace)
+            .await
+            .unwrap();
+        assert_eq!(
+            before.binding_signature(),
+            after.binding_signature(),
+            "TOC/summary mutations must never split one exact mount binding"
+        );
+    }
+
+    /// Session mounts use the canonical workpath binding only.
+    #[tokio::test]
+    async fn session_mounts_prefer_workpath_binding() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let key = workpath_key(&ws.to_string_lossy());
+
+        let kb_workpath = bind_new_base(&service, "路径库", WORKPATH_BINDING_KIND, &key).await;
+        let _kb_session = bind_new_base(
+            &service,
+            "会话库",
+            "conversation",
+            TEST_CONVERSATION_ID,
+        )
+        .await;
+
+        let outcome = service
+            .ensure_mounts_for_target(WORKPATH_BINDING_KIND, &key, &ws)
+            .await;
+        assert_eq!(outcome.mounts.len(), 1, "{:?}", outcome.mounts);
+        assert_eq!(outcome.mounts[0].knowledge_base_id.to_string(), kb_workpath);
+    }
+
+    /// A per-session binding is never read when the workpath has no row.
+    #[tokio::test]
+    async fn session_mounts_do_not_fall_back_to_session_binding() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let key = workpath_key(&ws.to_string_lossy());
+
+        let _kb_session = bind_new_base(
+            &service,
+            "会话库",
+            "conversation",
+            TEST_CONVERSATION_ID,
+        )
+        .await;
+
+        let outcome = service
+            .ensure_mounts_for_target(WORKPATH_BINDING_KIND, &key, &ws)
+            .await;
+        assert!(outcome.mounts.is_empty(), "{:?}", outcome.mounts);
+
+        // Terminal sessions follow the same workpath-only rule.
+        let _kb_term = bind_new_base(&service, "终端库", "terminal", TEST_TERMINAL_ID_2).await;
+        let outcome = service
+            .ensure_mounts_for_target(WORKPATH_BINDING_KIND, &key, &ws)
+            .await;
+        assert!(outcome.mounts.is_empty(), "{:?}", outcome.mounts);
+    }
+
+    /// A disabled workpath binding clears mounts regardless of any per-session
+    /// row that may exist.
+    #[tokio::test]
+    async fn disabled_workpath_binding_ignores_session_binding() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let key = workpath_key(&ws.to_string_lossy());
+
+        let _kb_session = bind_new_base(
+            &service,
+            "会话库",
+            "conversation",
+            TEST_CONVERSATION_ID,
+        )
+        .await;
+        service
+            .set_binding(WORKPATH_BINDING_KIND, &key, KnowledgeBinding::default())
+            .await
+            .unwrap();
+
+        let outcome = service
+            .ensure_mounts_for_target(WORKPATH_BINDING_KIND, &key, &ws)
+            .await;
+        assert!(outcome.mounts.is_empty(), "{:?}", outcome.mounts);
+    }
+
+    /// Temporary (backend-managed) workspaces resolve to the
+    /// `__default__` sentinel and share one default-workpath binding.
+    #[tokio::test]
+    async fn session_mounts_default_workpath_for_temporary_workspace() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        let service = make_service(&data_dir);
+
+        // Temp workspace under the backend data dir → sentinel key (the
+        // same derivation the conversation/terminal services apply).
+        let temp_ws = data_dir.join("conversations").join("gemini-temp-c1");
+        std::fs::create_dir_all(&temp_ws).unwrap();
+        let key = crate::workpath::session_workpath_key(&temp_ws, &data_dir);
+        assert_eq!(key, DEFAULT_WORKPATH_KEY);
+
+        let kb = bind_new_base(&service, "默认库", WORKPATH_BINDING_KIND, DEFAULT_WORKPATH_KEY).await;
+        let outcome = service
+            .ensure_mounts_for_target(WORKPATH_BINDING_KIND, &key, &temp_ws)
+            .await;
+        assert_eq!(outcome.mounts.len(), 1, "{:?}", outcome.mounts);
+        assert_eq!(outcome.mounts[0].knowledge_base_id.to_string(), kb);
+    }
+
+    /// Workpath target ids are canonicalized server-side: every spelling of
+    /// the same directory (trailing slash, backslashes) reads/writes the
+    /// same row, and the mount lookup tolerates a raw (un-normalized) key.
+    #[tokio::test]
+    async fn workpath_binding_target_id_is_canonicalized() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let canonical = workpath_key(&ws.to_string_lossy());
+
+        // Write with a trailing-slash spelling…
+        let kb = bind_new_base(&service, "路径库", WORKPATH_BINDING_KIND, &format!("{}/", ws.display())).await;
+
+        // …read back under the canonical key.
+        let binding = service.get_binding(WORKPATH_BINDING_KIND, &canonical).await.unwrap();
+        assert!(binding.enabled);
+        assert_eq!(binding.kb_ids, vec![KnowledgeBaseId::parse(kb.clone()).unwrap()]);
+
+        // The mount lookup normalizes its own input too.
+        let outcome = service
+            .ensure_mounts_for_target(WORKPATH_BINDING_KIND, &format!("{}/", ws.display()), &ws)
+            .await;
+        assert_eq!(outcome.mounts.len(), 1, "{:?}", outcome.mounts);
+        assert_eq!(outcome.mounts[0].knowledge_base_id.to_string(), kb);
+
+        // delete_binding canonicalizes as well — the row really goes away.
+        service
+            .delete_binding(WORKPATH_BINDING_KIND, &format!("{}/", ws.display()))
+            .await
+            .unwrap();
+        let binding = service.get_binding(WORKPATH_BINDING_KIND, &canonical).await.unwrap();
+        assert!(!binding.enabled);
+        assert!(binding.kb_ids.is_empty());
+    }
+
+    // ── search_bases (in-process keyword search over real base root) ──
+
+    /// Build a service whose `data_dir` is a fresh tempdir, mirroring the
+    /// crate's `make_service`/managed-base layout. Managed bases provision
+    /// under `{data_dir}/knowledge/{id}` eagerly at create time.
+    async fn search_test_service() -> (KnowledgeService, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = make_service(tmp.path());
+        (svc, tmp)
+    }
+
+    #[tokio::test]
+    async fn search_bases_finds_topic_in_managed_base_ignoring_gitignore() {
+        let (svc, _tmp) = search_test_service().await;
+        let info = svc.create_base("运维手册", "团队运维约定", None, None).await.unwrap();
+        let root = svc.data_dir().join("knowledge").join(info.knowledge_base_id.as_str());
+        std::fs::write(root.join(".gitignore"), "*\n").unwrap();
+        std::fs::create_dir_all(root.join("deploy")).unwrap();
+        std::fs::write(root.join("deploy/rollback.md"), "# 回滚流程\n\n生产环境回滚分三步：先停流量……\n").unwrap();
+
+        let hits = svc.search_bases(&[info.knowledge_base_id.clone()], "回滚", 8).await.unwrap();
+        assert!(!hits.is_empty(), "must find topic despite .gitignore + hidden mount semantics");
+        assert!(hits.iter().any(|h| h.rel_path == "deploy/rollback.md"));
+        let top = &hits[0];
+        assert_eq!(top.kb_name, "运维手册");
+        assert!(top.heading.contains("回滚流程"));
+        assert!(!top.snippet.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_bases_ranks_filename_and_heading_above_body() {
+        let (svc, _tmp) = search_test_service().await;
+        let info = svc.create_base("库", "", None, None).await.unwrap();
+        let root = svc.data_dir().join("knowledge").join(info.knowledge_base_id.as_str());
+        std::fs::write(root.join("payments.md"), "# Payments API\n\nrefund flow here\n").unwrap();
+        std::fs::write(root.join("misc.md"), "# Misc\n\nthe word payments appears once\n").unwrap();
+        let hits = svc.search_bases(&[info.knowledge_base_id.clone()], "payments", 8).await.unwrap();
+        assert_eq!(hits[0].rel_path, "payments.md", "filename/heading match ranks first");
+    }
+
+    #[tokio::test]
+    async fn search_bases_unknown_id_is_skipped_not_error() {
+        let (svc, _tmp) = search_test_service().await;
+        let hits = svc.search_bases(&[KnowledgeBaseId::new()], "x", 8).await.unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn score_md_zero_when_no_match() {
+        let terms = vec!["zzz".to_string()];
+        assert!(score_md("a/b.md", "Heading", "body text", "zzz", &terms).is_none());
+    }
+
+    #[test]
+    fn score_md_phrase_and_terms() {
+        let terms = vec!["回滚".to_string()];
+        let scored = score_md("deploy/rollback.md", "回滚流程", "生产环境回滚分三步", "回滚", &terms);
+        assert!(scored.is_some());
+        let (score, snippet) = scored.unwrap();
+        assert!(score > 0);
+        assert!(snippet.contains("回滚"));
+    }
+
+    // ── resolve_kb_ids_for_cwd ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn resolve_kb_ids_for_cwd_returns_bound_bases_for_known_workpath() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        let service = make_service(&data_dir);
+
+        // Create two bases.
+        let kb1 = service.create_base("库A", "", None, None).await.unwrap();
+        let kb2 = service.create_base("库B", "", None, None).await.unwrap();
+
+        // Bind only kb1 to a workpath.
+        let ws = "/Users/dev/project";
+        let key = workpath_key(ws);
+        service
+            .set_binding(
+                WORKPATH_BINDING_KIND,
+                &key,
+                KnowledgeBinding {
+                    enabled: true,
+                    kb_ids: vec![kb1.knowledge_base_id.clone()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // cwd matching the bound workpath → only the bound base.
+        let ids = service.resolve_kb_ids_for_cwd(ws).await;
+        assert_eq!(ids, vec![kb1.knowledge_base_id.clone()]);
+
+        // Trailing slash normalizes to the same key.
+        let ids = service.resolve_kb_ids_for_cwd(&format!("{ws}/")).await;
+        assert_eq!(ids, vec![kb1.knowledge_base_id.clone()]);
+
+        // Unknown cwd → all bases.
+        let ids = service.resolve_kb_ids_for_cwd("/unknown/path").await;
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&kb1.knowledge_base_id));
+        assert!(ids.contains(&kb2.knowledge_base_id));
+
+        // Empty cwd → all bases.
+        let ids = service.resolve_kb_ids_for_cwd("").await;
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn resolve_kb_ids_for_cwd_disabled_binding_falls_back_to_all() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        let service = make_service(&data_dir);
+
+        let kb1 = service.create_base("库A", "", None, None).await.unwrap();
+        let kb2 = service.create_base("库B", "", None, None).await.unwrap();
+
+        let ws = "/Users/dev/proj2";
+        let key = workpath_key(ws);
+        // Bind only kb1 to this workpath, but DISABLED → fallback to all.
+        service
+            .set_binding(
+                WORKPATH_BINDING_KIND,
+                &key,
+                KnowledgeBinding {
+                    enabled: false,
+                    kb_ids: vec![kb1.knowledge_base_id.clone()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let ids = service.resolve_kb_ids_for_cwd(ws).await;
+        // Must return ALL mounted bases (kb1 + kb2), not just the binding's [kb1].
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&kb1.knowledge_base_id));
+        assert!(ids.contains(&kb2.knowledge_base_id));
+    }
+
+    #[tokio::test]
+    async fn resolve_kb_ids_for_cwd_managed_workspace_returns_all() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        let service = make_service(&data_dir);
+
+        let kb1 = service.create_base("库", "", None, None).await.unwrap();
+
+        // A cwd under the data_dir (managed workspace) maps to DEFAULT_WORKPATH_KEY → all.
+        let managed_cwd = data_dir.join("conversations").join("temp-1");
+        let ids = service
+            .resolve_kb_ids_for_cwd(&managed_cwd.to_string_lossy())
+            .await;
+        assert_eq!(ids, vec![kb1.knowledge_base_id]);
+    }
+
+    // ── document handle codec (P1 unified write stack) ────────────────
+
+    #[test]
+    fn handle_roundtrips_kb_id_and_rel_path() {
+        let kb_id = KnowledgeBaseId::new();
+        let h = encode_doc_handle(&kb_id, "deploy/rollback.md");
+        assert!(h.starts_with("kdoc_"), "{h}");
+        assert_eq!(decode_doc_handle(&h), Some((kb_id, "deploy/rollback.md".to_owned())));
+    }
+
+    #[test]
+    fn handle_roundtrips_unicode_and_spaces() {
+        let kb_id = KnowledgeBaseId::new();
+        let h = encode_doc_handle(&kb_id, "运维/回滚 流程.md");
+        assert_eq!(decode_doc_handle(&h), Some((kb_id, "运维/回滚 流程.md".to_owned())));
+    }
+
+    #[test]
+    fn handle_decode_rejects_malformed() {
+        assert_eq!(decode_doc_handle("not-a-handle"), None);
+        assert_eq!(decode_doc_handle("kdoc_!!!notbase64"), None);
+        assert_eq!(decode_doc_handle("kdoc_"), None);
+    }
+
+    // ── write target resolver + path de-confusion (P1) ────────────────
+
+    /// Build a service with one managed base seeded with `{rel}` = `content`.
+    /// The returned `TempDir` must be kept in scope by the caller (bind it as
+    /// `_dir`) so the managed directory survives for the test.
+    async fn test_service_with_file(
+        rel: &str,
+        content: &str,
+    ) -> (KnowledgeService, KnowledgeBaseId, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = crate::testutil::make_service(&dir.path().join("data"));
+        let kb = service.create_base("库", "", None, None).await.unwrap();
+        service.write_file(&kb.knowledge_base_id, rel, content).await.unwrap();
+        (service, kb.knowledge_base_id, dir)
+    }
+
+    #[tokio::test]
+    async fn write_file_atomically_replaces_existing_file_without_temp_leaks() {
+        let (service, kb_id, _dir) = test_service_with_file("nested/existing.md", "first").await;
+
+        service
+            .write_file(&kb_id, "nested/existing.md", "second")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            service
+                .read_file(&kb_id, "nested/existing.md")
+                .await
+                .unwrap()
+                .content,
+            "second"
+        );
+        let base = service.get_base_info(&kb_id).await.unwrap();
+        let nested = PathBuf::from(base.root_path).join("nested");
+        let names = std::fs::read_dir(nested)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["existing.md"], "atomic temp sibling leaked: {names:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_writeback_no_clobber_link_fallback_rolls_back_when_source_unlink_fails() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("source.md");
+        let destination = dir.path().join("destination.md");
+        std::fs::write(&source, "keep me live").unwrap();
+
+        let result = hard_link_move_no_clobber_with(
+            &source,
+            &destination,
+            |path| {
+                if path == source {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected source unlink failure",
+                    ))
+                } else {
+                    std::fs::remove_file(path)
+                }
+            },
+        );
+
+        assert!(result.is_err(), "a copied-but-not-moved file is not success");
+        assert!(source.exists(), "failed move must leave the live source intact");
+        assert!(
+            !destination.exists(),
+            "failed move must roll back its destination hard link"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_text_atomic_replaces_an_existing_file_on_this_platform() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("README.md");
+        tokio::fs::write(&path, "OLD").await.unwrap();
+        write_text_atomic(&path, "NEW").await.unwrap();
+        assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "NEW");
+    }
+
+    async fn await_atomic_publication_test_hook(
+        entered: std::sync::mpsc::Receiver<()>,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async move {
+            loop {
+                match entered.try_recv() {
+                    Ok(()) => return,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        panic!("atomic publication task exited before entering its syscall")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("atomic publication task never reached its target-path syscall");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_during_atomic_replace_cannot_quiesce_before_publication_returns() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("replace-abort.md");
+        tokio::fs::write(&path, "OLD").await.unwrap();
+        let (entered, release) = install_atomic_publication_test_hook(&path);
+        let task_path = path.clone();
+        let mut task =
+            tokio::spawn(async move { write_text_atomic(&task_path, "NEW").await });
+
+        await_atomic_publication_test_hook(entered).await;
+        task.abort();
+        let quiesced_before_release =
+            tokio::time::timeout(Duration::from_millis(100), &mut task).await;
+        let _ = release.send(());
+        if quiesced_before_release.is_err() {
+            let _ = task.await;
+        }
+
+        assert!(
+            quiesced_before_release.is_err(),
+            "an aborted owner reported quiesced while its target-path syscall was still pending"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            "NEW",
+            "once publication has begun, cancellation must not leave a late replace behind"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_during_no_clobber_cannot_quiesce_before_publication_returns() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("no-replace-abort.md");
+        let (entered, release) = install_atomic_publication_test_hook(&path);
+        let task_path = path.clone();
+        let mut task = tokio::spawn(async move {
+            write_text_atomic_if_absent(&task_path, "PUBLISHED").await
+        });
+
+        await_atomic_publication_test_hook(entered).await;
+        task.abort();
+        let quiesced_before_release =
+            tokio::time::timeout(Duration::from_millis(100), &mut task).await;
+        let _ = release.send(());
+        if quiesced_before_release.is_err() {
+            let _ = task.await;
+        }
+
+        assert!(
+            quiesced_before_release.is_err(),
+            "an aborted owner reported quiesced while its no-replace syscall was still pending"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            "PUBLISHED",
+            "once publication has begun, cancellation must not leave a late no-replace write behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_no_clobber_publish_race_has_exactly_one_winner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("proposal.md");
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let left_barrier = Arc::clone(&barrier);
+        let right_barrier = Arc::clone(&barrier);
+        let (left, right) = tokio::join!(
+            async {
+                left_barrier.wait().await;
+                write_text_atomic_if_absent(&path, "LEFT").await
+            },
+            async {
+                right_barrier.wait().await;
+                write_text_atomic_if_absent(&path, "RIGHT").await
+            },
+        );
+
+        assert!(
+            matches!(
+                (&left, &right),
+                (Ok(()), Err(AppError::Conflict(_)))
+                    | (Err(AppError::Conflict(_)), Ok(()))
+            ),
+            "one publisher must win and one must observe the collision: {left:?}, {right:?}"
+        );
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(content == "LEFT" || content == "RIGHT", "{content}");
+    }
+
+    #[test]
+    fn deconfuse_strips_mount_prefix() {
+        assert_eq!(deconfuse_rel_path(".nomi/knowledge/Finance/terms.md"), "terms.md");
+        assert_eq!(deconfuse_rel_path("./.nomi/knowledge/运维手册/deploy/rollback.md"), "deploy/rollback.md");
+        assert_eq!(deconfuse_rel_path("deploy/rollback.md"), "deploy/rollback.md");
+        assert_eq!(deconfuse_rel_path("terms.md"), "terms.md");
+        assert_eq!(deconfuse_rel_path("a\\b.md"), "a/b.md");
+    }
+
+    #[tokio::test]
+    async fn resolve_handle_to_existing_is_update() {
+        let (svc, kb_id, _dir) = test_service_with_file("terms.md", "# 术语").await;
+        let h = encode_doc_handle(&kb_id, "terms.md");
+        let res = svc.resolve_write_target(&[kb_id.clone()], &WriteTargetSpec::Handle(h)).await.unwrap();
+        assert_eq!(res.canonical_rel_path, "terms.md");
+        assert_eq!(res.op, WriteOp::Update);
+    }
+
+    #[tokio::test]
+    async fn resolve_mount_prefixed_path_updates_original() {
+        let (svc, kb_id, _dir) = test_service_with_file("terms.md", "# 术语").await;
+        let spec = WriteTargetSpec::Path { kb_id: kb_id.clone(), rel_path: ".nomi/knowledge/X/terms.md".into() };
+        let res = svc.resolve_write_target(&[kb_id.clone()], &spec).await.unwrap();
+        assert_eq!(res.canonical_rel_path, "terms.md", "mount prefix stripped → updates original");
+        assert_eq!(res.op, WriteOp::Update);
+    }
+
+    #[tokio::test]
+    async fn resolve_novel_path_is_create() {
+        let (svc, kb_id, _dir) = test_service_with_file("terms.md", "x").await;
+        let spec = WriteTargetSpec::Path { kb_id: kb_id.clone(), rel_path: "brand-new.md".into() };
+        let res = svc.resolve_write_target(&[kb_id.clone()], &spec).await.unwrap();
+        assert_eq!(res.op, WriteOp::Create);
+        assert_eq!(res.canonical_rel_path, "brand-new.md");
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_create_preserves_existing_parent_spelling() {
+        let (svc, kb_id, _dir) =
+            test_service_with_file("Notes/Archive/existing.md", "x").await;
+        let spec = WriteTargetSpec::Path {
+            kb_id: kb_id.clone(),
+            rel_path: "notes/archive/new.md".into(),
+        };
+
+        let resolution = svc
+            .resolve_write_target(&[kb_id.clone()], &spec)
+            .await
+            .unwrap();
+
+        assert_eq!(resolution.op, WriteOp::Create);
+        assert_eq!(
+            resolution.canonical_rel_path,
+            "Notes/Archive/new.md"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_novel_path_does_not_scan_unrelated_same_basename() {
+        let (svc, kb_id, _dir) = test_service_with_file("deep/terms.md", "x").await;
+        let spec = WriteTargetSpec::Path { kb_id: kb_id.clone(), rel_path: "terms.md".into() };
+        let resolution = svc
+            .resolve_write_target(&[kb_id.clone()], &spec)
+            .await
+            .unwrap();
+        assert_eq!(resolution.op, WriteOp::Create);
+        assert_eq!(resolution.canonical_rel_path, "terms.md");
+    }
+
+    #[tokio::test]
+    async fn resolve_out_of_scope_kb_is_forbidden() {
+        let (svc, kb_id, _dir) = test_service_with_file("terms.md", "x").await;
+        let h = encode_doc_handle(&kb_id, "terms.md");
+        let err = svc.resolve_write_target(&[], &WriteTargetSpec::Handle(h)).await.unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[test]
+    fn portable_writeback_path_validation_matches_all_supported_filesystems() {
+        for invalid in [
+            "CON.md",
+            "com¹.md",
+            "LPT³",
+            "trailing.",
+            "trailing ",
+            "a:b.md",
+        ] {
+            assert!(
+                validate_portable_path_component(invalid).is_err(),
+                "{invalid} must be rejected portably"
+            );
+        }
+        assert!(
+            validate_portable_path_component(&format!(
+                "{}.md",
+                "界".repeat(86)
+            ))
+            .is_err(),
+            "component must honor the 255-byte Unix name limit"
+        );
+        assert_eq!(
+            portable_path_component_identity("Maße.md"),
+            portable_path_component_identity("MASSE.md")
+        );
+        assert_eq!(
+            portable_path_component_identity("ß.md"),
+            portable_path_component_identity("ẞ.md")
+        );
+        assert_eq!(
+            portable_path_component_identity("οσ.md"),
+            portable_path_component_identity("ος.md")
+        );
+        assert_eq!(
+            portable_path_component_identity("café.md"),
+            portable_path_component_identity("cafe\u{301}.md")
+        );
+        assert_ne!(
+            portable_path_component_identity("①.md"),
+            portable_path_component_identity("1.md"),
+            "compatibility characters that filesystems keep distinct must not collide"
+        );
+        assert!(validate_portable_path_component("portable.md").is_ok());
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_named_snapshots_user_paths_remain_editable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let kb = service
+            .create_base(
+                "Live source",
+                "",
+                None,
+                Some(url_source(
+                    KnowledgeSourceMode::Live,
+                    &["https://example.com/docs"],
+                )),
+            )
+            .await
+            .unwrap();
+
+        let written = service
+            .write_document(WriteRequest {
+                spec: WriteTargetSpec::Path {
+                    kb_id: kb.knowledge_base_id.clone(),
+                    rel_path: "snapshots/manual.md".into(),
+                },
+                content: "# Must not overwrite source state\n".into(),
+                policy: WritePolicy {
+                    mode: WriteMode::Direct,
+                    allow_create: true,
+                    surface: WriteSurface::RegularChat,
+                },
+                bound_kb_ids: vec![kb.knowledge_base_id.clone()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(written.op, WriteOp::Create);
+
+        let root = PathBuf::from(&kb.root_path);
+        std::fs::write(
+            root.join("snapshots/captured.md"),
+            source_url::snapshot_markdown(
+                "https://example.com/docs",
+                "2026-01-01T00:00:00Z",
+                None,
+                "managed",
+            ),
+        )
+        .unwrap();
+        let error = service
+            .write_document(WriteRequest {
+                spec: WriteTargetSpec::Path {
+                    kb_id: kb.knowledge_base_id.clone(),
+                    rel_path: "snapshots/captured.md".into(),
+                },
+                content: "# attempted overwrite\n".into(),
+                policy: WritePolicy {
+                    mode: WriteMode::Direct,
+                    allow_create: true,
+                    surface: WriteSurface::RegularChat,
+                },
+                bound_kb_ids: vec![kb.knowledge_base_id.clone()],
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::Forbidden(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_source_attachment_does_not_reserve_a_directory_name() {
+        let (service, kb_id, _dir) =
+            test_service_with_file("terms.md", "x").await;
+        let direct_spec = WriteTargetSpec::Path {
+            kb_id: kb_id.clone(),
+            rel_path: "snapshots/direct.md".into(),
+        };
+        let direct_resolution = service
+            .resolve_write_target(
+                std::slice::from_ref(&kb_id),
+                &direct_spec,
+            )
+            .await
+            .unwrap();
+
+        service
+            .set_source(
+                kb_id.as_str(),
+                Some(url_source(
+                    KnowledgeSourceMode::Live,
+                    &["https://example.com/docs"],
+                )),
+            )
+            .await
+            .unwrap();
+
+        service
+            .write_resolved_document_under_target_lock(
+                WriteRequest {
+                    spec: direct_spec,
+                    content: "# Direct\n".into(),
+                    policy: WritePolicy {
+                        mode: WriteMode::Direct,
+                        allow_create: true,
+                        surface: WriteSurface::RegularChat,
+                    },
+                    bound_kb_ids: vec![kb_id.clone()],
+                },
+                direct_resolution,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            service
+                .read_file(kb_id.as_str(), "snapshots/direct.md")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_stale_source_refresh_cannot_overwrite_new_config() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (service, repo) =
+            service_with_repo(&dir.path().join("data"));
+        let source_a = url_source(
+            KnowledgeSourceMode::Live,
+            &["https://example.com/a"],
+        );
+        let kb = service
+            .create_base("Source", "", None, Some(source_a))
+            .await
+            .unwrap();
+        let mut stale_row =
+            service.require_base(kb.knowledge_base_id.as_str()).await.unwrap();
+        let mut stale_source =
+            source_from_extra(&stale_row.extra).unwrap().unwrap();
+        stale_source.last_fetched_at = Some(123);
+        let source_b = url_source(
+            KnowledgeSourceMode::Live,
+            &["https://example.com/b"],
+        );
+        service
+            .set_source(kb.knowledge_base_id.as_str(), Some(source_b))
+            .await
+            .unwrap();
+
+        let error = service
+            .persist_source(&mut stale_row, &stale_source)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
+        let stored =
+            extra_source(&repo, kb.knowledge_base_id.as_str()).unwrap();
+        assert_eq!(stored.entries[0].url, "https://example.com/b");
+
+        service
+            .update_base(
+                kb.knowledge_base_id.as_str(),
+                Some("Renamed"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let stored_after_metadata =
+            extra_source(&repo, kb.knowledge_base_id.as_str()).unwrap();
+        assert_eq!(
+            stored_after_metadata.entries[0].url,
+            "https://example.com/b"
+        );
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_source_switch_prevents_stale_snapshot_publication() {
+        use crate::source_url::FetchedPage;
+        use tokio::sync::Barrier;
+
+        #[derive(Clone)]
+        struct PausingFetcher {
+            started: Arc<Barrier>,
+            resume: Arc<Barrier>,
+        }
+
+        #[async_trait::async_trait]
+        impl PageFetcher for PausingFetcher {
+            async fn fetch_page(
+                &self,
+                raw_url: &str,
+            ) -> Result<FetchedPage, AppError> {
+                self.started.wait().await;
+                self.resume.wait().await;
+                Ok(FetchedPage {
+                    final_url: raw_url.to_owned(),
+                    title: Some("stale A".into()),
+                    markdown: "source A body".into(),
+                    truncated: false,
+                })
+            }
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = Arc::new(MemRepo::default());
+        let started = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let service = Arc::new(
+            KnowledgeService::new(
+                repo.clone(),
+                &dir.path().join("data"),
+                KnowledgeEventEmitter::new(
+                    Arc::new(NoopBroadcaster),
+                    Arc::from(TEST_OWNER_ID),
+                ),
+            )
+            .with_url_fetcher(PausingFetcher {
+                started: Arc::clone(&started),
+                resume: Arc::clone(&resume),
+            }),
+        );
+        let source_a = url_source(
+            KnowledgeSourceMode::Live,
+            &["https://example.com/a"],
+        );
+        let kb = service
+            .create_base("Source race", "", None, Some(source_a))
+            .await
+            .unwrap();
+        let kb_id = kb.knowledge_base_id.clone();
+        let refreshing = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service.refresh_source(kb_id.as_str()).await
+            })
+        };
+
+        started.wait().await;
+        service
+            .set_source(
+                kb.knowledge_base_id.as_str(),
+                Some(url_source(
+                    KnowledgeSourceMode::Live,
+                    &["https://example.com/b"],
+                )),
+            )
+            .await
+            .unwrap();
+        resume.wait().await;
+
+        let error = refreshing.await.unwrap().unwrap_err();
+        assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
+        let stored =
+            extra_source(&repo, kb.knowledge_base_id.as_str()).unwrap();
+        assert_eq!(stored.entries[0].url, "https://example.com/b");
+        let snapshots =
+            Path::new(&kb.root_path).join(source_url::SNAPSHOT_REL_DIR);
+        assert!(
+            !snapshots.exists()
+                || std::fs::read_dir(&snapshots)
+                    .unwrap()
+                    .next()
+                    .is_none(),
+            "stale source A must not publish any snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_tree_mutations_reject_aliases_and_allow_case_rename() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let kb = service.create_base("Tree", "", None, None).await.unwrap();
+        service
+            .create_folder(kb.knowledge_base_id.as_str(), "Notes")
+            .await
+            .unwrap();
+        let duplicate = service
+            .create_folder(kb.knowledge_base_id.as_str(), "notes")
+            .await
+            .unwrap_err();
+        assert!(matches!(duplicate, AppError::Conflict(_)), "{duplicate:?}");
+
+        service
+            .write_file(kb.knowledge_base_id.as_str(), "Notes/Alpha.md", "x")
+            .await
+            .unwrap();
+        service
+            .rename_tree_entry(
+                kb.knowledge_base_id.as_str(),
+                "Notes/Alpha.md",
+                "alpha.md",
+            )
+            .await
+            .unwrap();
+        let names = std::fs::read_dir(Path::new(&kb.root_path).join("Notes"))
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["alpha.md"]);
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_legacy_root_alias_is_never_blessed_on_startup() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let physical_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let real_parent = physical_dir.join("real-parent");
+        let alias_parent = physical_dir.join("alias-parent");
+        let real_root = real_parent.join("kb");
+        std::fs::create_dir_all(&real_root).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_parent, &alias_parent).unwrap();
+        #[cfg(windows)]
+        junction::create(&real_parent, &alias_parent).unwrap();
+
+        let repo = Arc::new(MemRepo::default());
+        let kb_id = KnowledgeBaseId::new();
+        repo.bases.lock().unwrap().push(KnowledgeBaseRow {
+            id: 1,
+            knowledge_base_id: kb_id.clone().into_string(),
+            name: "Legacy".into(),
+            description: String::new(),
+            root_path: alias_parent
+                .join("kb")
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            managed: false,
+            tree_access: "editable".into(),
+            extra: "{}".into(),
+            created_at: 0,
+            updated_at: 0,
+            tags: None,
+        });
+        let service = KnowledgeService::new(
+            repo.clone(),
+            &physical_dir.join("data"),
+            KnowledgeEventEmitter::new(
+                Arc::new(NoopBroadcaster),
+                Arc::from(TEST_OWNER_ID),
+            ),
+        );
+
+        let stored = repo
+            .bases
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|row| row.knowledge_base_id == kb_id.as_str())
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            PathBuf::from(stored.root_path),
+            alias_parent.join("kb"),
+            "startup must never rewrite an unsafe legacy alias into a newly trusted root"
+        );
+        let error = service
+            .write_file(kb_id.as_str(), "blocked.md", "must not escape")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
+        assert!(!real_root.join("blocked.md").exists());
+        #[cfg(windows)]
+        junction::delete(&alias_parent).unwrap();
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_rejects_registered_root_retargeting() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let physical_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let service = make_service(&physical_dir.join("data"));
+        let registered_root = physical_dir.join("registered");
+        let moved_root = physical_dir.join("moved");
+        let outside = physical_dir.join("outside");
+        std::fs::create_dir_all(&registered_root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let kb = service
+            .create_base(
+                "External",
+                "",
+                Some(registered_root.to_str().unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        service
+            .write_file(
+                kb.knowledge_base_id.as_str(),
+                "before.md",
+                "safe",
+            )
+            .await
+            .unwrap();
+        std::fs::rename(&registered_root, &moved_root).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &registered_root).unwrap();
+        #[cfg(windows)]
+        junction::create(&outside, &registered_root).unwrap();
+        std::fs::write(
+            outside.join("secret.md"),
+            "# Outside secret\nnever expose",
+        )
+        .unwrap();
+
+        let error = service
+            .write_file(
+                kb.knowledge_base_id.as_str(),
+                "escaped.md",
+                "must not escape",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
+        assert!(!outside.join("escaped.md").exists());
+        assert!(
+            service
+                .list_files(kb.knowledge_base_id.as_str())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            service
+                .search_bases(
+                    std::slice::from_ref(&kb.knowledge_base_id),
+                    "never expose",
+                    10,
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(build_toc(&registered_root).await.is_empty());
+        #[cfg(unix)]
+        std::fs::remove_file(&registered_root).unwrap();
+        #[cfg(windows)]
+        junction::delete(&registered_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_refresh_rejects_retargeted_root_before_prune() {
+        use crate::source_url::FetchedPage;
+
+        struct CannedFetcher;
+        #[async_trait::async_trait]
+        impl PageFetcher for CannedFetcher {
+            async fn fetch_page(
+                &self,
+                raw_url: &str,
+            ) -> Result<FetchedPage, AppError> {
+                Ok(FetchedPage {
+                    final_url: raw_url.into(),
+                    title: None,
+                    markdown: "fresh".into(),
+                    truncated: false,
+                })
+            }
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let physical_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let repo = Arc::new(MemRepo::default());
+        let service = KnowledgeService::new(
+            repo,
+            &physical_dir.join("data"),
+            KnowledgeEventEmitter::new(
+                Arc::new(NoopBroadcaster),
+                Arc::from(TEST_OWNER_ID),
+            ),
+        )
+        .with_url_fetcher(CannedFetcher);
+        let registered = physical_dir.join("refresh-root");
+        let moved = physical_dir.join("refresh-moved");
+        let outside = physical_dir.join("refresh-outside");
+        std::fs::create_dir_all(&registered).unwrap();
+        std::fs::create_dir_all(outside.join("snapshots")).unwrap();
+        let kb = service
+            .create_base(
+                "refresh root",
+                "",
+                Some(registered.to_str().unwrap()),
+                Some(url_source(
+                    KnowledgeSourceMode::Live,
+                    &["https://example.com/current"],
+                )),
+            )
+            .await
+            .unwrap();
+        service
+            .write_file(
+                kb.knowledge_base_id.as_str(),
+                "prime-lock-cache.md",
+                "safe",
+            )
+            .await
+            .unwrap();
+        std::fs::rename(&registered, &moved).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &registered).unwrap();
+        #[cfg(windows)]
+        junction::create(&outside, &registered).unwrap();
+        let orphan = outside.join("snapshots/orphan.md");
+        std::fs::write(
+            &orphan,
+            "---\nsource_url: https://example.com/old\n---\nexternal",
+        )
+        .unwrap();
+
+        let error = service
+            .refresh_source(kb.knowledge_base_id.as_str())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
+        assert_eq!(
+            std::fs::read_to_string(&orphan).unwrap(),
+            "---\nsource_url: https://example.com/old\n---\nexternal"
+        );
+        #[cfg(unix)]
+        std::fs::remove_file(&registered).unwrap();
+        #[cfg(windows)]
+        junction::delete(&registered).unwrap();
+    }
+
+    // ── write_document + per-surface WritePolicy (P1) ─────────────────
+
+    fn wb_binding(writeback: bool) -> KnowledgeBinding {
+        KnowledgeBinding { enabled: true, writeback, ..Default::default() }
+    }
+
+    #[tokio::test]
+    async fn search_cache_serves_unchanged_and_invalidates_on_edit() {
+        let (svc, kb_id, _dir) = test_service_with_file("doc.md", "# 标题\n市盈率 PER 内容").await;
+        // First search populates the cache.
+        let hits = svc.search_bases(&[kb_id.clone()], "市盈率", 8).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(svc.search_cache_len() >= 1, "cache should be populated after a search");
+        // Second search → same result (served from cache).
+        let hits2 = svc.search_bases(&[kb_id.clone()], "市盈率", 8).await.unwrap();
+        assert_eq!(hits2.len(), 1);
+        assert_eq!(hits2[0].rel_path, hits[0].rel_path);
+        // Overwrite (size + mtime change) → cache invalidates, new content searchable.
+        svc.write_file(&kb_id, "doc.md", "# 标题\n净资产收益率 ROE 新内容补充").await.unwrap();
+        let hits3 = svc.search_bases(&[kb_id.clone()], "ROE", 8).await.unwrap();
+        assert_eq!(hits3.len(), 1, "edited content must be searchable");
+        let stale = svc.search_bases(&[kb_id.clone()], "市盈率", 8).await.unwrap();
+        assert!(stale.is_empty(), "old content must not survive in cache");
+        // Clear empties the cache.
+        svc.clear_search_cache();
+        assert_eq!(svc.search_cache_len(), 0);
+    }
+
+    /// Placement is no longer a per-surface choice: every surface either writes
+    /// the base body or is refused outright. The single asymmetry left is the
+    /// external IM channel, so the whole matrix is pinned here — a third variant
+    /// silently reappearing would reintroduce a landing spot nobody reviews.
+    #[test]
+    fn write_policy_is_direct_or_disabled_on_every_surface() {
+        const SURFACES: [WriteSurface; 4] = [
+            WriteSurface::RegularChat,
+            WriteSurface::Companion,
+            WriteSurface::Terminal,
+            WriteSurface::ExternalChannel,
+        ];
+
+        for surface in SURFACES {
+            // `channel_write_enabled` is deliberately on here: the toggle may
+            // only widen an already-open door, never open one.
+            let mut off = wb_binding(false);
+            off.channel_write_enabled = true;
+            assert!(
+                matches!(resolve_write_policy(surface, &off).mode, WriteMode::Disabled),
+                "{surface:?} must stay disabled while write-back is off"
+            );
+        }
+
+        for surface in [
+            WriteSurface::RegularChat,
+            WriteSurface::Companion,
+            WriteSurface::Terminal,
+        ] {
+            assert!(
+                matches!(resolve_write_policy(surface, &wb_binding(true)).mode, WriteMode::Direct),
+                "{surface:?} writes the base body once write-back is on"
+            );
+        }
+
+        assert!(matches!(
+            resolve_write_policy(WriteSurface::ExternalChannel, &wb_binding(true)).mode,
+            WriteMode::Disabled
+        ));
+        let mut channel_on = wb_binding(true);
+        channel_on.channel_write_enabled = true;
+        assert!(matches!(
+            resolve_write_policy(WriteSurface::ExternalChannel, &channel_on).mode,
+            WriteMode::Direct
+        ));
+    }
+
+    /// `channel_write_enabled` is all that stands between an unattended IM bot
+    /// and the base body, so it keeps its own named guard: the flip must be the
+    /// only way in, and powerless while the binding itself is off.
+    #[test]
+    fn policy_external_channel_respects_write_toggle() {
+        // Off (default) → Disabled even with writeback on.
+        let off = KnowledgeBinding { enabled: true, writeback: true, channel_write_enabled: false, ..Default::default() };
+        assert!(matches!(resolve_write_policy(WriteSurface::ExternalChannel, &off).mode, WriteMode::Disabled));
+        // On → the owner has opted in, so the channel writes like any surface.
+        let on = KnowledgeBinding { enabled: true, writeback: true, channel_write_enabled: true, ..Default::default() };
+        assert!(matches!(resolve_write_policy(WriteSurface::ExternalChannel, &on).mode, WriteMode::Direct));
+        // Both switches are irrelevant when the binding is not enabled at all —
+        // nothing is mounted, so nothing may be written.
+        let unbound = KnowledgeBinding { enabled: false, writeback: true, channel_write_enabled: true, ..Default::default() };
+        assert!(matches!(resolve_write_policy(WriteSurface::ExternalChannel, &unbound).mode, WriteMode::Disabled));
+    }
+
+    /// The disposition vocabulary shrank to `manual`/`auto`. `conservative` and
+    /// `aggressive` must not be quietly re-admitted: they parse to the
+    /// restrained default, so an owner would believe a disposition they never
+    /// chose was in force.
+    #[test]
+    fn eagerness_allow_list_is_manual_and_auto() {
+        assert_eq!(WRITEBACK_EAGERNESS, &["manual", "auto"]);
+        for retired in ["conservative", "aggressive"] {
+            assert!(
+                !WRITEBACK_EAGERNESS.contains(&retired),
+                "{retired} is retired vocabulary and must not be accepted"
+            );
+        }
+        assert_eq!(KnowledgeBinding::default().writeback_eagerness, "manual");
+    }
+
+    /// An un-migrated caller must fail loudly rather than be silently coerced —
+    /// a coerced binding reads back as configured while behaving as `manual`.
+    #[tokio::test]
+    async fn set_binding_rejects_the_retired_disposition_vocabulary() {
+        let (svc, kb_id, _dir) = test_service_with_file("a.md", "x").await;
+        let error = svc
+            .set_binding(
+                "conversation",
+                TEST_CONVERSATION_ID,
+                KnowledgeBinding {
+                    enabled: true,
+                    writeback: true,
+                    writeback_eagerness: "conservative".into(),
+                    kb_ids: vec![kb_id],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, AppError::BadRequest(ref message) if message.contains("writeback_eagerness")),
+            "{error}"
+        );
+    }
+
+    /// Second rule of [`validate_canonical_write_target`]: a document parked
+    /// under a directory the walkers prune is invisible to search and to the
+    /// owner, so a write-back that lands there is indistinguishable from a
+    /// write-back that was silently dropped.
+    #[test]
+    fn canonical_write_target_refuses_directories_hidden_from_review() {
+        for hidden in [
+            ".obsidian/workspace.md",
+            ".git/COMMIT_EDITMSG.md",
+            "node_modules/pkg/readme.md",
+            "_trash/old.md",
+            "notes/.hidden/deep.md",
+        ] {
+            assert!(
+                matches!(
+                    validate_canonical_write_target(hidden),
+                    Err(AppError::BadRequest(_))
+                ),
+                "{hidden} must be refused"
+            );
+        }
+        assert!(validate_canonical_write_target("notes/visible.md").is_ok());
+        // Only PARENT components are machinery — a leading-dot file name is a
+        // legitimate document and must not be swept up by the same rule.
+        assert!(validate_canonical_write_target(".hidden.md").is_ok());
+    }
+
+    /// The handle spec (what `knowledge_search`/`knowledge_read` hand back) must
+    /// resolve to the very document it was minted from and append there.
+    #[tokio::test]
+    async fn direct_update_via_handle_appends_to_the_addressed_document() {
+        let (svc, kb_id, _dir) = test_service_with_file("terms.md", "OLD").await;
+        let req = WriteRequest {
+            spec: WriteTargetSpec::Handle(encode_doc_handle(&kb_id, "terms.md")),
+            content: "NEW".into(),
+            policy: WritePolicy { mode: WriteMode::Direct, allow_create: true, surface: WriteSurface::Companion },
+            bound_kb_ids: vec![kb_id.clone()],
+        };
+        let out = svc.write_document(req).await.unwrap();
+        assert_eq!(out.final_rel_path, "terms.md");
+        assert_eq!(out.op, WriteOp::Update);
+        let body = svc.read_file(&kb_id, "terms.md").await.unwrap().content;
+        assert!(body.starts_with("OLD"), "{body}");
+        assert!(body.contains("NEW"), "{body}");
+    }
+
+    /// The regression guard for the data-loss hazard staged placement used to
+    /// cover. The tool write path may no longer overwrite: the model sees a
+    /// prompt-sized excerpt, never the whole document, so an unconditional
+    /// rewrite would silently discard everything the owner curated by hand.
+    /// A short new fact must therefore be APPENDED to a large document that
+    /// stays byte-for-byte intact.
+    #[tokio::test]
+    async fn tool_direct_update_appends_and_never_truncates() {
+        let existing = format!(
+            "# 术语表\n\n{}\nTAIL-SENTINEL\n",
+            "已有条目：必须原样保留。\n".repeat(2_000)
+        );
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, kb_id, root) = crate::testutil::make_service_with_base(
+            &dir.path().join("data"),
+            "库",
+            &[("terms.md", existing.as_str())],
+        )
+        .await;
+
+        let out = svc
+            .write_document(WriteRequest {
+                spec: WriteTargetSpec::Path {
+                    kb_id: kb_id.clone(),
+                    rel_path: "terms.md".into(),
+                },
+                content: "新增：一条简短的事实。".into(),
+                policy: WritePolicy {
+                    mode: WriteMode::Direct,
+                    allow_create: true,
+                    surface: WriteSurface::RegularChat,
+                },
+                bound_kb_ids: vec![kb_id.clone()],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(out.op, WriteOp::Update);
+        // Read the raw bytes rather than going back through the service, so the
+        // truncation claim is about what actually reached the disk.
+        let body = std::fs::read_to_string(root.join("terms.md")).unwrap();
+        assert!(body.starts_with("# 术语表"), "original heading was rewritten");
+        assert!(body.contains("已有条目：必须原样保留。"), "original body text was lost");
+        assert!(body.contains("TAIL-SENTINEL"), "the document tail was truncated");
+        assert!(body.contains("新增：一条简短的事实。"), "the new fact never landed");
+        assert!(
+            body.len() > existing.len(),
+            "a short update must grow the document, never shrink it: {} vs {}",
+            body.len(),
+            existing.len()
+        );
+    }
+
+    /// Repeated turns and manual retries propose the same material again. That
+    /// must be a no-op rather than a stack of duplicate paragraphs.
+    #[tokio::test]
+    async fn tool_direct_update_is_idempotent_for_material_already_present() {
+        let (svc, kb_id, _dir) =
+            test_service_with_file("terms.md", "# 术语表\n\n已有条目。\n").await;
+        let request = || WriteRequest {
+            spec: WriteTargetSpec::Path {
+                kb_id: kb_id.clone(),
+                rel_path: "terms.md".into(),
+            },
+            content: "新增：只应出现一次。".into(),
+            policy: WritePolicy {
+                mode: WriteMode::Direct,
+                allow_create: true,
+                surface: WriteSurface::RegularChat,
+            },
+            bound_kb_ids: vec![kb_id.clone()],
+        };
+
+        svc.write_document(request()).await.unwrap();
+        let first = svc.read_file(&kb_id, "terms.md").await.unwrap().content;
+        svc.write_document(request()).await.unwrap();
+        let second = svc.read_file(&kb_id, "terms.md").await.unwrap().content;
+
+        assert_eq!(first, second, "the retry must not touch the document at all");
+        assert_eq!(
+            second.matches("新增：只应出现一次。").count(),
+            1,
+            "{second}"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_mode_refuses() {
+        let (svc, kb_id, _dir) = test_service_with_file("terms.md", "x").await;
+        let req = WriteRequest {
+            spec: WriteTargetSpec::Path { kb_id: kb_id.clone(), rel_path: "terms.md".into() },
+            content: "y".into(),
+            policy: WritePolicy { mode: WriteMode::Disabled, allow_create: true, surface: WriteSurface::ExternalChannel },
+            bound_kb_ids: vec![kb_id.clone()],
+        };
+        assert!(matches!(svc.write_document(req).await.unwrap_err(), AppError::Forbidden(_)));
+    }
+
+    /// The exact reported scenario: the model passes the workspace-MOUNT path
+    /// instead of the base-relative one. That must resolve to the ORIGINAL
+    /// document — not create a new file nested under `.nomi/knowledge/...`,
+    /// which nothing would ever read back.
+    #[tokio::test]
+    async fn mothers_bug_mount_prefixed_path_updates_original_not_a_nested_copy() {
+        let (svc, kb_id, _dir) = test_service_with_file("terms.md", "ORIGINAL").await;
+        let req = WriteRequest {
+            spec: WriteTargetSpec::Path { kb_id: kb_id.clone(), rel_path: ".nomi/knowledge/Finance/terms.md".into() },
+            content: "PROPOSED EDIT".into(),
+            policy: WritePolicy { mode: WriteMode::Direct, allow_create: true, surface: WriteSurface::RegularChat },
+            bound_kb_ids: vec![kb_id.clone()],
+        };
+        let out = svc.write_document(req).await.unwrap();
+        assert_eq!(
+            out.final_rel_path,
+            "terms.md",
+            "update the original, not nest under .nomi/..."
+        );
+        assert_eq!(out.op, WriteOp::Update);
+        let body = svc.read_file(&kb_id, "terms.md").await.unwrap().content;
+        assert!(body.starts_with("ORIGINAL"), "{body}");
+        assert!(body.contains("PROPOSED EDIT"), "{body}");
+        let files = svc.list_files(&kb_id).await.unwrap();
+        assert!(!files.iter().any(|f| f.rel_path.contains(".nomi/knowledge")), "no nested mount-path file: {files:?}");
+    }
+
+    #[tokio::test]
+    async fn turn_finalizer_auto_writes_candidate_to_the_base_after_final_answer() {
+        let (svc, kb_id, _dir) = test_service_with_file("terms.md", "ORIGINAL").await;
+        let reply = format!(
+            r##"{{"candidates":[{{"kb_id":"{kb_id}","rel_path":"patterns/finalizer.md","content":"# 回写触发\n\n知识库回写应在 assistant 最终答复后再检查一次。"}}]}}"##
+        );
+        let completer = ScriptedCompleter::new(&[&reply]);
+        svc.set_completer(completer.clone());
+
+        let report = svc
+            .finalize_turn_writeback(TurnWritebackRequest {
+                mounts: vec![KnowledgeMountInfo {
+                    knowledge_base_id: KnowledgeBaseId::parse(kb_id.clone()).unwrap(),
+                    name: "领域库".into(),
+                    description: "项目复用知识".into(),
+                    rel_path: ".nomi/knowledge/领域库".into(),
+                    toc: vec!["terms.md — 术语表".into()],
+                    summary: None,
+                    live_sources: Vec::new(),
+                }],
+                binding: KnowledgeBinding {
+                    enabled: true,
+                    writeback: true,
+                    writeback_eagerness: "auto".into(),
+                    kb_ids: vec![KnowledgeBaseId::parse(kb_id.clone()).unwrap()],
+                    ..Default::default()
+                },
+                surface: WriteSurface::RegularChat,
+                user_text: "请分析为什么回写没有产出。".into(),
+                assistant_text: "结论：触发时机应放在最终答复之后。".into(),
+                model: None,
+                excluded_targets: None,
+                cancellation: None,
+            })
+            .await;
+
+        assert_eq!(report.status, TurnWritebackStatus::Written);
+        assert_eq!(report.written.len(), 1);
+        assert_eq!(report.written[0].final_rel_path, "patterns/finalizer.md");
+        assert_eq!(report.written[0].op, WriteOp::Create);
+        // A new document must not disturb the unrelated one it sits beside.
+        assert_eq!(svc.read_file(&kb_id, "terms.md").await.unwrap().content, "ORIGINAL");
+        assert!(
+            svc.read_file(&kb_id, "patterns/finalizer.md")
+                .await
+                .unwrap()
+                .content
+                .contains("最终答复后再检查一次")
+        );
+        assert_eq!(completer.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            completer.last_user.lock().unwrap().contains("eagerness: auto"),
+            "eagerness must reach extraction — it is the only knob left"
+        );
+        assert_eq!(
+            *completer.last_override.lock().unwrap(),
+            None,
+            "a request without an explicit model must keep the completer's default path"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_finalizer_uses_explicit_effective_model_override() {
+        let (svc, kb_id, _dir) = test_service_with_file("terms.md", "ORIGINAL").await;
+        let completer = ScriptedCompleter::new(&[r#"{"candidates":[]}"#]);
+        svc.set_completer(completer.clone());
+
+        let report = svc
+            .finalize_turn_writeback(TurnWritebackRequest {
+                mounts: vec![KnowledgeMountInfo {
+                    knowledge_base_id: kb_id.clone(),
+                    name: "领域库".into(),
+                    description: String::new(),
+                    rel_path: ".nomi/knowledge/领域库".into(),
+                    toc: Vec::new(),
+                    summary: None,
+                    live_sources: Vec::new(),
+                }],
+                binding: KnowledgeBinding {
+                    enabled: true,
+                    writeback: true,
+                    kb_ids: vec![kb_id],
+                    ..Default::default()
+                },
+                surface: WriteSurface::RegularChat,
+                user_text: "u".into(),
+                assistant_text: "a".into(),
+                model: Some(ProviderWithModel {
+                    provider_id: TEST_PROVIDER_ID_2.to_owned(),
+                    model: "configured-name".into(),
+                    use_model: Some("effective-name".into()),
+                }),
+                excluded_targets: None,
+                cancellation: None,
+            })
+            .await;
+
+        assert_eq!(report.status, TurnWritebackStatus::NoCandidate);
+        assert_eq!(completer.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *completer.last_override.lock().unwrap(),
+            Some((TEST_PROVIDER_ID_2.to_owned(), "effective-name".to_owned())),
+            "turn-final write-back must call complete_with using use_model when present"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_finalizer_rejects_candidate_overflow_before_any_write() {
+        let (svc, kb_id, _dir) = test_service_with_file("terms.md", "ORIGINAL").await;
+        let candidates = (0..=TURN_WRITEBACK_MAX_CANDIDATES)
+            .map(|index| {
+                serde_json::json!({
+                    "kb_id": kb_id.as_str(),
+                    "rel_path": format!("overflow/{index}.md"),
+                    "content": format!("# Candidate {index}")
+                })
+            })
+            .collect::<Vec<_>>();
+        let reply = serde_json::json!({ "candidates": candidates }).to_string();
+        let completer = ScriptedCompleter::new(&[&reply]);
+        svc.set_completer(completer.clone());
+
+        let report = svc
+            .finalize_turn_writeback(TurnWritebackRequest {
+                mounts: vec![KnowledgeMountInfo {
+                    knowledge_base_id: kb_id.clone(),
+                    name: "领域库".into(),
+                    description: String::new(),
+                    rel_path: ".nomi/knowledge/领域库".into(),
+                    toc: Vec::new(),
+                    summary: None,
+                    live_sources: Vec::new(),
+                }],
+                binding: KnowledgeBinding {
+                    enabled: true,
+                    writeback: true,
+                    kb_ids: vec![kb_id.clone()],
+                    ..Default::default()
+                },
+                surface: WriteSurface::RegularChat,
+                user_text: "u".into(),
+                assistant_text: "a".into(),
+                model: None,
+                excluded_targets: None,
+                cancellation: None,
+            })
+            .await;
+
+        assert_eq!(report.status, TurnWritebackStatus::Failed);
+        assert_eq!(report.candidates, TURN_WRITEBACK_MAX_CANDIDATES + 1);
+        assert!(report.written.is_empty());
+        assert!(report.failures[0].error.contains("maximum is 8"));
+        assert!(
+            svc.list_files(&kb_id)
+                .await
+                .unwrap()
+                .iter()
+                .all(|file| file.rel_path == "terms.md"),
+            "candidate overflow must fail before the first disk write"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_finalizer_malformed_output_is_not_automatically_retried() {
+        let (svc, kb_id, _dir) = test_service_with_file("terms.md", "ORIGINAL").await;
+        let completer = ScriptedCompleter::new(&[
+            "not valid JSON",
+            r#"{"candidates":[]}"#,
+        ]);
+        svc.set_completer(completer.clone());
+
+        let report = svc
+            .finalize_turn_writeback(TurnWritebackRequest {
+                mounts: vec![KnowledgeMountInfo {
+                    knowledge_base_id: kb_id.clone(),
+                    name: "领域库".into(),
+                    description: String::new(),
+                    rel_path: ".nomi/knowledge/领域库".into(),
+                    toc: Vec::new(),
+                    summary: None,
+                    live_sources: Vec::new(),
+                }],
+                binding: KnowledgeBinding {
+                    enabled: true,
+                    writeback: true,
+                    kb_ids: vec![kb_id],
+                    ..Default::default()
+                },
+                surface: WriteSurface::RegularChat,
+                user_text: "u".into(),
+                assistant_text: "a".into(),
+                model: None,
+                excluded_targets: None,
+                cancellation: None,
+            })
+            .await;
+
+        assert_eq!(report.status, TurnWritebackStatus::Failed);
+        assert_eq!(
+            completer.calls.load(Ordering::SeqCst),
+            1,
+            "one background attempt must make exactly one extraction call; retry is user-driven"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_finalizer_disabled_policy_skips_without_calling_completer() {
+        let (svc, kb_id, _dir) = test_service_with_file("terms.md", "ORIGINAL").await;
+        let completer = ScriptedCompleter::new(&[r#"{"candidates":[]}"#]);
+        svc.set_completer(completer.clone());
+
+        let report = svc
+            .finalize_turn_writeback(TurnWritebackRequest {
+                mounts: vec![KnowledgeMountInfo {
+                    knowledge_base_id: KnowledgeBaseId::parse(kb_id.clone()).unwrap(),
+                    name: "领域库".into(),
+                    description: String::new(),
+                    rel_path: ".nomi/knowledge/领域库".into(),
+                    toc: Vec::new(),
+                    summary: None,
+                    live_sources: Vec::new(),
+                }],
+                binding: KnowledgeBinding {
+                    enabled: true,
+                    writeback: false,
+                    writeback_eagerness: "auto".into(),
+                    kb_ids: vec![KnowledgeBaseId::parse(kb_id).unwrap()],
+                    ..Default::default()
+                },
+                surface: WriteSurface::RegularChat,
+                user_text: "u".into(),
+                assistant_text: "a".into(),
+                model: None,
+                excluded_targets: None,
+                cancellation: None,
+            })
+            .await;
+
+        assert_eq!(report.status, TurnWritebackStatus::Disabled);
+        assert_eq!(
+            completer.calls.load(Ordering::SeqCst),
+            0,
+            "disabled write-back must not spend a model call"
+        );
+    }
+
+    /// The finalizer must refuse a candidate that would land somewhere the
+    /// walkers prune. Writing it would report success while producing a document
+    /// no search, TOC or owner will ever see again.
+    #[tokio::test]
+    async fn turn_finalizer_rejects_candidates_that_target_hidden_directories() {
+        let (svc, kb_id, _dir) = test_service_with_file("terms.md", "ORIGINAL").await;
+        let reply = format!(
+            r##"{{"candidates":[{{"kb_id":"{kb_id}","rel_path":".obsidian/manual.md","content":"# Bad"}}]}}"##
+        );
+        svc.set_completer(ScriptedCompleter::new(&[&reply]));
+
+        let report = svc
+            .finalize_turn_writeback(TurnWritebackRequest {
+                mounts: vec![KnowledgeMountInfo {
+                    knowledge_base_id: KnowledgeBaseId::parse(kb_id.clone()).unwrap(),
+                    name: "领域库".into(),
+                    description: String::new(),
+                    rel_path: ".nomi/knowledge/领域库".into(),
+                    toc: Vec::new(),
+                    summary: None,
+                    live_sources: Vec::new(),
+                }],
+                binding: KnowledgeBinding {
+                    enabled: true,
+                    writeback: true,
+                    kb_ids: vec![KnowledgeBaseId::parse(kb_id).unwrap()],
+                    ..Default::default()
+                },
+                surface: WriteSurface::RegularChat,
+                user_text: "u".into(),
+                assistant_text: "a".into(),
+                model: None,
+                excluded_targets: None,
+                cancellation: None,
+            })
+            .await;
+
+        assert_eq!(report.status, TurnWritebackStatus::Failed);
+        assert_eq!(report.written.len(), 0);
+        assert!(report.failures[0].error.contains("hidden from review and search"));
+    }
+
+    #[tokio::test]
+    async fn turn_finalizer_direct_update_appends_without_rewriting_existing_document() {
+        let existing = format!(
+            "# Existing\n\nKeep this established section.\n\n{}\nTAIL-SENTINEL",
+            "preserve-this-line\n".repeat(2_000)
+        );
+        assert!(
+            existing.chars().count() > 24_000,
+            "fixture must exceed the removed merge prompt's historical truncation bound"
+        );
+        let (svc, kb_id, _dir) = test_service_with_file(
+            "patterns/safe.md",
+            &existing,
+        )
+        .await;
+        let candidate = format!(
+            r##"{{"candidates":[{{"kb_id":"{kb_id}","rel_path":"patterns/safe.md","content":"# New\n\nAdd this durable lesson."}}]}}"##
+        );
+        let completer = ScriptedCompleter::new(&[&candidate]);
+        svc.set_completer(completer.clone());
+
+        let report = svc
+            .finalize_turn_writeback(TurnWritebackRequest {
+                mounts: vec![KnowledgeMountInfo {
+                    knowledge_base_id: KnowledgeBaseId::parse(kb_id.clone()).unwrap(),
+                    name: "领域库".into(),
+                    description: String::new(),
+                    rel_path: ".nomi/knowledge/领域库".into(),
+                    toc: vec!["patterns/safe.md — Safe".into()],
+                    summary: None,
+                    live_sources: Vec::new(),
+                }],
+                binding: KnowledgeBinding {
+                    enabled: true,
+                    writeback: true,
+                    writeback_eagerness: "auto".into(),
+                    kb_ids: vec![KnowledgeBaseId::parse(kb_id.clone()).unwrap()],
+                    ..Default::default()
+                },
+                surface: WriteSurface::RegularChat,
+                user_text: "请补充这个经验。".into(),
+                assistant_text: "结论：应保留旧内容并追加新经验。".into(),
+                model: None,
+                excluded_targets: None,
+                cancellation: None,
+            })
+            .await;
+
+        assert_eq!(report.status, TurnWritebackStatus::Written, "{report:?}");
+        assert_eq!(report.written[0].final_rel_path, "patterns/safe.md");
+        let body = svc.read_file(&kb_id, "patterns/safe.md").await.unwrap().content;
+        assert!(body.starts_with(&existing), "existing document bytes were rewritten or truncated");
+        assert!(body.contains("Keep this established section."), "{body}");
+        assert!(body.contains("TAIL-SENTINEL"), "long document tail was lost");
+        assert!(body.contains("Add this durable lesson."), "{body}");
+        assert_eq!(
+            completer.calls.load(Ordering::SeqCst),
+            1,
+            "direct mode must not make a second model call that can rewrite or truncate existing content"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_finalizer_direct_concurrent_updates_preserve_both_merges() {
+        let (svc, kb_id, _dir) = test_service_with_file("patterns/shared.md", "# Existing").await;
+        svc.set_completer(ConcurrentDirectMergeCompleter::new(kb_id.clone()));
+
+        let request = |user_text: &str| TurnWritebackRequest {
+            mounts: vec![KnowledgeMountInfo {
+                knowledge_base_id: KnowledgeBaseId::parse(kb_id.clone()).unwrap(),
+                name: "领域库".into(),
+                description: String::new(),
+                rel_path: ".nomi/knowledge/领域库".into(),
+                toc: vec!["patterns/shared.md — Shared".into()],
+                summary: None,
+                live_sources: Vec::new(),
+            }],
+            binding: KnowledgeBinding {
+                enabled: true,
+                writeback: true,
+                writeback_eagerness: "auto".into(),
+                kb_ids: vec![KnowledgeBaseId::parse(kb_id.clone()).unwrap()],
+                ..Default::default()
+            },
+            surface: WriteSurface::RegularChat,
+            user_text: user_text.into(),
+            assistant_text: "final durable answer".into(),
+            model: None,
+            excluded_targets: None,
+            cancellation: None,
+        };
+
+        let (alpha, beta) = tokio::join!(
+            svc.finalize_turn_writeback(request("alpha-user")),
+            svc.finalize_turn_writeback(request("beta-user")),
+        );
+
+        assert!(matches!(
+            alpha.status,
+            TurnWritebackStatus::Written | TurnWritebackStatus::NoCandidate
+        ));
+        assert!(matches!(
+            beta.status,
+            TurnWritebackStatus::Written | TurnWritebackStatus::NoCandidate
+        ));
+        let body = svc.read_file(&kb_id, "patterns/shared.md").await.unwrap().content;
+        assert!(body.contains("Alpha durable note."), "{body}");
+        assert!(body.contains("Beta durable note."), "{body}");
+    }
+
+    #[tokio::test]
+    async fn direct_case_aliases_share_one_lock_on_case_insensitive_filesystems() {
+        let (svc, kb_id, _dir) =
+            test_service_with_file("patterns/shared.md", "# Existing").await;
+        let root = PathBuf::from(
+            svc.get_base_info(kb_id.as_str())
+                .await
+                .unwrap()
+                .root_path,
+        );
+        if !tokio::fs::try_exists(root.join("PATTERNS").join("SHARED.MD"))
+            .await
+            .unwrap_or(false)
+        {
+            // A case-sensitive Linux/macOS volume correctly treats these as
+            // different paths; the alias race does not exist there.
+            return;
+        }
+        svc.set_completer(ConcurrentCaseAliasMergeCompleter::new(kb_id.clone()));
+
+        let request = |user_text: &str| TurnWritebackRequest {
+            mounts: vec![KnowledgeMountInfo {
+                knowledge_base_id: kb_id.clone(),
+                name: "Shared".into(),
+                description: String::new(),
+                rel_path: ".nomi/knowledge/Shared".into(),
+                toc: Vec::new(),
+                summary: None,
+                live_sources: Vec::new(),
+            }],
+            binding: KnowledgeBinding {
+                enabled: true,
+                writeback: true,
+                writeback_eagerness: "auto".into(),
+                kb_ids: vec![kb_id.clone()],
+                ..Default::default()
+            },
+            surface: WriteSurface::RegularChat,
+            user_text: user_text.into(),
+            assistant_text: "final durable answer".into(),
+            model: None,
+            excluded_targets: None,
+            cancellation: None,
+        };
+
+        let (alpha, beta) = tokio::join!(
+            svc.finalize_turn_writeback(request("alpha-user")),
+            svc.finalize_turn_writeback(request("beta-user")),
+        );
+        assert_eq!(alpha.status, TurnWritebackStatus::Written, "{alpha:?}");
+        assert_eq!(beta.status, TurnWritebackStatus::Written, "{beta:?}");
+        let body = svc
+            .read_file(kb_id.as_str(), "patterns/shared.md")
+            .await
+            .unwrap()
+            .content;
+        assert!(body.contains("Alpha durable note."), "{body}");
+        assert!(body.contains("Beta durable note."), "{body}");
+    }
+
+    /// The finalizer skips a candidate whose material is already in the target
+    /// document — an explicit `knowledge_write` earlier in the same turn is the
+    /// common case, and re-appending it would duplicate the paragraph.
+    #[tokio::test]
+    async fn turn_finalizer_skips_candidate_already_written_by_explicit_tool() {
+        let (svc, kb_id, _dir) = test_service_with_file("terms.md", "ORIGINAL").await;
+        let parsed_kb_id = KnowledgeBaseId::parse(kb_id.clone()).unwrap();
+        svc.write_document(WriteRequest {
+            spec: WriteTargetSpec::Path {
+                kb_id: parsed_kb_id.clone(),
+                rel_path: "patterns/note.md".into(),
+            },
+            content: "# Durable\n\nAlready written by knowledge_write.".into(),
+            policy: WritePolicy {
+                mode: WriteMode::Direct,
+                allow_create: true,
+                surface: WriteSurface::RegularChat,
+            },
+            bound_kb_ids: vec![parsed_kb_id],
+        })
+        .await
+        .unwrap();
+        let before = svc.read_file(&kb_id, "patterns/note.md").await.unwrap().content;
+        let reply = format!(
+            r##"{{"candidates":[{{"kb_id":"{kb_id}","rel_path":"patterns/note.md","content":"# Durable\n\nAlready written by knowledge_write."}}]}}"##
+        );
+        svc.set_completer(ScriptedCompleter::new(&[&reply]));
+
+        let report = svc
+            .finalize_turn_writeback(TurnWritebackRequest {
+                mounts: vec![KnowledgeMountInfo {
+                    knowledge_base_id: KnowledgeBaseId::parse(kb_id.clone()).unwrap(),
+                    name: "领域库".into(),
+                    description: String::new(),
+                    rel_path: ".nomi/knowledge/领域库".into(),
+                    toc: Vec::new(),
+                    summary: None,
+                    live_sources: Vec::new(),
+                }],
+                binding: KnowledgeBinding {
+                    enabled: true,
+                    writeback: true,
+                    kb_ids: vec![KnowledgeBaseId::parse(kb_id.clone()).unwrap()],
+                    ..Default::default()
+                },
+                surface: WriteSurface::RegularChat,
+                user_text: "u".into(),
+                assistant_text: "a".into(),
+                model: None,
+                excluded_targets: None,
+                cancellation: None,
+            })
+            .await;
+
+        assert_eq!(report.status, TurnWritebackStatus::NoCandidate, "{report:?}");
+        assert_eq!(report.written.len(), 0);
+        assert_eq!(
+            svc.read_file(&kb_id, "patterns/note.md").await.unwrap().content,
+            before,
+            "already-present material must not be appended a second time"
+        );
+    }
+
+    /// A retry that re-spells the path in another case must land on the SAME
+    /// document and keep the spelling the base already has. Otherwise a
+    /// case-insensitive volume ends up with two names for one file, and a
+    /// case-sensitive one silently forks the knowledge in two.
+    #[tokio::test]
+    async fn portable_writeback_retry_reuses_the_existing_case_alias() {
+        let (svc, kb_id, _dir) = test_service_with_file("terms.md", "x").await;
+        let request = |rel_path: &str| WriteRequest {
+            spec: WriteTargetSpec::Path {
+                kb_id: kb_id.clone(),
+                rel_path: rel_path.into(),
+            },
+            content: "# Portable proposal\n".into(),
+            policy: WritePolicy {
+                mode: WriteMode::Direct,
+                allow_create: true,
+                surface: WriteSurface::RegularChat,
+            },
+            bound_kb_ids: vec![kb_id.clone()],
+        };
+        let created = svc.write_document(request("Notes/Foo.md")).await.unwrap();
+        let retried = svc.write_document(request("notes/foo.md")).await.unwrap();
+
+        assert_eq!(created.op, WriteOp::Create);
+        assert_eq!(created.final_rel_path, "Notes/Foo.md");
+        assert_eq!(retried.op, WriteOp::Update);
+        assert_eq!(retried.final_rel_path, "Notes/Foo.md");
+        let documents = svc.list_files(&kb_id).await.unwrap();
+        assert_eq!(
+            documents
+                .iter()
+                .filter(|entry| entry.rel_path.ends_with("Foo.md"))
+                .count(),
+            1,
+            "the alias must not fork a second document: {documents:?}"
+        );
+    }
+
+    /// **P4 consumers**: `list_consumers` returns every binding that mounts the
+    /// base — enabled and disabled — and excludes bindings of other bases.
+    #[tokio::test]
+    async fn list_consumers_returns_enabled_and_disabled_bindings() {
+        let (svc, kb_id, _dir) = test_service_with_file("a.md", "x").await;
+        svc.set_binding(
+            "conversation",
+            TEST_CONVERSATION_ID,
+            KnowledgeBinding {
+                enabled: true,
+                kb_ids: vec![KnowledgeBaseId::parse(kb_id.clone()).unwrap()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        svc.set_binding(
+            "workpath",
+            "/Users/me/proj",
+            KnowledgeBinding {
+                enabled: false,
+                kb_ids: vec![KnowledgeBaseId::parse(kb_id.clone()).unwrap()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // A binding for a DIFFERENT base must not appear.
+        let other = svc.create_base("其他", "", None, None).await.unwrap();
+        svc.set_binding(
+            "terminal",
+            TEST_TERMINAL_ID_9,
+            KnowledgeBinding { enabled: true, kb_ids: vec![other.knowledge_base_id.clone()], ..Default::default() },
+        )
+        .await
+        .unwrap();
+
+        let consumers = svc.list_consumers(&kb_id).await.unwrap();
+        assert_eq!(consumers.len(), 2, "only bindings using this kb: {consumers:?}");
+        let conv = consumers.iter().find(|c| c.target_kind == "conversation").unwrap();
+        assert_eq!(conv.target_id.as_deref(), Some(TEST_CONVERSATION_ID));
+        assert!(conv.enabled);
+        assert!(!consumers.iter().find(|c| c.target_kind == "workpath").unwrap().enabled, "disabled included");
+    }
+
+    /// `derive_kind` covers all four UI type categories.
+    #[test]
+    fn derive_kind_covers_all_ui_types() {
+        // managed + no source = blank (user created from scratch)
+        assert_eq!(derive_kind(true, None), "blank");
+        // non-managed + no source = local (user-referenced directory)
+        assert_eq!(derive_kind(false, None), "local");
+        // URL source = web
+        let url = KnowledgeSource {
+            kind: "url".into(),
+            mode: KnowledgeSourceMode::Live,
+            entries: vec![],
+            last_fetched_at: None,
+            ..Default::default()
+        };
+        assert_eq!(derive_kind(true, Some(&url)), "web");
+        assert_eq!(derive_kind(false, Some(&url)), "web");
+    }
+
+    // ── Tag CRUD tests ───────────────────────────────────────────────────
+
+    fn test_service() -> KnowledgeService {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Leak the tempdir so it lives for the test's duration.
+        let path = dir.keep();
+        crate::testutil::make_service(&path)
+    }
+
+    #[tokio::test]
+    async fn delete_tag_strips_it_from_bases() {
+        let svc = test_service();
+        svc.create_tag("研发", None).await.unwrap();
+        let key = svc.list_tags().await.unwrap()[0].key.clone();
+        let base = svc.create_base("库A", "", None, None).await.unwrap();
+        svc.update_base(&base.knowledge_base_id, None, None, Some(vec![key.clone()])).await.unwrap();
+        // Verify the tag was written.
+        let before = svc.list_bases().await.unwrap().into_iter().find(|b| b.knowledge_base_id == base.knowledge_base_id).unwrap();
+        assert_eq!(before.tags, vec![key.clone()]);
+        // Delete the tag — must strip from the base.
+        svc.delete_tag(&key).await.unwrap();
+        let after = svc.list_bases().await.unwrap().into_iter().find(|b| b.knowledge_base_id == base.knowledge_base_id).unwrap();
+        assert!(after.tags.is_empty(), "删除标签须从库上剔除");
+    }
+
+    #[tokio::test]
+    async fn create_tag_slugifies_label() {
+        let svc = test_service();
+        let tag = svc.create_tag("Hello World", None).await.unwrap();
+        assert_eq!(tag.key, "hello-world");
+        assert_eq!(tag.label, "Hello World");
+    }
+
+    #[tokio::test]
+    async fn create_tag_dedup_on_conflict() {
+        let svc = test_service();
+        svc.create_tag("ops", None).await.unwrap();
+        let second = svc.create_tag("ops", None).await.unwrap();
+        assert_eq!(second.key, "ops-2");
+    }
+
+    #[tokio::test]
+    async fn create_tag_chinese_label_fallback() {
+        let svc = test_service();
+        let tag = svc.create_tag("研发", None).await.unwrap();
+        // Should start with "tag-" since the label is all CJK.
+        assert!(tag.key.starts_with("tag-"), "CJK label should get hash-based key, got: {}", tag.key);
+    }
+
+    #[tokio::test]
+    async fn update_tag_changes_label() {
+        let svc = test_service();
+        let tag = svc.create_tag("alpha", Some("red".into())).await.unwrap();
+        let updated = svc.update_tag(&tag.key, UpdateKnowledgeTagRequest {
+            label: Some("beta".into()),
+            color: None,
+            sort_order: None,
+        }).await.unwrap();
+        assert_eq!(updated.label, "beta");
+        assert_eq!(updated.color, Some("red".into())); // unchanged
+    }
+
+    /// Non-URL source kinds are unsupported and must be rejected at create time.
+    #[tokio::test]
+    async fn create_base_rejects_non_url_source_kinds() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (service, _repo) = service_with_repo(&dir.path().join("data"));
+        let source = KnowledgeSource {
+            kind: "feishu".into(),
+            mode: KnowledgeSourceMode::Snapshot,
+            entries: vec![],
+            last_fetched_at: None,
+            ..Default::default()
+        };
+        assert!(service.create_base("x", "", None, Some(source)).await.is_err());
+        assert!(service.list_bases().await.unwrap().is_empty(), "rejected base must not persist");
+    }
+
+    /// A5: creating a base with tags persists them in the returned info.
+    #[tokio::test]
+    async fn create_base_with_tags_via_route_persists_tags() {
+        let svc = test_service();
+        // First create a tag so the key exists.
+        svc.create_tag("研发", None).await.unwrap();
+        let key = svc.list_tags().await.unwrap()[0].key.clone();
+        // Create a base, then immediately assign tags (mimicking the route handler
+        // pattern: create → update_base with tags).
+        let info = svc.create_base("带标签库", "", None, None).await.unwrap();
+        let info = svc.update_base(&info.knowledge_base_id, None, None, Some(vec![key.clone()])).await.unwrap();
+        assert_eq!(info.tags, vec![key.clone()], "tags must be persisted at create-time");
+        // Verify via a fresh load
+        let reloaded = svc.get_base_info(&info.knowledge_base_id).await.unwrap();
+        assert_eq!(reloaded.tags, vec![key]);
+    }
+}

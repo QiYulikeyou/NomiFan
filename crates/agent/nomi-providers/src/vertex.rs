@@ -1,0 +1,514 @@
+// Google Vertex AI provider for Claude models.
+// Uses GCP OAuth2 authentication. Response is standard SSE (same as Anthropic).
+
+use async_trait::async_trait;
+use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
+
+use nomi_types::llm::{LlmEvent, LlmRequest, ThinkingConfig};
+
+use super::anthropic_shared;
+use crate::{LlmProvider, ProviderError};
+use nomi_config::compat::ProviderCompat;
+
+pub struct VertexProvider {
+    project_id: String,
+    region: String,
+    auth: GcpAuth,
+    cache_enabled: bool,
+    compat: ProviderCompat,
+    /// Cached access token
+    cached_token: Mutex<Option<CachedToken>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum GcpAuth {
+    ServiceAccount { key_file: String },
+    ApplicationDefault,
+    MetadataServer,
+}
+
+struct CachedToken {
+    token: String,
+    expires_at: u64,
+}
+
+/// The Vertex AI API host that serves a given `location` value.
+///
+/// Only true *locational* endpoints carry a `{region}-` host prefix. The global
+/// endpoint is the bare service host, and the `us`/`eu` data-residency
+/// multi-regions get an infix instead. Google's `aiplatform` v1 discovery
+/// document enumerates every published endpoint — 46 `{region}-aiplatform`
+/// locational hosts, `aiplatform.{us,eu}.rep` regional hosts, `aiplatform.mtls`
+/// and the bare `aiplatform.googleapis.com` base URL — and no `global-`
+/// prefixed host appears anywhere in it.
+///
+/// `global-aiplatform.googleapis.com` therefore is not an endpoint. It answers
+/// DNS only because `*.googleapis.com` is wildcarded (so does
+/// `bogusxyz-aiplatform.googleapis.com`), which is why a resolvable name is not
+/// evidence that a request would ever reach Vertex.
+///
+/// The `locations/{region}` path segment is unaffected: `global`, `us` and `eu`
+/// all stay in the resource path exactly as given. This mirrors the branch in
+/// Anthropic's official Vertex SDKs and in Google's own `python-genai` client.
+fn vertex_api_host(region: &str) -> String {
+    match region {
+        "global" => "aiplatform.googleapis.com".to_owned(),
+        "us" | "eu" => format!("aiplatform.{region}.rep.googleapis.com"),
+        _ => format!("{region}-aiplatform.googleapis.com"),
+    }
+}
+
+impl VertexProvider {
+    pub fn new(
+        project_id: &str,
+        region: &str,
+        auth: GcpAuth,
+        cache_enabled: bool,
+        compat: ProviderCompat,
+    ) -> Self {
+        Self {
+            project_id: project_id.to_string(),
+            region: region.to_string(),
+            auth,
+            cache_enabled,
+            compat,
+            cached_token: Mutex::new(None),
+        }
+    }
+
+    fn build_url(&self, model: &str) -> String {
+        format!(
+            "https://{}/v1/projects/{}/locations/{}/publishers/anthropic/models/{}:streamRawPredict",
+            vertex_api_host(&self.region),
+            self.project_id,
+            self.region,
+            model
+        )
+    }
+
+    fn build_request_body(&self, request: &LlmRequest) -> Result<Value, ProviderError> {
+        let max_tokens = request.max_tokens.ok_or_else(|| {
+            ProviderError::Config(
+                "vertex anthropic protocol requires an explicit output ceiling; pass --max-tokens (or set [default].max_tokens) in the CLI, or set Max output tokens on the desktop model capability"
+                    .into(),
+            )
+        })?;
+        let system = if self.cache_enabled {
+            json!([{
+                "type": "text",
+                "text": &request.system,
+                "cache_control": { "type": "ephemeral" }
+            }])
+        } else {
+            json!(&request.system)
+        };
+
+        let mut body = json!({
+            "anthropic_version": "vertex-2023-10-16",
+            "max_tokens": max_tokens,
+            "system": system,
+            "messages": anthropic_shared::build_messages(&request.messages, &self.compat),
+            "stream": true
+        });
+
+        if !request.tools.is_empty() {
+            let mut tools = anthropic_shared::build_tools(&request.tools);
+            if let Some(last) = tools.last_mut().filter(|_| self.cache_enabled) {
+                last["cache_control"] = json!({ "type": "ephemeral" });
+            }
+            body["tools"] = json!(tools);
+        }
+
+        if let Some(ThinkingConfig::Enabled { budget_tokens }) = &request.thinking {
+            body["thinking"] = json!({
+                "type": "enabled",
+                "budget_tokens": budget_tokens
+            });
+        }
+
+        Ok(body)
+    }
+
+    async fn get_access_token(&self) -> Result<String, ProviderError> {
+        // Check cache first
+        {
+            let cached = self.cached_token.lock().map_err(|_| {
+                ProviderError::Connection("Vertex token cache lock poisoned".to_string())
+            })?;
+            if let Some(token) = cached.as_ref() {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                if token.expires_at > now + 60 {
+                    return Ok(token.token.clone());
+                }
+            }
+        }
+
+        let (token, expires_in) = match &self.auth {
+            GcpAuth::ServiceAccount { key_file } => {
+                self.get_service_account_token(key_file).await?
+            }
+            GcpAuth::ApplicationDefault => self.get_adc_token().await?,
+            GcpAuth::MetadataServer => self.get_metadata_token().await?,
+        };
+
+        // Cache the token
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut cached = self.cached_token.lock().map_err(|_| {
+            ProviderError::Connection("Vertex token cache lock poisoned".to_string())
+        })?;
+        *cached = Some(CachedToken {
+            token: token.clone(),
+            expires_at: now + expires_in,
+        });
+
+        Ok(token)
+    }
+
+    async fn get_service_account_token(
+        &self,
+        key_file: &str,
+    ) -> Result<(String, u64), ProviderError> {
+        let key_json = std::fs::read_to_string(key_file)
+            .map_err(|e| ProviderError::Connection(format!("Failed to read key file: {}", e)))?;
+
+        let sa: ServiceAccountKey = serde_json::from_str(&key_json)
+            .map_err(|e| ProviderError::Connection(format!("Failed to parse key file: {}", e)))?;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let claims = JwtClaims {
+            iss: sa.client_email.clone(),
+            scope: "https://www.googleapis.com/auth/cloud-platform".to_string(),
+            aud: sa.token_uri.clone(),
+            iat: now,
+            exp: now + 3600,
+        };
+
+        let encoding_key = EncodingKey::from_rsa_pem(sa.private_key.as_bytes())
+            .map_err(|e| ProviderError::Connection(format!("Invalid RSA key: {}", e)))?;
+
+        let header = Header::new(Algorithm::RS256);
+        let jwt = jsonwebtoken::encode(&header, &claims, &encoding_key)
+            .map_err(|e| ProviderError::Connection(format!("JWT encode error: {}", e)))?;
+
+        // Exchange JWT for access token
+        let client = crate::http_client()?;
+        let resp = client
+            .post(&sa.token_uri)
+            .form(&[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+                ("assertion", &jwt),
+            ])
+            .send()
+            .await
+            .map_err(|e| ProviderError::Connection(format!("Token exchange error: {}", e)))?;
+
+        let token_resp: GoogleTokenResponse = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Connection(format!("Token parse error: {}", e)))?;
+
+        Ok((token_resp.access_token, token_resp.expires_in))
+    }
+
+    async fn get_adc_token(&self) -> Result<(String, u64), ProviderError> {
+        // Read Application Default Credentials
+        let adc_path = dirs::home_dir()
+            .ok_or_else(|| ProviderError::Connection("Cannot determine home dir".into()))?
+            .join(".config/gcloud/application_default_credentials.json");
+
+        let adc_json = std::fs::read_to_string(&adc_path).map_err(|e| {
+            ProviderError::Connection(format!(
+                "Failed to read ADC at {}: {}. Run 'gcloud auth application-default login'.",
+                adc_path.display(),
+                e
+            ))
+        })?;
+
+        let adc: AdcCredentials = serde_json::from_str(&adc_json)
+            .map_err(|e| ProviderError::Connection(format!("Failed to parse ADC: {}", e)))?;
+
+        // Use refresh token to get access token
+        let client = crate::http_client()?;
+        let resp = client
+            .post("https://oauth2.googleapis.com/token")
+            .form(&[
+                ("client_id", adc.client_id.as_str()),
+                ("client_secret", adc.client_secret.as_str()),
+                ("refresh_token", adc.refresh_token.as_str()),
+                ("grant_type", "refresh_token"),
+            ])
+            .send()
+            .await
+            .map_err(|e| ProviderError::Connection(format!("ADC token refresh error: {}", e)))?;
+
+        let token_resp: GoogleTokenResponse = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Connection(format!("Token parse error: {}", e)))?;
+
+        Ok((token_resp.access_token, token_resp.expires_in))
+    }
+
+    async fn get_metadata_token(&self) -> Result<(String, u64), ProviderError> {
+        let client = crate::http_client()?;
+        let resp = client
+            .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
+            .header("Metadata-Flavor", "Google")
+            .send()
+            .await
+            .map_err(|e| ProviderError::Connection(format!("Metadata server error: {}", e)))?;
+
+        let token_resp: GoogleTokenResponse = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Connection(format!("Token parse error: {}", e)))?;
+
+        Ok((token_resp.access_token, token_resp.expires_in))
+    }
+}
+
+#[async_trait]
+impl LlmProvider for VertexProvider {
+    async fn stream(
+        &self,
+        request: &LlmRequest,
+    ) -> Result<mpsc::Receiver<LlmEvent>, ProviderError> {
+        let url = self.build_url(&request.model);
+        let body = self.build_request_body(request)?;
+
+        tracing::debug!(target: "nomi_providers", body = %serde_json::to_string_pretty(&body).unwrap_or_default(), "outgoing request");
+
+        let access_token = self.get_access_token().await?;
+        let redactor = nomifun_net::secret_redaction::SecretRedactor::new([&access_token]);
+        let client = crate::http_client()?;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", access_token))
+                .map_err(|e| ProviderError::Connection(format!("Header error: {}", e)))?,
+        );
+
+        let response = crate::retry::with_initial_request_retry(|| async {
+            let response = client
+                .post(&url)
+                .headers(headers.clone())
+                .json(&body)
+                .send()
+                .await?;
+
+            let status = response.status();
+            if !status.is_success() {
+                let retry_after_ms = crate::parse_retry_after_ms(response.headers()).unwrap_or(5000);
+                let body_text = crate::read_provider_error_body(response, &redactor).await;
+                if status.as_u16() == 429 {
+                    return Err(ProviderError::RateLimited {
+                        retry_after_ms,
+                        message: crate::non_empty_rate_limit_message(body_text),
+                    });
+                }
+                return Err(ProviderError::Api {
+                    status: status.as_u16(),
+                    message: body_text,
+                });
+            }
+            Ok(response)
+        })
+        .await?;
+
+        let (tx, rx) = mpsc::channel(64);
+        let client = client.clone();
+        let url_clone = url.clone();
+        let headers_clone = {
+            let mut h = HeaderMap::new();
+            h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            h.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {}", access_token))
+                    .map_err(|e| ProviderError::Connection(format!("Header error: {}", e)))?,
+            );
+            h
+        };
+        let stream_redactor = redactor.clone();
+
+        // Vertex uses standard SSE (same as Anthropic)
+        tokio::spawn(async move {
+            let Some(outcome) = crate::retry::until_receiver_closed(
+                &tx,
+                anthropic_shared::process_sse_stream_redacted(
+                    response,
+                    &tx,
+                    &stream_redactor,
+                ),
+            )
+            .await
+            else {
+                return;
+            };
+            crate::retry::finish_stream_with_retry(
+                outcome,
+                &tx,
+                || {
+                    crate::retry::send_and_check(
+                        &client,
+                        &url_clone,
+                        &headers_clone,
+                        &body,
+                        &stream_redactor,
+                    )
+                },
+                |resp| {
+                    anthropic_shared::process_sse_stream_redacted(
+                        resp,
+                        &tx,
+                        &stream_redactor,
+                    )
+                },
+            )
+            .await;
+        });
+
+        Ok(rx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vertex_rejects_an_omitted_output_ceiling_before_authentication() {
+        let provider = VertexProvider::new(
+            "project",
+            "us-central1",
+            GcpAuth::ApplicationDefault,
+            false,
+            ProviderCompat::anthropic_defaults(),
+        );
+        let request = LlmRequest {
+            model: "claude-test".into(),
+            system: "test".into(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: None,
+            thinking: None,
+            reasoning_effort: None,
+            retain_provider_round: false,
+        };
+
+        let error = provider.build_request_body(&request).unwrap_err();
+        assert!(matches!(error, ProviderError::Config(message) if
+            message.contains("--max-tokens") && message.contains("desktop")));
+    }
+
+    fn url_for_region(region: &str) -> String {
+        VertexProvider::new(
+            "my-project",
+            region,
+            GcpAuth::ApplicationDefault,
+            false,
+            ProviderCompat::anthropic_defaults(),
+        )
+        .build_url("claude-sonnet-4@20250514")
+    }
+
+    #[test]
+    fn a_regional_location_keeps_the_region_host_prefix() {
+        assert_eq!(
+            url_for_region("us-central1"),
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/anthropic/models/claude-sonnet-4@20250514:streamRawPredict"
+        );
+    }
+
+    #[test]
+    fn the_global_location_uses_the_bare_host_and_keeps_global_in_the_path() {
+        // `global` is a location value Anthropic's official Vertex SDKs accept
+        // and document for Claude, but it is NOT a locational endpoint:
+        // prefixing the host would address `global-aiplatform.googleapis.com`,
+        // which is not a published Vertex host (it only answers DNS because
+        // `*.googleapis.com` is wildcarded).
+        assert_eq!(
+            url_for_region("global"),
+            "https://aiplatform.googleapis.com/v1/projects/my-project/locations/global/publishers/anthropic/models/claude-sonnet-4@20250514:streamRawPredict"
+        );
+    }
+
+    #[test]
+    fn data_residency_multi_regions_use_the_rep_host_infix() {
+        for (region, host) in [
+            ("us", "aiplatform.us.rep.googleapis.com"),
+            ("eu", "aiplatform.eu.rep.googleapis.com"),
+        ] {
+            assert_eq!(
+                url_for_region(region),
+                format!(
+                    "https://{host}/v1/projects/my-project/locations/{region}/publishers/anthropic/models/claude-sonnet-4@20250514:streamRawPredict"
+                )
+            );
+        }
+    }
+}
+
+// --- Internal types ---
+
+#[derive(Debug, Deserialize)]
+struct ServiceAccountKey {
+    client_email: String,
+    private_key: String,
+    token_uri: String,
+}
+
+#[derive(Debug, Serialize)]
+struct JwtClaims {
+    iss: String,
+    scope: String,
+    aud: String,
+    iat: u64,
+    exp: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleTokenResponse {
+    access_token: String,
+    #[serde(default = "default_expires_in")]
+    expires_in: u64,
+}
+
+fn default_expires_in() -> u64 {
+    3600
+}
+
+#[derive(Debug, Deserialize)]
+struct AdcCredentials {
+    client_id: String,
+    client_secret: String,
+    refresh_token: String,
+}
+
+/// Build GcpAuth from nomi-config's VertexConfig
+pub fn auth_from_config(vc: &nomi_config::config::VertexConfig) -> GcpAuth {
+    if let Some(creds_file) = &vc.credentials_file {
+        GcpAuth::ServiceAccount {
+            key_file: creds_file.clone(),
+        }
+    } else {
+        GcpAuth::ApplicationDefault
+    }
+}

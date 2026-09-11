@@ -1,0 +1,521 @@
+/**
+ * @license
+ * Copyright 2025-2026 NomiFun (nomifun.com)
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import type { CreativeAsset } from '../../assets';
+import type {
+  CreativeCanvasConnection,
+  CreativeCanvasNode,
+  CreativeImagePromptMention,
+  CreativeProjectDocument,
+  CreativeSize,
+} from '../../domain';
+import type {
+  CreativeModelCatalogSnapshot,
+  CreativeModelOption,
+  CreativeModelSelectionRef,
+} from '../../models';
+import {
+  isCanvasNodeTaskOwner,
+  type CreativeTask,
+  type CreativeTaskReference,
+} from '../../tasks';
+import type {
+  ImageWorkbenchInterfaceMode,
+  ImageWorkbenchQuality,
+  ImageWorkbenchSettings,
+  ImageWorkbenchTaskSummary,
+} from '../../workbenches/image';
+import {
+  prepareImageWorkbenchRun,
+  workbenchResumeRequestsFromDocument,
+  type CreativeWorkbenchReferences,
+  type CreativeWorkbenchResumeRequest,
+  type PreparedCreativeWorkbenchRun,
+} from '../../workbenches/runtime';
+import { validateCanvasConnection, type CanvasState } from '../core';
+import {
+  canvasTaskResultPosition,
+  nextCanvasImageTaskPosition,
+} from './imageTaskCanvasLayout';
+import {
+  createCreativeCanvasProductNode,
+  CREATIVE_CANVAS_PRODUCT_NODE_SIZES,
+} from './nodeFactory';
+import { creativeStudioProductText } from './i18n';
+
+export const CREATIVE_IMAGE_COMPOSE_OPERATION = 'image-node-compose';
+
+type ImageNode = Extract<CreativeCanvasNode, { type: 'image' }>;
+type ConfigNode = Extract<CreativeCanvasNode, { type: 'config' }>;
+
+export interface CanvasImageComposeDraft {
+  prompt: string;
+  mentions?: CreativeImagePromptMention[];
+  settings: ImageWorkbenchSettings;
+}
+
+export interface PreparedCanvasImageCompose {
+  configNode: ConfigNode;
+  connection: Omit<CreativeCanvasConnection, 'id'>;
+  plan: PreparedCreativeWorkbenchRun;
+}
+
+export const DEFAULT_CANVAS_IMAGE_COMPOSE_SETTINGS: ImageWorkbenchSettings = {
+  model: null,
+  interfaceMode: 'images',
+  quality: 'auto',
+  width: 1024,
+  height: 1024,
+  aspectRatio: '1:1',
+  count: 1,
+};
+
+const interfaceMode = (value: unknown): ImageWorkbenchInterfaceMode =>
+  value === 'responses' ? 'responses' : 'images';
+
+const quality = (value: unknown): ImageWorkbenchQuality =>
+  value === 'high' || value === 'medium' || value === 'low' ? value : 'auto';
+
+const dimension = (value: unknown): number | null =>
+  typeof value === 'number' && Number.isInteger(value) && value > 0 && value <= 8192
+    ? value
+    : null;
+
+const count = (value: unknown): number =>
+  typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 10
+    ? value
+    : 1;
+
+export function canvasImageComposeSettings(
+  config: ConfigNode | null
+): ImageWorkbenchSettings {
+  if (!config) return structuredClone(DEFAULT_CANVAS_IMAGE_COMPOSE_SETTINGS);
+  const aspect = config.data.parameters.aspect;
+  return {
+    model:
+      config.data.providerId && config.data.model
+        ? { providerId: config.data.providerId, model: config.data.model }
+        : null,
+    interfaceMode: interfaceMode(config.data.parameters.interface_mode),
+    quality: quality(config.data.parameters.quality),
+    width: dimension(config.data.parameters.width),
+    height: dimension(config.data.parameters.height),
+    aspectRatio: typeof aspect === 'string' && aspect.trim() ? aspect : 'auto',
+    count: count(config.data.parameters.count),
+  };
+}
+
+/** Restore the node-owned draft, falling back to the latest submitted config. */
+export function canvasImageComposeDraftFromState(
+  state: CanvasState,
+  nodeId: string
+): CanvasImageComposeDraft {
+  const source = state.document.nodes.find(
+    (node): node is ImageNode => node.id === nodeId && node.type === 'image'
+  );
+  const persisted = source?.data.composer;
+  if (persisted) {
+    return {
+      prompt: persisted.prompt,
+      mentions: structuredClone(persisted.mentions ?? []),
+      settings: {
+        model: persisted.model ? { ...persisted.model } : null,
+        interfaceMode: persisted.interfaceMode,
+        quality: persisted.quality,
+        width: persisted.width,
+        height: persisted.height,
+        aspectRatio: persisted.aspectRatio,
+        count: persisted.count,
+      },
+    };
+  }
+  const config = latestCanvasImageComposeConfig(state.document, nodeId);
+  return {
+    prompt: config?.data.prompt ?? '',
+    mentions: [],
+    settings: config
+      ? canvasImageComposeSettings(config)
+      : structuredClone(DEFAULT_CANVAS_IMAGE_COMPOSE_SETTINGS),
+  };
+}
+
+/** Replace the complete durable composer draft without changing node identity. */
+export function withCanvasImageComposeDraft(
+  node: ImageNode,
+  draft: CanvasImageComposeDraft
+): ImageNode {
+  return {
+    ...node,
+    data: {
+      ...node.data,
+      composer: {
+        prompt: draft.prompt,
+        mentions: structuredClone(draft.mentions ?? []),
+        model: draft.settings.model ? { ...draft.settings.model } : null,
+        interfaceMode: draft.settings.interfaceMode,
+        quality: draft.settings.quality,
+        width: draft.settings.width,
+        height: draft.settings.height,
+        aspectRatio: draft.settings.aspectRatio,
+        count: draft.settings.count,
+      },
+    },
+  };
+}
+
+/** An empty image uses T2I while a filled image uses I2I, so never carry a
+ * task-specific model selection across that boundary. The submitted config
+ * node keeps the historical model identity. */
+export function clearCanvasImageComposeDraftModel(node: ImageNode): ImageNode {
+  if (!node.data.composer?.model) return node;
+  return {
+    ...node,
+    data: {
+      ...node.data,
+      composer: {
+        ...node.data.composer,
+        model: null,
+      },
+    },
+  };
+}
+
+export function canvasImageComposeTaskSummary(
+  config: ConfigNode | null
+): ImageWorkbenchTaskSummary {
+  if (!config) return { state: 'idle', pendingCount: 0 };
+  const pending = config.data.status === 'queued' || config.data.status === 'running';
+  return {
+    state: config.data.status,
+    pendingCount: pending ? 1 : 0,
+    message: config.data.errorMessage ?? undefined,
+  };
+}
+
+export function isCanvasImageComposeConfig(
+  node: CreativeCanvasNode | undefined
+): node is ConfigNode {
+  return Boolean(
+    node?.type === 'config' &&
+    ((node.data.task === 'image_edit' && node.data.capability === 'i2i') ||
+      (node.data.task === 'image_generation' && node.data.capability === 't2i')) &&
+    node.data.operation?.kind === CREATIVE_IMAGE_COMPOSE_OPERATION
+  );
+}
+
+export function canvasImageComposeSourceNodeId(node: ConfigNode): string {
+  const value = node.data.operation?.sourceNodeId;
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new Error(
+      creativeStudioProductText(
+        'creativeStudio.canvas.errors.image.missingSourceNodeId',
+        '图片创作配置缺少 sourceNodeId。'
+      )
+    );
+  }
+  return value;
+}
+
+export function latestCanvasImageComposeConfig(
+  document: Pick<CreativeProjectDocument, 'nodes'>,
+  sourceNodeId: string
+): ConfigNode | null {
+  const matches = document.nodes.filter(
+    (node): node is ConfigNode =>
+      isCanvasImageComposeConfig(node) &&
+      node.data.operation?.sourceNodeId === sourceNodeId
+  );
+  return matches.at(-1) ?? null;
+}
+
+export function preferredCanvasImageComposeModel(
+  options: readonly CreativeModelOption[],
+  previous: CreativeModelSelectionRef | null,
+  source: CreativeAsset | null
+): CreativeModelSelectionRef | null {
+  const match = (candidate: CreativeModelSelectionRef | null) =>
+    candidate
+      ? (options.find(
+          (option) =>
+            option.providerId === candidate.providerId &&
+            option.model === candidate.model
+        ) ?? null)
+      : null;
+  const retained = match(previous);
+  if (retained) return { providerId: retained.providerId, model: retained.model };
+  const origin =
+    source?.origin?.providerId && source.origin.model
+      ? match({
+          providerId:
+            source.origin.providerId as CreativeModelSelectionRef['providerId'],
+          model: source.origin.model,
+        })
+      : null;
+  if (origin) return { providerId: origin.providerId, model: origin.model };
+  const only = options.length === 1 ? options[0] : null;
+  return only ? { providerId: only.providerId, model: only.model } : null;
+}
+
+export function prepareCanvasImageCompose(input: {
+  projectId: string;
+  state: CanvasState;
+  viewportSize: CreativeSize;
+  sourceNode: ImageNode;
+  sourceAsset: CreativeAsset | null;
+  references?: CreativeWorkbenchReferences;
+  catalog: CreativeModelCatalogSnapshot;
+  model: CreativeModelSelectionRef;
+  /** User-authored text retained for the Canvas and history UI. */
+  prompt: string;
+  /** Exact mention-resolved text sent to the selected Provider. */
+  providerPrompt?: string;
+  settings: Omit<ImageWorkbenchSettings, 'model'>;
+}): PreparedCanvasImageCompose {
+  const sourceAssetId = input.sourceNode.data.assetId;
+  if (
+    (sourceAssetId === null && input.sourceAsset !== null) ||
+    (sourceAssetId !== null &&
+      (input.sourceAsset?.kind !== 'image' || input.sourceAsset.id !== sourceAssetId))
+  ) {
+    throw new Error(
+      creativeStudioProductText(
+        'creativeStudio.canvas.errors.image.sourceAssetMismatch',
+        '图片创作源节点与真实图片素材不一致。'
+      )
+    );
+  }
+  const references: CreativeWorkbenchReferences = input.references ??
+    (input.sourceAsset
+      ? {
+          assets: [input.sourceAsset],
+          bindings: [
+            {
+              assetId: input.sourceAsset.id,
+              kind: 'image',
+              role: 'reference',
+            },
+          ],
+        }
+      : { assets: [], bindings: [] });
+  if (
+    sourceAssetId !== null &&
+    references.bindings[0]?.assetId !== sourceAssetId
+  ) {
+    throw new Error(
+      creativeStudioProductText(
+        'creativeStudio.canvas.errors.image.baseReferenceOrderMismatch',
+        '当前图片必须作为第一张参考图发送。'
+      )
+    );
+  }
+
+  const configPosition = nextCanvasImageTaskPosition(
+    input.state.document.nodes,
+    input.sourceNode,
+    CREATIVE_CANVAS_PRODUCT_NODE_SIZES.config
+  );
+  const base = createCreativeCanvasProductNode(
+    'config',
+    input.state,
+    input.viewportSize,
+    { position: configPosition, locked: true }
+  );
+  const plan = prepareImageWorkbenchRun({
+    catalog: input.catalog,
+    canvasId: input.projectId,
+    nodeId: base.id,
+    model: input.model,
+    references,
+    operation: references.bindings.length > 0
+      ? { task: 'image_edit', capability: 'i2i' }
+      : { task: 'image_generation', capability: 't2i' },
+    prompt: input.providerPrompt ?? input.prompt,
+    interfaceMode: input.settings.interfaceMode,
+    quality: input.settings.quality,
+    width: input.settings.width,
+    height: input.settings.height,
+    aspectRatio: input.settings.aspectRatio,
+    count: input.settings.count,
+  });
+  const configNode: ConfigNode = {
+    ...base,
+    data: {
+      ...base.data,
+      task: plan.input.task,
+      capability: plan.input.capability,
+      providerId: plan.model.providerId,
+      model: plan.model.model,
+      prompt: input.prompt,
+      operation: {
+        kind: CREATIVE_IMAGE_COMPOSE_OPERATION,
+        sourceNodeId: input.sourceNode.id,
+        sourceAssetId: input.sourceAsset?.id ?? null,
+      },
+      parameters: structuredClone(plan.input.parameters),
+      inputAssetIds: references.bindings.map((binding) => binding.assetId),
+      taskId: plan.input.idempotencyKey,
+      resultAssetIds: [],
+      status: 'queued',
+      errorMessage: null,
+    },
+  };
+  const connection = {
+    sourceNodeId: input.sourceNode.id,
+    targetNodeId: configNode.id,
+    sourceHandle: 'source',
+    targetHandle: 'target',
+  };
+  const validation = validateCanvasConnection(
+    {
+      ...input.state.document,
+      nodes: [...input.state.document.nodes, configNode],
+    },
+    connection
+  );
+  if (!validation.ok) {
+    throw new Error(
+      creativeStudioProductText(
+        'creativeStudio.canvas.errors.image.connectConfigFailed',
+        '无法保存图片创作任务关联：{{code}}。',
+        { code: validation.code }
+      )
+    );
+  }
+  return { configNode, connection, plan };
+}
+
+export function canvasImageComposeResumeRequests(
+  document: CreativeProjectDocument
+): CreativeWorkbenchResumeRequest[] {
+  const owners = new Set(
+    document.nodes.filter(isCanvasImageComposeConfig).map((node) => node.id)
+  );
+  return workbenchResumeRequestsFromDocument(document).filter(
+    (request) =>
+      request.reference.owner.kind === 'canvas_node' &&
+      owners.has(request.reference.owner.nodeId)
+  );
+}
+
+export function canvasImageComposeConfigForReference(
+  document: Pick<CreativeProjectDocument, 'projectId' | 'nodes'>,
+  reference: CreativeTaskReference
+): ConfigNode {
+  if (
+    !isCanvasNodeTaskOwner(reference.owner) ||
+    reference.owner.canvasId !== document.projectId
+  ) {
+      throw new Error(
+        creativeStudioProductText(
+          'creativeStudio.canvas.errors.image.wrongCanvas',
+          '图片创作任务不属于当前画布。'
+        )
+      );
+  }
+  const owner = reference.owner;
+  const node = document.nodes.find(
+    (candidate) => candidate.id === owner.nodeId
+  );
+  if (!isCanvasImageComposeConfig(node)) {
+    throw new Error(
+      creativeStudioProductText(
+        'creativeStudio.canvas.errors.image.missingConfig',
+        '图片创作任务缺少必要任务记录。'
+      )
+    );
+  }
+  if (
+    node.data.taskId !== reference.taskId ||
+    node.data.providerId !== reference.providerId ||
+    node.data.model !== reference.model ||
+    node.data.task !== reference.task ||
+    node.data.capability !== reference.capability
+  ) {
+    throw new Error(
+      creativeStudioProductText(
+        'creativeStudio.canvas.errors.image.identityMismatch',
+        '图片创作任务与其任务记录身份不一致。'
+      )
+    );
+  }
+  return node;
+}
+
+export function canvasImageComposeConfigFromTask(
+  document: Pick<CreativeProjectDocument, 'projectId' | 'nodes'>,
+  task: CreativeTask
+): ConfigNode {
+  return canvasImageComposeConfigForReference(document, {
+    taskId: task.taskId,
+    owner: task.owner,
+    providerId: task.providerId,
+    model: task.model,
+    task: task.task,
+    capability: task.capability,
+  });
+}
+
+export function reconcileCanvasImageComposeConfig(
+  node: ConfigNode,
+  task: CreativeTask
+): ConfigNode {
+  if (
+    task.inputs !== null &&
+    (task.inputs.length !== node.data.inputAssetIds.length ||
+      task.inputs.some(
+        (input, index) =>
+          input.assetId !== node.data.inputAssetIds[index] ||
+          input.kind !== 'image' ||
+          input.role !== 'reference'
+      ))
+  ) {
+    throw new Error(
+      creativeStudioProductText(
+        'creativeStudio.canvas.errors.image.inputSnapshotMismatch',
+        '图片任务输入与画布配置快照不一致，已停止恢复。'
+      )
+    );
+  }
+  const terminal =
+    task.status === 'succeeded' ||
+    task.status === 'failed' ||
+    task.status === 'canceled';
+  return {
+    ...node,
+    locked: !terminal,
+    data: {
+      ...node.data,
+      taskId: task.taskId,
+      resultAssetIds:
+        task.status === 'succeeded' ? [...task.resultAssetIds] : [],
+      status: task.status,
+      errorMessage:
+        task.status === 'failed'
+          ? (task.error?.message ??
+            creativeStudioProductText(
+              'creativeStudio.canvas.errors.image.failed',
+              '图片创作失败。'
+            ))
+          : task.status === 'canceled'
+            ? creativeStudioProductText(
+                'creativeStudio.canvas.errors.image.cancelled',
+                '图片创作已取消。'
+              )
+            : null,
+    },
+  };
+}
+
+export function canvasImageComposeResultPosition(
+  nodes: readonly CreativeCanvasNode[],
+  config: ConfigNode
+): { x: number; y: number } {
+  return canvasTaskResultPosition(
+    nodes,
+    config,
+    CREATIVE_CANVAS_PRODUCT_NODE_SIZES.image
+  );
+}

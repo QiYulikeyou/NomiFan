@@ -1,0 +1,357 @@
+/**
+ * @license
+ * Copyright 2025-2026 NomiFun (nomifun.com)
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import { describe, expect, test } from 'bun:test';
+
+import { parseAssetId } from '@/common/types/ids';
+
+import type { WorkshopAssetApi, WorkshopAssetDto } from './api';
+import { CreativeAssetClient, mapWorkshopAsset, toWorkshopAssetQuery } from './client';
+
+const ASSET_ID = parseAssetId('0190f5fe-7c00-7a00-8000-000000000001');
+
+function assetDto(overrides: Partial<WorkshopAssetDto> = {}): WorkshopAssetDto {
+  return {
+    asset_id: ASSET_ID,
+    kind: 'image',
+    title: 'Reference',
+    collection: 'Moodboard',
+    tags: ['warm', 'portrait'],
+    mime: 'image/png',
+    width: 1024,
+    height: 768,
+    bytes: 4096,
+    in_library: true,
+    text_content: null,
+    origin: {
+      provider_id: '0190f5fe-7c00-7a00-8000-000000000002',
+      canvas_id: '0190f5fe-7c00-7a00-8000-000000000003',
+      node_id: '0190f5fe-7c00-7a00-8000-000000000004',
+      creation_task_id: '0190f5fe-7c00-7a00-8000-000000000005',
+    },
+    url: '/api/creative-studio/files/asset',
+    thumb_url: '/api/creative-studio/files/asset?thumb=1',
+    created_at: 100,
+    updated_at: 200,
+    ...overrides,
+  };
+}
+
+function apiStub(overrides: Partial<WorkshopAssetApi> = {}): WorkshopAssetApi {
+  return {
+    list: async () => ({ items: [assetDto()], total: 1 }),
+    get: async () => assetDto(),
+    upload: async () => assetDto(),
+    createText: async () => assetDto({ kind: 'text', mime: null, width: null, height: null, bytes: null }),
+    removePromptAsset: async () => ({ matched: 0 }),
+    update: async () => assetDto(),
+    remove: async () => undefined,
+    renameCollection: async () => 0,
+    fileUrl: (_assetId, thumbnail) => (thumbnail ? '/thumbnail' : '/original'),
+    ...overrides,
+  };
+}
+
+describe('CreativeAssetClient', () => {
+  test('keeps tombstone metadata readable without exposing deleted media or text', async () => {
+    const client = new CreativeAssetClient(apiStub({ get: async () => assetDto({ deleted_at: 300, text_content: 'old content' }) }));
+    const deleted = await client.get(ASSET_ID);
+    expect(deleted.deletedAt).toBe(300);
+    expect(deleted.originalUrl).toBe('');
+    expect(deleted.thumbnailUrl).toBe(null);
+    expect(deleted.textContent).toBe(null);
+    expect(deleted.inLibrary).toBe(false);
+  });
+
+  test('late read and list responses cannot resurrect an asset after successful deletion', async () => {
+    let finishRead!: (value: WorkshopAssetDto) => void;
+    const response = new Promise<WorkshopAssetDto>((resolve) => { finishRead = resolve; });
+    const client = new CreativeAssetClient(apiStub({ get: () => response }));
+    const staleRead = client.get(ASSET_ID);
+    await client.remove(ASSET_ID);
+    finishRead(assetDto());
+    const asset = await staleRead;
+    expect(typeof asset.deletedAt).toBe('number');
+    expect(asset.originalUrl).toBe('');
+    expect((await client.list()).items).toEqual([]);
+  });
+
+  test('confirms partial cleanup deletion via metadata but preserves the retryable error', async () => {
+    const failure = new Error('File cleanup failed');
+    let deleted = true;
+    const client = new CreativeAssetClient(apiStub({
+      remove: async () => { throw failure; },
+      get: async () => assetDto({ deleted_at: deleted ? 300 : null }),
+    }));
+    expect(await client.remove(ASSET_ID).catch((error) => error)).toBe(failure);
+    deleted = false; // A pre-deletion GET snapshot arriving later is still stale.
+    expect((await client.get(ASSET_ID)).deletedAt).toBe(300);
+  });
+
+  test('never infers deletion from an error when metadata does not confirm it', async () => {
+    const failure = new Error('Network unavailable');
+    const client = new CreativeAssetClient(apiStub({ remove: async () => { throw failure; } }));
+    expect(await client.remove(ASSET_ID).catch((error) => error)).toBe(failure);
+    expect((await client.get(ASSET_ID)).deletedAt).toBe(null);
+  });
+  test('maps the Workshop wire shape into the Creative Studio domain shape', () => {
+    const asset = mapWorkshopAsset(assetDto());
+
+    expect(asset.id).toBe(ASSET_ID);
+    expect(asset.mimeType).toBe('image/png');
+    expect(asset.inLibrary).toBe(true);
+    expect(asset.thumbnailUrl?.includes('thumb=1')).toBe(true);
+    expect(asset.origin).toEqual({
+      prompt: undefined,
+      model: undefined,
+      providerId: '0190f5fe-7c00-7a00-8000-000000000002',
+      params: undefined,
+      workbenchKind: undefined,
+      canvasId: '0190f5fe-7c00-7a00-8000-000000000003',
+      nodeId: '0190f5fe-7c00-7a00-8000-000000000004',
+      generationTaskId: '0190f5fe-7c00-7a00-8000-000000000005',
+      promptLibrarySource: undefined,
+      promptLibraryId: undefined,
+      promptCatalogId: undefined,
+      sourceUrl: undefined,
+      license: undefined,
+      licenseUrl: undefined,
+    });
+  });
+
+  test('keeps legacy standalone project provenance inert', () => {
+    const asset = mapWorkshopAsset(
+      assetDto({
+        origin: {
+          workbench_kind: 'image',
+          project_id: '0190f5fe-7c00-7a00-8000-000000000003',
+          creation_task_id: '0190f5fe-7c00-7a00-8000-000000000005',
+        },
+      })
+    );
+
+    expect(asset.origin?.workbenchKind).toBe('image');
+    expect(asset.origin?.canvasId).toBeUndefined();
+  });
+
+  test('keeps ungrouped and named collection mutually exclusive on the wire', () => {
+    expect(
+      toWorkshopAssetQuery({
+        kind: 'video',
+        collection: 'ignored',
+        search: 'launch',
+        inLibrary: true,
+        ungrouped: true,
+        page: 2,
+        pageSize: 24,
+      })
+    ).toEqual({
+      kind: 'video',
+      collection: undefined,
+      q: 'launch',
+      in_library: true,
+      ungrouped: true,
+      tag: undefined,
+      sort: undefined,
+      page: 2,
+      page_size: 24,
+    });
+  });
+
+  test('adapts detail, list, update, upload, text creation, deletion, rename and URLs', async () => {
+    const calls: Array<[string, unknown]> = [];
+    const api = apiStub({
+      list: async (query) => {
+        calls.push(['list', query]);
+        return { items: [assetDto()], total: 1 };
+      },
+      get: async (id) => {
+        calls.push(['get', id]);
+        return assetDto();
+      },
+      upload: async (_file, metadata, signal, onProgress) => {
+        calls.push(['upload', { metadata, signal }]);
+        onProgress?.(42);
+        return assetDto();
+      },
+      createText: async (input) => {
+        calls.push(['createText', input]);
+        return assetDto({ kind: 'text', mime: null, width: null, height: null, bytes: null });
+      },
+      removePromptAsset: async (input) => {
+        calls.push(['removePromptAsset', input]);
+        return { matched: 2 };
+      },
+      update: async (_id, patch) => {
+        calls.push(['update', patch]);
+        return assetDto({ title: 'Updated' });
+      },
+      remove: async (id) => {
+        calls.push(['remove', id]);
+      },
+      renameCollection: async (from, to) => {
+        calls.push(['rename', { from, to }]);
+        return 3;
+      },
+    });
+    const client = new CreativeAssetClient(api);
+    const controller = new AbortController();
+    const progress: number[] = [];
+
+    const page = await client.list({ inLibrary: true });
+    expect(page.total).toBe(1);
+    expect(page.items[0]?.originalUrl).toBe('/original');
+    expect(page.items[0]?.thumbnailUrl).toBe('/thumbnail');
+    expect((await client.get(ASSET_ID)).originalUrl).toBe('/original');
+    expect(
+      (
+        await client.upload(
+          new File(['image'], 'sample.png', { type: 'image/png' }),
+          { inLibrary: false },
+          controller.signal,
+          (percent) => progress.push(percent)
+        )
+      ).id
+    ).toBe(ASSET_ID);
+    expect(
+      (
+        await client.createText({
+          title: 'Prompt',
+          textContent: 'Hello',
+          origin: {
+            promptLibrarySource: 'catalog',
+            promptLibraryId: 'prompt-1',
+            promptCatalogId: 'prompt-1',
+            sourceUrl: 'https://example.test/source',
+            license: 'MIT',
+            licenseUrl: 'https://example.test/license',
+          },
+        })
+      ).kind
+    ).toBe('text');
+    expect(await client.removePromptAsset('catalog', 'prompt-1')).toBe(2);
+    expect((await client.update(ASSET_ID, { collection: null, inLibrary: false })).title).toBe('Updated');
+    await client.remove(ASSET_ID);
+    expect(await client.renameCollection('Old', 'New')).toBe(3);
+    expect(client.url(ASSET_ID)).toBe('/original');
+    expect(client.url(ASSET_ID, 'thumbnail')).toBe('/thumbnail');
+    expect(progress).toEqual([42]);
+    expect(calls.map(([name]) => name)).toEqual([
+      'list',
+      'get',
+      'upload',
+      'createText',
+      'removePromptAsset',
+      'update',
+      'remove',
+      'rename',
+    ]);
+    expect(calls.find(([name]) => name === 'update')?.[1]).toEqual({
+      title: undefined,
+      collection: '',
+      tags: undefined,
+      in_library: false,
+    });
+    expect(calls.find(([name]) => name === 'createText')?.[1]).toEqual({
+      kind: 'text',
+      title: 'Prompt',
+      text_content: 'Hello',
+      collection: undefined,
+      tags: undefined,
+      in_library: undefined,
+      origin: {
+        prompt_library_source: 'catalog',
+        prompt_library_id: 'prompt-1',
+        prompt_catalog_id: 'prompt-1',
+        source_url: 'https://example.test/source',
+        license: 'MIT',
+        license_url: 'https://example.test/license',
+      },
+    });
+    expect(calls.find(([name]) => name === 'removePromptAsset')?.[1]).toEqual({
+      prompt_library_source: 'catalog',
+      prompt_library_id: 'prompt-1',
+    });
+  });
+
+  test('rejects unknown backend asset kinds instead of guessing', () => {
+    let error: unknown;
+    try {
+      mapWorkshopAsset(assetDto({ kind: 'archive' }));
+    } catch (reason) {
+      error = reason;
+    }
+    expect(error instanceof TypeError).toBe(true);
+    expect(error instanceof Error ? error.message : '').toBe('Unknown creative asset kind: archive');
+  });
+
+  test('rejects incomplete prompt-library provenance instead of losing its identity', () => {
+    let error: unknown;
+    try {
+      mapWorkshopAsset(
+        assetDto({
+          origin: {
+            prompt_library_source: 'preset',
+          },
+        })
+      );
+    } catch (reason) {
+      error = reason;
+    }
+    expect(error instanceof Error ? error.message : '').toBe(
+      'Invalid creative asset prompt-library origin'
+    );
+  });
+
+  test('serializes preset provenance without catalog-only attribution fields', async () => {
+    let request: unknown;
+    const client = new CreativeAssetClient(
+      apiStub({
+        createText: async (input) => {
+          request = input;
+          return assetDto({
+            kind: 'text',
+            mime: null,
+            width: null,
+            height: null,
+            bytes: null,
+          });
+        },
+      })
+    );
+
+    await client.createText({
+      title: 'Preset prompt',
+      textContent: 'Prompt body',
+      origin: {
+        promptLibrarySource: 'preset',
+        promptLibraryId: 'preset-1',
+      },
+    });
+    expect(request).toMatchObject({
+      origin: {
+        prompt_library_source: 'preset',
+        prompt_library_id: 'preset-1',
+      },
+    });
+    expect(JSON.stringify(request).includes('prompt_catalog_id')).toBe(false);
+  });
+
+  test('rejects an invalid prompt-removal match count', async () => {
+    const client = new CreativeAssetClient(
+      apiStub({ removePromptAsset: async () => ({ matched: -1 }) })
+    );
+    let error: unknown;
+    try {
+      await client.removePromptAsset('preset', 'preset-1');
+    } catch (reason) {
+      error = reason;
+    }
+    expect(error instanceof Error ? error.message : '').toBe(
+      'Invalid creative asset matched prompt assets'
+    );
+  });
+});

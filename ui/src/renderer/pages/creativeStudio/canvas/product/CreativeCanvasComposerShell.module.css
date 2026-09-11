@@ -1,0 +1,522 @@
+.positioner {
+  position: absolute;
+  top: calc(100% + 16px * var(--creative-canvas-inverse-zoom));
+  left: 50%;
+  z-index: 35;
+  width: 540px;
+  color: var(--color-text-1);
+  pointer-events: auto;
+  transform:
+    translateX(
+      calc(-50% + var(--creative-canvas-composer-offset-x, 0px))
+    )
+    scale(var(--creative-canvas-inverse-zoom));
+  transform-origin: center top;
+}
+
+:global([data-theme='light']) .positioner {
+  color-scheme: light;
+}
+
+:global([data-theme='dark']) .positioner {
+  color-scheme: dark;
+}
+
+.positioner[data-placement='above'] {
+  top: auto;
+  bottom: calc(100% + 16px * var(--creative-canvas-inverse-zoom));
+  transform-origin: center bottom;
+}
+
+.positioner[data-overlay='true'] {
+  position: fixed;
+  top: var(--creative-canvas-composer-overlay-top, 16px);
+  bottom: auto;
+  left: var(--creative-canvas-composer-overlay-left, 16px);
+  z-index: 1600;
+  width: var(--creative-canvas-composer-overlay-width, calc(100vw - 32px));
+  transform: none;
+  transform-origin: center;
+}
+
+.panel {
+  box-sizing: border-box;
+  padding: 8px;
+  border: 1px solid color-mix(in srgb, var(--color-border-2) 86%, transparent);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--color-bg-2) 94%, transparent);
+  box-shadow: 0 22px 52px color-mix(in srgb, #000 22%, transparent);
+  backdrop-filter: blur(18px);
+}
+
+.prompt {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  height: 92px;
+  resize: none;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 12px;
+  outline: none;
+  background: transparent;
+  color: var(--color-text-1);
+  font: inherit;
+  font-size: 12px;
+  line-height: 18px;
+  scrollbar-color: color-mix(in srgb, var(--color-text-3) 32%, transparent)
+    transparent;
+  scrollbar-width: thin;
+}
+
+.prompt::placeholder {
+  color: var(--color-text-4);
+}
+
+.prompt:focus-visible {
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, rgb(var(--primary-6)) 42%, var(--color-border-2));
+}
+
+.prompt:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.footer {
+  display: flex;
+  min-width: 0;
+  min-height: 30px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.controls {
+  display: flex;
+  min-width: 0;
+  min-height: 30px;
+  flex: 1 1 auto;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.controls > *,
+.submitButton {
+  align-self: center;
+}
+
+.controlButton {
+  appearance: none;
+  display: inline-flex;
+  box-sizing: border-box;
+  height: 30px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--color-border-2);
+  background: var(--color-bg-1);
+  color: var(--color-text-2);
+  cursor: pointer;
+  font: inherit;
+}
+
+.iconButton {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  padding: 0;
+  border-color: transparent;
+  border-radius: 50%;
+  background: transparent;
+}
+
+.modelSelect {
+  width: 156px;
+  height: 30px;
+  min-width: 0;
+  flex: 0 1 156px;
+}
+
+.modelSelect :global(.arco-select-view) {
+  display: flex;
+  height: 30px;
+  align-items: center;
+  border-radius: 999px;
+  background: var(--color-bg-1);
+  font-size: 11px;
+}
+
+.modelSelect:global(.arco-select-size-mini.arco-select-single)
+  :global(.arco-select-view) {
+  height: 30px;
+  padding: 0 9px;
+  font-size: 11px;
+  line-height: 28px;
+}
+
+.modelSelect:global(.arco-select-size-mini.arco-select-single)
+  :global(.arco-select-view-value) {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 11px;
+  line-height: 28px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.selectedModelLabel {
+  display: inline-flex;
+  max-width: 100%;
+  align-items: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: top;
+  white-space: nowrap;
+}
+
+.footer :global(.i-icon) {
+  display: grid;
+  width: 14px;
+  height: 14px;
+  place-items: center;
+  line-height: 0;
+  vertical-align: middle;
+}
+
+.footer :global(.i-icon > svg) {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.settingsButton {
+  width: 144px;
+  min-width: 0;
+  max-width: 144px;
+  flex: 0 1 144px;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  gap: 5px;
+  overflow: hidden;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.settingsButton :global(.i-icon) {
+  flex: 0 0 14px;
+}
+
+.settingsButton > button {
+  appearance: none;
+  display: inline-flex;
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  overflow: hidden;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: inherit;
+  font: inherit;
+  white-space: nowrap;
+}
+
+.settingsSummary {
+  display: block;
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.submitButton {
+  width: 48px;
+  min-width: 48px;
+  border-color: rgb(var(--primary-6));
+  border-radius: 999px;
+  background: rgb(var(--primary-6));
+  color: var(--button-primary-text, #fff);
+}
+
+.retrySubmitButton {
+  width: 100px;
+  min-width: 100px;
+  gap: 6px;
+  padding: 0 10px;
+}
+
+.retryLabel {
+  white-space: nowrap;
+  font-size: 11px;
+}
+
+.iconButton:hover:not(:disabled),
+.settingsButton:hover:not(:disabled) {
+  border-color: var(--color-border-3);
+  background: var(--color-fill-2);
+}
+
+.submitButton:hover:not(:disabled) {
+  border-color: rgb(var(--primary-5));
+  background: rgb(var(--primary-5));
+}
+
+.iconButton:focus-visible,
+.settingsButton:focus-visible,
+.submitButton:focus-visible {
+  outline: 2px solid rgb(var(--primary-6));
+  outline-offset: 2px;
+}
+
+.iconButton:disabled,
+.settingsButton:disabled,
+.submitButton:disabled {
+  cursor: not-allowed;
+  opacity: 0.38;
+}
+
+.positioner :global(.arco-select-popup) {
+  padding: 3px 0;
+  border-radius: 10px;
+}
+
+.positioner :global(.arco-select-popup .arco-select-option) {
+  min-height: 28px;
+  padding: 0 10px;
+  font-size: 11px;
+  line-height: 28px;
+}
+
+.positioner :global(.arco-select-popup .arco-select-option-empty) {
+  height: 28px;
+  font-size: 11px;
+}
+
+.modelMenu :global(.arco-select-option) {
+  height: auto;
+  min-height: 32px;
+  padding: 5px 10px;
+  line-height: 1.35;
+  white-space: normal;
+}
+
+.modelOption {
+  display: flex;
+  min-width: 0;
+  width: 100%;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.modelOptionIdentity {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.modelOptionLabel {
+  overflow: hidden;
+  flex: 0 1 auto;
+  color: var(--color-text-1);
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.modelOptionProvider {
+  flex: 0 1 auto;
+  overflow: hidden;
+  max-width: 42%;
+  color: var(--color-text-3);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.modelOptionId {
+  overflow: hidden;
+  min-width: 0;
+  flex: 1 1 auto;
+  color: var(--color-text-2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.positioner :global(.arco-popover-content) {
+  border-color: var(--color-border-1);
+  border-radius: 14px;
+  background: var(--color-bg-popup);
+  box-shadow: 0 18px 48px color-mix(in srgb, #000 22%, transparent);
+}
+
+.popoverSettingsPanel {
+  display: grid;
+  box-sizing: border-box;
+  width: min(292px, calc(100vw - 52px));
+  gap: 10px;
+  padding: 2px;
+  color: var(--color-text-1);
+}
+
+.field {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  color: var(--color-text-2);
+  font-size: 11px;
+}
+
+.settingsControl {
+  box-sizing: border-box;
+  width: 100%;
+  height: 30px;
+  padding: 0 9px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  outline: none;
+  background: var(--color-fill-2);
+  color: var(--color-text-1);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+}
+
+input.settingsControl {
+  cursor: text;
+}
+
+select.settingsControl {
+  padding-right: 26px;
+}
+
+.settingsControl::placeholder {
+  color: var(--color-text-4);
+}
+
+.settingsControl:hover:not(:disabled) {
+  border-color: var(--color-border-3);
+  background: var(--color-fill-3);
+}
+
+.settingsControl:focus-visible {
+  border-color: rgb(var(--primary-6));
+  box-shadow: 0 0 0 2px rgba(var(--primary-6), 0.14);
+}
+
+.settingsControl:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.settingsControl option {
+  background: var(--color-bg-popup);
+  color: var(--color-text-1);
+  font-size: 11px;
+}
+
+.message {
+  margin-top: 8px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: var(--color-fill-2);
+  color: var(--color-text-2);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.message[role='alert'] {
+  background: color-mix(in srgb, rgb(var(--danger-6)) 10%, var(--color-bg-2));
+  color: rgb(var(--danger-6));
+}
+
+.confirmSubmissionButton {
+  appearance: none;
+  margin-top: 6px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: rgb(var(--primary-6));
+  cursor: pointer;
+  font-size: 11px;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.confirmSubmissionButton:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.confirmSubmissionButton:focus-visible {
+  outline: 2px solid rgb(var(--primary-6));
+  outline-offset: 2px;
+}
+
+.spin {
+  animation: composer-spin 0.8s linear infinite;
+}
+
+@keyframes composer-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 760px) {
+  .positioner {
+    width: min(540px, calc(100vw - 32px));
+  }
+
+  .modelSelect {
+    width: auto;
+    flex: 1 1 120px;
+  }
+
+  .settingsSummary {
+    display: none;
+  }
+
+  .settingsButton {
+    width: 40px;
+    min-width: 40px;
+    max-width: 40px;
+    flex: 0 0 40px;
+    padding: 0;
+  }
+}
+
+@media (max-width: 420px) {
+  .retrySubmitButton {
+    width: 48px;
+    min-width: 48px;
+    padding: 0;
+  }
+
+  .retryLabel {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spin {
+    animation: none;
+  }
+}

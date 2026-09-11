@@ -1,0 +1,58 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "NomiFun",
+  "identifier": "com.nomifun.desktop",
+  "build": {
+    "frontendDist": "../../ui/dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "bun run --filter=./ui dev",
+    "beforeBuildCommand": "bun scripts/prune-build.mjs --pre && bun run --filter=./ui build"
+  },
+  "app": {
+    "windows": [],
+    "macOSPrivateApi": true,
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "app", "dmg", "appimage", "deb", "rpm"],
+    "resources": {
+      "../../ui/dist/": "webui-dist/",
+      "../../LICENSE": "LICENSE",
+      "../../NOTICE": "NOTICE"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "template": "nsis/installer.nsi"
+      }
+    }
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["nomifun"]
+      }
+    },
+    "updater": {
+      "endpoints": [
+        "https://cdn.crabnebula.app/update/nomifun/nomifun-desktop/{{target}}-{{arch}}/{{current_version}}",
+        "https://github.com/nomifun/nomifun-desktop/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYzQUEyNzJFNjBBQTc5NTIKUldSU2VhcGdMaWVxODRRbUdXczZodEJZOE1Ja2Zta011eWUxUko2SG5XclVaSUdtaWNobXJNemEK"
+    }
+  }
+}

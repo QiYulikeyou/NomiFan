@@ -1,0 +1,297 @@
+.controls {
+  display: flex;
+  box-sizing: border-box;
+  min-width: 0;
+  height: 42px;
+  align-items: center;
+  gap: 2px;
+  padding: 4px 5px;
+  border: 1px solid color-mix(in srgb, var(--color-border-2) 88%, transparent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--color-bg-2) 96%, transparent);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+  color: var(--color-text-2);
+  backdrop-filter: blur(18px) saturate(135%);
+}
+
+.iconButton,
+.percentageButton,
+.stepButton {
+  display: grid;
+  height: 32px;
+  flex: 0 0 auto;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  transition:
+    color 120ms ease,
+    background-color 120ms ease,
+    box-shadow 120ms ease;
+}
+
+.iconButton {
+  width: 32px;
+}
+
+.percentageButton {
+  display: flex;
+  min-width: 76px;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 0 7px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.percentageButton > span:first-child {
+  min-width: 36px;
+  text-align: right;
+}
+
+.menuAnchor {
+  position: relative;
+  display: inline-flex;
+  min-width: 0;
+  flex: 0 0 auto;
+  align-items: center;
+}
+
+.zoomMenuPopover {
+  position: absolute;
+  z-index: 30;
+  bottom: calc(100% + 8px);
+  left: 0;
+  box-sizing: border-box;
+  width: 220px;
+  max-width: calc(100vw - 40px);
+  padding: 8px;
+  border: 1px solid color-mix(in srgb, var(--color-border-2) 88%, transparent);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--color-bg-2) 98%, transparent);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.14);
+  backdrop-filter: blur(18px) saturate(135%);
+}
+
+.iconButton:hover:not(:disabled),
+.percentageButton:hover:not(:disabled),
+.stepButton:hover:not(:disabled) {
+  background: var(--color-fill-2);
+  color: var(--color-text-1);
+}
+
+.percentageButton[data-active='true'],
+.iconButton[data-active='true'] {
+  background: rgba(var(--primary-6), 0.12);
+  color: rgb(var(--primary-6));
+  box-shadow: inset 0 0 0 1px rgba(var(--primary-6), 0.18);
+}
+
+.iconButton:focus-visible,
+.percentageButton:focus-visible,
+.stepButton:focus-visible,
+.zoomInput:focus-within {
+  outline: 2px solid rgba(var(--primary-6), 0.55);
+  outline-offset: 2px;
+}
+
+.iconButton:disabled,
+.percentageButton:disabled,
+.stepButton:disabled,
+.zoomInput:has(input:disabled) {
+  cursor: default;
+  opacity: 0.38;
+}
+
+.divider {
+  width: 1px;
+  height: 22px;
+  flex: 0 0 1px;
+  margin: 0 2px;
+  background: var(--color-border-2);
+}
+
+.zoomMenu {
+  width: 100%;
+  color: var(--color-text-1);
+}
+
+.backgroundHeading {
+  padding: 3px 8px 7px;
+  color: var(--color-text-3);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.backgroundOptions {
+  display: grid;
+  gap: 2px;
+}
+
+.backgroundOption {
+  display: flex;
+  width: 100%;
+  min-height: 36px;
+  align-items: center;
+  gap: 9px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--color-text-2);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+}
+
+.backgroundOption:hover:not(:disabled) {
+  background: var(--color-fill-2);
+  color: var(--color-text-1);
+}
+
+.backgroundOption[data-active='true'] {
+  color: var(--color-text-1);
+}
+
+.selectionIndicator {
+  display: grid;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+  place-items: center;
+  color: rgb(var(--primary-6));
+}
+
+.selectionIndicator + span {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.backgroundOption:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.zoomStepper {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--color-border-2);
+}
+
+.stepButton {
+  width: 28px;
+  height: 30px;
+  flex: 0 0 28px;
+}
+
+.zoomInput {
+  display: flex;
+  min-width: 0;
+  height: 32px;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 3px;
+  padding: 0 9px;
+  border: 1px solid color-mix(in srgb, rgb(var(--primary-6)) 70%, var(--color-border-2));
+  border-radius: 8px;
+  background: var(--color-bg-2);
+  color: var(--color-text-2);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.zoomInput input {
+  width: 100%;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--color-text-1);
+  font: inherit;
+  text-align: right;
+}
+
+.controls[data-embedded='true'] {
+  width: 100%;
+  height: 36px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+
+.controls[data-embedded='true'] .menuAnchor {
+  flex: 1 1 auto;
+}
+
+.controls[data-embedded='true'] .percentageButton {
+  min-width: 0;
+  flex: 1 1 auto;
+  padding-inline: 3px;
+}
+
+.controls[data-embedded='true'] .percentageButton > span:first-child {
+  min-width: 34px;
+}
+
+.controls[data-embedded='true'] .stepButton {
+  width: 26px;
+  flex-basis: 26px;
+}
+
+.controls[data-embedded='true'] .iconButton {
+  width: 30px;
+}
+
+.zoomInput input::-webkit-inner-spin-button,
+.zoomInput input::-webkit-outer-spin-button {
+  margin: 0;
+  appearance: none;
+}
+
+@media (max-width: 640px) {
+  .controls {
+    height: 40px;
+    max-width: calc(100vw - 20px);
+    padding: 3px 4px;
+  }
+
+  .percentageButton {
+    min-width: 72px;
+  }
+
+  .divider {
+    margin-inline: 1px;
+  }
+
+  .zoomMenu {
+    width: 100%;
+  }
+
+  .zoomMenuPopover {
+    left: 0;
+    width: min(220px, calc(100vw - 24px));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .iconButton,
+  .percentageButton,
+  .stepButton {
+    transition: none;
+  }
+}

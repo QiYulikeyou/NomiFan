@@ -1,0 +1,294 @@
+/**
+ * @license
+ * Copyright 2025-2026 NomiFun (nomifun.com)
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import { ipcBridge } from '@/common';
+import type { IProvider } from '@/common/config/storage';
+import type { ModelTask } from '@/common/protocolBindings/ModelTask';
+import ModalHOC from '@/renderer/utils/ui/ModalHOC';
+import NomiModal from '@/renderer/components/base/NomiModal';
+import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import useModeModeList from '@renderer/hooks/agent/useModeModeList';
+import ModelDefinitionEditor, {
+  type ModelCatalogSuggestion,
+  type ModelDefinitionEditorHandle,
+} from './ModelDefinitionEditor';
+import {
+  capabilityInputsFromDefinition,
+  describeValidationErrors,
+  normalizeModelId,
+  validateModelDefinition,
+  type ModelDefinitionDraft,
+} from './providerModelAdvanced';
+import useModelProtocolManifests from './useModelProtocolManifests';
+import { useProviderConnections } from './useProviderConnections';
+import ModelCallConfigModalFooter from './ModelCallConfigModalFooter';
+import ProviderAutoConfigurationNotice from './ProviderAutoConfigurationNotice';
+import {
+  applyProviderAutoConfiguration,
+  isAutoConfigurationPlatform,
+} from './providerAutoConfiguration';
+import useProviderAutoConfiguration from './useProviderAutoConfiguration';
+
+const EMPTY_DEFINITION: ModelDefinitionDraft = { model: '', capabilities: [] };
+
+const AddModelModal = ModalHOC<{ data?: IProvider; onSubmit: (provider: IProvider) => void }>(
+  ({ modalProps, data, onSubmit, modalCtrl }) => {
+    const { t } = useTranslation();
+    const [message, messageHolder] = useArcoMessage();
+    const [definition, setDefinition] = useState<ModelDefinitionDraft>(EMPTY_DEFINITION);
+    const [saving, setSaving] = useState(false);
+    const [focusedCallConfigTask, setFocusedCallConfigTask] = useState<ModelTask>();
+    const modelEditorRef = useRef<ModelDefinitionEditorHandle>(null);
+    const appliedAutoConfigurationRef = useRef('');
+    const tasks = useMemo(
+      () => definition.capabilities.map((capability) => capability.task),
+      [definition.capabilities]
+    );
+    const manifests = useModelProtocolManifests({
+      preset: data?.platform,
+      tasks,
+      baseUrlHint: data?.base_url,
+    });
+    const connectionState = useProviderConnections(data?.id, modalProps.visible && Boolean(data));
+    const modelListState = useModeModeList({
+      platform: data?.platform ?? '',
+      providerId: data?.id,
+    });
+    const autoConfigurationEnabled = isAutoConfigurationPlatform(data?.platform ?? '');
+    const autoConfiguration = useProviderAutoConfiguration({
+      enabled: modalProps.visible && autoConfigurationEnabled,
+      platform: data?.platform ?? '',
+      baseUrl: data?.base_url ?? '',
+      authScheme: data?.auth_scheme ?? '',
+      definition,
+      manifests: manifests.manifests,
+      loadingTasks: manifests.loadingTasks,
+      providerId: data?.id,
+    });
+    const catalogSuggestions = useMemo<ModelCatalogSuggestion[]>(
+      () =>
+        (modelListState.data?.models ?? []).map((model) => ({
+          value: model.value,
+          label: model.label,
+          ...(model.displayName ? { displayName: model.displayName } : {}),
+          tasks: model.tasks,
+          traits: model.traits,
+          ...(model.contextLimit === undefined ? {} : { contextLimit: model.contextLimit }),
+        })),
+      [modelListState.data?.models]
+    );
+    const existingModelIds = useMemo(() => data?.models.map((row) => row.model) ?? [], [data?.models]);
+    const validation = useMemo(
+      () =>
+        validateModelDefinition(
+          definition,
+          manifests.manifests,
+          data?.base_url ?? '',
+          existingModelIds,
+          manifests.loadingTasks,
+          connectionState.connections.map((connection) => connection.role),
+          data?.auth_scheme ?? '',
+          Object.fromEntries(
+            connectionState.connections.map((connection) => [connection.role, connection.auth_scheme])
+          ),
+          connectionState.connections
+        ),
+      [
+        connectionState.connections,
+        data?.base_url,
+        data?.auth_scheme,
+        definition,
+        existingModelIds,
+        manifests.loadingTasks,
+        manifests.manifests,
+      ]
+    );
+
+    useEffect(() => {
+      if (modalProps.visible) {
+        setDefinition(EMPTY_DEFINITION);
+        setSaving(false);
+        setFocusedCallConfigTask(undefined);
+        appliedAutoConfigurationRef.current = '';
+      }
+    }, [data?.id, modalProps.visible]);
+
+    useEffect(() => {
+      const batch = autoConfiguration.data;
+      if (!batch || batch.detections.length === 0) return;
+      const signature = JSON.stringify(batch);
+      if (appliedAutoConfigurationRef.current === signature) return;
+      appliedAutoConfigurationRef.current = signature;
+      setDefinition((current) =>
+        applyProviderAutoConfiguration(current, batch.detections)
+      );
+    }, [autoConfiguration.data]);
+
+    const handleConfirm = useCallback(async () => {
+      if (autoConfiguration.isLoading) {
+        message.warning(
+          t('settings.providerAutoConfiguration.detecting', {
+            defaultValue: '正在探测协议、鉴权方式和可用 API 地址…',
+          })
+        );
+        return;
+      }
+      if (!data || !validation.valid) {
+        // Name the blockers. A bare "finish configuring each task" left a
+        // new-api provider — which requires an explicit protocol per model —
+        // with no way to discover what was missing.
+        const detail = describeValidationErrors(validation.errors, (key, fallback) =>
+          t(key, { defaultValue: fallback })
+        );
+        message.warning(
+          detail ||
+            t('settings.completeCapabilityConfiguration', {
+              defaultValue: '请完成每个已选模态的协议、地址和参数配置。',
+            })
+        );
+        return;
+      }
+      const capabilities = capabilityInputsFromDefinition(definition);
+      if (!capabilities) {
+        message.warning(
+          t('settings.modelAdvanced.invalidParamsJson', { defaultValue: '供应商参数必须是 JSON 对象。' })
+        );
+        return;
+      }
+
+      setSaving(true);
+      try {
+        await ipcBridge.providerModel.save.invoke({
+          provider_id: data.id,
+          model: {
+            model: normalizeModelId(definition.model),
+            ...(definition.displayName?.trim()
+              ? { display_name: definition.displayName.trim() }
+              : {}),
+            enabled: true,
+            capabilities,
+          },
+        });
+        onSubmit(data);
+        modalCtrl.close();
+      } catch (error) {
+        console.error('provider model save failed', error);
+        message.error(t('settings.saveModelConfigFailed', { defaultValue: '模型能力保存失败' }));
+      } finally {
+        setSaving(false);
+      }
+    }, [
+      autoConfiguration.isLoading,
+      data,
+      definition,
+      message,
+      modalCtrl,
+      onSubmit,
+      t,
+      validation.errors,
+      validation.valid,
+    ]);
+
+    return (
+      <>
+        {messageHolder}
+        <NomiModal
+          visible={modalProps.visible}
+          onCancel={modalCtrl.close}
+          unmountOnExit
+          header={{
+            title: focusedCallConfigTask
+              ? `${t(`settings.modelTask.${focusedCallConfigTask}`, {
+                  defaultValue: focusedCallConfigTask,
+                })} · ${t('settings.modelAdvanced.callConfigurationTitle', {
+                  defaultValue: '调用配置',
+                })}`
+              : t('settings.addModel'),
+            showClose: true,
+          }}
+          footer={
+            focusedCallConfigTask ? (
+              <ModelCallConfigModalFooter
+                task={focusedCallConfigTask}
+                onCancel={() => modelEditorRef.current?.cancelCallConfig()}
+                onApply={() => modelEditorRef.current?.applyCallConfig()}
+              />
+            ) : undefined
+          }
+          style={{
+            width: focusedCallConfigTask ? 840 : 760,
+            maxWidth: '94vw',
+            maxHeight: focusedCallConfigTask ? '96vh' : '92vh',
+          }}
+          contentStyle={{
+            background: 'var(--dialog-fill-0)',
+            borderRadius: 16,
+            padding: '20px 24px',
+            overflow: 'auto',
+            maxHeight: focusedCallConfigTask ? 'calc(96vh - 72px)' : undefined,
+          }}
+          onOk={handleConfirm}
+          confirmLoading={saving}
+          okText={t('common.confirm')}
+          cancelText={t('common.cancel')}
+          okButtonProps={{
+            disabled: !validation.valid || autoConfiguration.isLoading,
+          }}
+        >
+          <div className={focusedCallConfigTask ? 'pt-4px' : 'pt-16px'}>
+            {!focusedCallConfigTask && (
+              <div className='mb-12px'>
+                <ProviderAutoConfigurationNotice
+                  enabled={autoConfigurationEnabled}
+                  loading={autoConfiguration.isLoading}
+                  batch={autoConfiguration.data}
+                />
+              </div>
+            )}
+            <ModelDefinitionEditor
+              ref={modelEditorRef}
+              value={definition}
+              onChange={setDefinition}
+              providerBaseUrl={data?.base_url ?? ''}
+              providerAuthScheme={data?.auth_scheme ?? ''}
+              providerLabel={data?.name ?? data?.platform ?? ''}
+              manifests={manifests.manifests}
+              manifestLoadingTasks={manifests.loadingTasks}
+              manifestErrorTasks={manifests.errorTasks}
+              validationErrors={validation.errors}
+              validationPending={
+                connectionState.isLoading || autoConfiguration.isLoading
+              }
+              existingModelIds={existingModelIds}
+              catalogSuggestions={catalogSuggestions}
+              catalogLoading={modelListState.isLoading}
+              catalogError={
+                modelListState.error instanceof Error
+                  ? modelListState.error.message
+                  : modelListState.error
+                    ? String(modelListState.error)
+                    : undefined
+              }
+              onRefreshCatalog={() => void modelListState.mutate()}
+              onCallConfigFocusChange={setFocusedCallConfigTask}
+              callConfigFooterPlacement='modal'
+              connections={connectionState.connections}
+              onCreateConnection={async (connection) => {
+                if (!data) throw new Error('provider is required');
+                await ipcBridge.providerConnection.save.invoke({ provider_id: data.id, connection });
+                await connectionState.mutate();
+              }}
+            />
+          </div>
+        </NomiModal>
+      </>
+    );
+  }
+);
+
+export default AddModelModal;

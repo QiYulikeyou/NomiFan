@@ -1,0 +1,245 @@
+.root,
+.canvasHost {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+.nodeComposerHost {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.root {
+  /*
+   * Canvas-specific roles remain local, but every role derives from the live
+   * application palette so the editor follows light/dark and custom themes.
+   */
+  --creative-canvas-surface-background: var(--color-bg-1);
+  --creative-canvas-grid-dot: color-mix(in srgb, var(--color-text-3) 32%, transparent);
+  --creative-canvas-grid-line: color-mix(in srgb, var(--color-border-2) 58%, transparent);
+  --creative-canvas-selection-stroke: rgb(var(--primary-6));
+  --creative-canvas-selection-fill: rgba(var(--primary-6), 0.08);
+  --creative-canvas-edge-default: var(--color-text-3);
+  --creative-canvas-edge-active: rgb(var(--primary-6));
+  --creative-canvas-node-fill: color-mix(
+    in srgb,
+    var(--color-bg-2) 88%,
+    var(--color-fill-3)
+  );
+  --creative-canvas-node-panel: var(--color-bg-2);
+  --creative-canvas-node-stroke: var(--color-border-3);
+  --creative-canvas-node-label: var(--color-text-2);
+  --creative-canvas-node-placeholder: var(--color-text-3);
+  position: relative;
+  overflow: hidden;
+  background: var(--creative-canvas-surface-background);
+  color: var(--color-text-1);
+  color-scheme: inherit;
+}
+
+:global([data-theme='light']) .root {
+  color-scheme: light;
+}
+
+:global([data-theme='dark']) .root {
+  color-scheme: dark;
+  --creative-canvas-grid-dot: color-mix(in srgb, var(--color-text-3) 44%, transparent);
+  --creative-canvas-grid-line: color-mix(in srgb, var(--color-border-3) 68%, transparent);
+  --creative-canvas-node-fill: color-mix(
+    in srgb,
+    var(--color-bg-2) 84%,
+    var(--color-fill-3)
+  );
+}
+
+.root :global([data-creative-canvas-chrome]) {
+  grid-template-columns:
+    0
+    minmax(0, 1fr)
+    minmax(
+      320px,
+      clamp(320px, var(--creative-canvas-right-panel-width, 390px), 560px)
+    );
+}
+
+@media (max-width: 880px) {
+  .root :global([data-creative-canvas-chrome]) {
+    grid-template-columns:
+      0
+      minmax(0, 1fr)
+      minmax(
+        260px,
+        clamp(260px, var(--creative-canvas-right-panel-width, 300px), 560px)
+      );
+  }
+}
+
+@media (max-width: 640px) {
+  .root :global([data-creative-canvas-chrome]) {
+    grid-template-columns:
+      0
+      minmax(0, 1fr)
+      minmax(
+        240px,
+        min(
+          55vw,
+          clamp(240px, var(--creative-canvas-right-panel-width, 260px), 560px)
+        )
+      );
+  }
+}
+
+.root :global([data-creative-canvas-chrome][data-right-view='closed']) {
+  grid-template-columns:
+    0
+    minmax(0, 1fr)
+    0;
+}
+
+.root :global([data-creative-canvas-chrome] > section[aria-label='编辑历史']),
+.root :global([data-creative-canvas-chrome] > section[aria-label='时间线']) {
+  height: min(60vh, var(--creative-canvas-bottom-panel-height, 240px));
+}
+
+.canvasHost {
+  position: relative;
+}
+
+.toolbarButton,
+.recoveryButton {
+  appearance: none;
+  border: 0;
+  font: inherit;
+  outline: none;
+}
+
+.toolbarButton {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  place-items: center;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--color-text-1);
+  cursor: pointer;
+}
+
+.toolbarButton > button {
+  appearance: none;
+  display: grid;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  place-items: center;
+  border: 0;
+  border-radius: inherit;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+
+.toolbarButton :global(.i-icon) {
+  display: grid;
+  width: 17px;
+  height: 17px;
+  place-items: center;
+  line-height: 0;
+  vertical-align: middle;
+}
+
+.toolbarButton :global(.i-icon > svg) {
+  display: block;
+}
+
+.toolbarButton:has(> button:disabled) {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+.toolbarButton:has(> button:disabled):hover {
+  background: transparent;
+  color: var(--color-text-1);
+}
+
+.toolbarButton:hover:not(:disabled) {
+  background: var(--color-fill-2);
+  color: var(--color-text-1);
+}
+
+.toolbarButton[data-danger='true'] {
+  color: rgb(var(--danger-6));
+}
+
+.toolbarButton:focus-visible,
+.recoveryButton:focus-visible {
+  box-shadow: 0 0 0 3px rgba(var(--primary-6), 0.22);
+}
+
+.toolbarButton:disabled,
+.recoveryButton:disabled {
+  cursor: not-allowed;
+  opacity: 0.38;
+}
+
+.recoveryButton {
+  display: inline-flex;
+  min-height: 32px;
+  align-items: center;
+  gap: 5px;
+  padding: 0 10px;
+  border-radius: 8px;
+  background: var(--color-fill-2);
+  color: var(--color-text-1);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 620;
+}
+
+.notice {
+  max-width: 240px;
+  overflow: hidden;
+  color: var(--color-text-3);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.spin {
+  animation: creative-canvas-product-spin 0.9s linear infinite;
+}
+
+.panoramaDescription {
+  margin: 0;
+  color: var(--color-text-2);
+  font-size: 13px;
+  line-height: 1.75;
+}
+
+.panoramaActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+@keyframes creative-canvas-product-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 880px) {
+  .notice {
+    display: none;
+  }
+
+  .recoveryButton {
+    width: 32px;
+    padding: 0;
+    justify-content: center;
+    font-size: 0;
+  }
+}
